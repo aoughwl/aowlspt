@@ -385,6 +385,38 @@ proc ttsSegment*(voice, sentence: string; note: var string;
   note = n2 & " (cached as " & baseName(dst) & ")"
   result = dst
 
+proc sayPayload*(personId, voice, text: string; segmentIdx: int; final: bool;
+                 source: string; wav: var string; cached: var bool;
+                 note: var string): string =
+  ## THE shape of a spoken line, and the ONLY place that decides whether it
+  ## carries a wav.
+  ##
+  ## MEASURED 2026-09-07: `/say` produced piper wavs while every line the
+  ## ENCOUNTER machine emitted (the threat bark after `player_aimed_at`)
+  ## reached the client with `"wav":""`, so the plugin logged "(no wav -- TTS
+  ## is off, missing or failed; the text IS the line)" and the world was mute
+  ## exactly when it was most dramatic. The cause was two copies of this
+  ## object, only one of which called `ttsSegment`. There is now one, and
+  ## `note` always says why a wav is absent -- never a silent "".
+  wav = ""
+  cached = false
+  note = ""
+  if text.len > 0:
+    wav = ttsSegment(voice, text, note, cached)
+  else:
+    note = "no text in this segment, so nothing was synthesised"
+  var o = obj()
+  o.put("personId", personId)
+  o.put("text", text)
+  o.put("wav", wav)
+  o.put("segmentIdx", segmentIdx)
+  o.put("final", final)
+  o.put("cachedWav", cached)
+  o.put("source", source)
+  o.put("voice", voice)
+  o.put("ttsNote", note)
+  result = done(o).text
+
 proc ttsStats*(): JsonObject =
   var o = obj()
   o.put("engine", cTtsEngine)
@@ -732,6 +764,7 @@ var gPttSession: string = ""
 var gPttWav: string = ""
 var gPttOutFile: string = ""
 var gPttCodeFile: string = ""
+var gPttStopFile: string = ""    ## `up` creates this; the wrapper polls it
 var gPttStartMs: int64 = 0
 var gPttSecs: int = 0
 var gPttFed: int = 0
@@ -867,6 +900,83 @@ proc pttPump*(partial: var string; note: var string): bool =
   gPttLastNote = note
   result = ok
 
+proc pttWrapperPs(recorder, wavPath, outPath, codePath, stopPath: string;
+                  secs: int): string =
+  ## The PowerShell wrapper that OWNS the recorder process.
+  ##
+  ## MEASURED 2026-09-07, first live SPT 4.1.5 raid: every `up` read
+  ## "0 PCM bytes fed, wav -1 bytes, recorder still running" 0.9-1.4 s after
+  ## the `down`. `recorder.exe` writes the RIFF sizes and closes the file only
+  ## when it STOPS, and it is told to stop by a line on its STDIN -- but the
+  ## old wrapper was `cmd /c recorder.exe ... <NUL`, a detached child with no
+  ## usable stdin, so the only thing that could ever end it was its own
+  ## `maxSeconds` bound. Every push-to-talk turn was therefore silent by
+  ## construction, and no amount of waiting in `up` could have helped.
+  ##
+  ## So: start it with RedirectStandardInput, poll for `<wav>.stop`, write
+  ## "stop" into its stdin, wait for it, and only then write the exit code.
+  ## stdout and stderr are redirected to files so the child inherits none of
+  ## OUR handles -- the pipe-never-sees-EOF hang measured twice in mods/voice.
+  result =
+    "$ErrorActionPreference = 'Stop'\r\n" &
+    "$psi = New-Object System.Diagnostics.ProcessStartInfo\r\n" &
+    "$psi.FileName = '" & recorder & "'\r\n" &
+    "$psi.Arguments = '\"" & wavPath & "\" " & $secs & "'\r\n" &
+    "$psi.UseShellExecute = $false\r\n" &
+    "$psi.RedirectStandardInput = $true\r\n" &
+    "$psi.RedirectStandardOutput = $true\r\n" &
+    "$psi.RedirectStandardError = $true\r\n" &
+    "$p = [System.Diagnostics.Process]::Start($psi)\r\n" &
+    "$deadline = (Get-Date).AddSeconds(" & $(secs + 5) & ")\r\n" &
+    "while (-not $p.HasExited -and (Get-Date) -lt $deadline) {\r\n" &
+    "  if (Test-Path -LiteralPath '" & stopPath & "') {\r\n" &
+    "    try { $p.StandardInput.WriteLine('stop'); $p.StandardInput.Flush() } catch {}\r\n" &
+    "    break\r\n" &
+    "  }\r\n" &
+    "  Start-Sleep -Milliseconds 50\r\n" &
+    "}\r\n" &
+    "if (-not $p.WaitForExit(5000)) { try { $p.Kill() } catch {} }\r\n" &
+    "$o = ''\r\n" &
+    "try { $o = $p.StandardOutput.ReadToEnd() + $p.StandardError.ReadToEnd() } catch {}\r\n" &
+    "Set-Content -LiteralPath '" & outPath & "' -Value $o -Encoding ascii\r\n" &
+    "Set-Content -LiteralPath '" & codePath & "' -Value ([string]$p.ExitCode + ' ') -Encoding ascii\r\n"
+
+proc pttWaitForWav(note: var string): bool =
+  ## Bounded wait for the recorder to finish CLOSING the file: the RIFF `data`
+  ## size field must be non-zero and the byte count must be the same across two
+  ## reads 50 ms apart. Three outcomes -- complete / timed out (said so) / no
+  ## file at all -- never "assume it is done".
+  let t0 = nowMs()
+  var lastSize = -1
+  var stable = 0
+  while (nowMs() - t0) < 2500'i64:
+    let bytes = readAll(gPttWav)
+    if bytes.len > 44:
+      var r = 0
+      var c = 0
+      var b = 0
+      var df = -1
+      let start = pcmStartOf(bytes, r, c, b, df)
+      if start > 0 and df > 0:
+        if bytes.len == lastSize:
+          stable = stable + 1
+          if stable >= 1:
+            note = "wav complete: " & $bytes.len & " bytes, RIFF data size " &
+                   $df & " after " & $int(nowMs() - t0) & " ms"
+            return true
+        else:
+          stable = 0
+        lastSize = bytes.len
+    var spin = 0
+    let tw = nowMs()
+    while (nowMs() - tw) < 50'i64: spin = spin + 1
+  note = "TIMED OUT after " & $int(nowMs() - t0) & " ms waiting for the " &
+         "recorder to close " & gPttWav & " (" & $sizeOfFile(gPttWav) &
+         " bytes on disk, RIFF data size field " & $gPttDataField &
+         "); the final transcription runs over whatever was fed, which may be " &
+         "less than was spoken. " & pttOutcome()
+  result = false
+
 proc pttStart*(session: string; wav: var string; already: var bool;
                note: var string): bool =
   already = false
@@ -903,7 +1013,8 @@ proc pttStart*(session: string; wav: var string; already: var bool;
   if cWorkDir.len >= 1 and (cWorkDir[0] == '/' or cWorkDir[0] == '\\'): absolute = true
   if not absolute:
     note = "workDir '" & cWorkDir & "' is a RELATIVE path; the recorder runs " &
-           "under a detached cmd whose working directory is not ours, so it " &
+           "under a detached powershell whose working directory is not " &
+           "ours, so it " &
            "would write the wav somewhere nothing here can read. Set " &
            "\"workDir\" in mods/basement/config.json to an absolute directory."
     return false
@@ -914,22 +1025,18 @@ proc pttStart*(session: string; wav: var string; already: var bool;
   let wavPath = joinPath(cWorkDir, "bm_ptt_" & tag & ".wav")
   let outPath = joinPath(cWorkDir, "bm_ptt_" & tag & ".out")
   let codePath = joinPath(cWorkDir, "bm_ptt_" & tag & ".code")
-  let batPath = joinPath(cWorkDir, "bm_ptt_" & tag & ".cmd")
-  let bat = "@echo off\r\n" &
-            "\"" & cRecorderExe & "\" \"" & wavPath & "\" " & $secs &
-            " <NUL > \"" & outPath & "\" 2>&1\r\n" &
-            "set BMRC=%ERRORLEVEL%\r\n" &
-            # `echo %ERRORLEVEL%> f` is a TRAP: cmd reads the digit immediately
-            # before `>` as a stream HANDLE, so `echo 2> f` redirects echo's
-            # own stderr and leaves an EMPTY file -- MEASURED 2026-09-06, it
-            # made the exit code read "unreadable" while the recorder had
-            # cleanly reported NO_DEVICES. The space keeps it a value.
-            "echo %BMRC% > \"" & codePath & "\"\r\n"
+  let batPath = joinPath(cWorkDir, "bm_ptt_" & tag & ".ps1")
+  let stopPath = joinPath(cWorkDir, "bm_ptt_" & tag & ".stop")
+  let bat = pttWrapperPs(cRecorderExe, wavPath, outPath, codePath,
+                         stopPath, secs)
   if not writeAll(batPath, bat):
     note = "could not write the recorder wrapper at " & batPath
     return false
-  if not spawnDetached("cmd.exe", "/c \"" & batPath & "\""):
-    note = "the recorder wrapper could not be started (cmd.exe /c " & batPath & ")"
+  if not spawnDetached("powershell.exe",
+      "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" &
+      batPath & "\""):
+    note = "the recorder wrapper could not be started (powershell -File " &
+           batPath & ")"
     return false
   gPttActive = true
   gPttSession = session
@@ -941,6 +1048,7 @@ proc pttStart*(session: string; wav: var string; already: var bool;
   gPttFed = 0
   gPttSeq = 0
   gPttPumps = 0
+  gPttStopFile = stopPath
   gPttDataField = -1
   gPttRate = 0
   gPttChan = 0
@@ -962,6 +1070,22 @@ proc pttStop*(sess: var string; finalText: var string; note: var string): bool =
     note = "no push-to-talk recording is running -- an `up` without a `down` " &
            "is refused, nothing was transcribed"
     return false
+  # Tell the wrapper to stop the recorder, then WAIT (bounded) for the wav to
+  # be closed, and only then pump the tail. Without this the final
+  # transcription runs over a file the recorder has not written yet -- which is
+  # what "0 PCM bytes fed" meant on every live turn.
+  var stopNote2 = "no stop file path (the recorder was not started by this " &
+                  "process's wrapper)"
+  if gPttStopFile.len > 0:
+    if writeAll(gPttStopFile, "stop"):
+      stopNote2 = ""
+      var waitNote = ""
+      let complete = pttWaitForWav(waitNote)
+      stopNote2 = (if complete: waitNote else: waitNote)
+    else:
+      stopNote2 = "REFUSED: could not write the stop file " & gPttStopFile &
+                  "; the recorder will run to its " & $gPttSecs &
+                  " s bound and this turn transcribes only what is on disk now"
   var lastPartial = ""
   var pumpNote = ""
   discard pttPump(lastPartial, pumpNote)
@@ -979,9 +1103,8 @@ proc pttStop*(sess: var string; finalText: var string; note: var string): bool =
   gPttSession = ""
   note = "stopped after " & $heldMs & " ms; " & $fed & " PCM bytes fed, wav " &
          $onDisk & " bytes at " & gPttWav & "; recorder " & outcome &
-         "; the recorder was bounded at " & $gPttSecs & " s and is NOT " &
-         "interrupted here, so it keeps writing until that bound expires; " &
-         pumpNote & "; " & sttNote
+         "; the recorder was bounded at " & $gPttSecs & " s; stop: " &
+         stopNote2 & "; " & pumpNote & "; " & sttNote
   gPttLastNote = note
   result = ok
 

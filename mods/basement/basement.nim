@@ -249,20 +249,15 @@ proc saySink(sentence: string; final: bool) =
   var ttsNote = ""
   var cached = false
   var wav = ""
+  # The SAME builder the encounter machine's barks go through: one shape, one
+  # decision about the wav, so the two paths cannot drift apart again.
+  let payload = sayPayload(gSayPerson, gSayVoice, sentence, gSegmentIdx, final,
+                           "brain", wav, cached, ttsNote)
   if sentence.len > 0:
-    wav = ttsSegment(gSayVoice, sentence, ttsNote, cached)
     gSaySegments.add sentence
     gSayWavs.add wav
-  var o = obj()
-  o.put("personId", gSayPerson)
-  o.put("text", sentence)
-  o.put("wav", wav)
-  o.put("segmentIdx", gSegmentIdx)
-  o.put("final", final)
-  o.put("cachedWav", cached)
-  o.put("source", "brain")
-  discard emitEvent("say", done(o).text, false)
-  discard broadcast("basement.say", done(o))
+  discard emitEvent("say", payload, false)
+  discard broadcast("basement.say", payload)
   gSegmentIdx = gSegmentIdx + 1
 
 proc sayReplyJson(personId: string; d: Decision; tagNote: string;
@@ -299,6 +294,25 @@ proc speakTurn(personId, utterance: string; directives: var int;
                tagNote: var string): Decision =
   ## The one path. `/say` calls it; the selfcheck calls it; nothing else has a
   ## second copy of this order.
+  ##
+  ## An EMPTY utterance is REFUSED here, with the reason in `notes`, rather
+  ## than handed to the brain. MEASURED 2026-09-07: push-to-talk `up` arrived
+  ## before the recorder had written a byte, so the transcript was "" -- and a
+  ## turn built from nothing produces the ontology's fallback row, which reads
+  ## on screen as the person answering a question the player never asked. The
+  ## refusal is the one route out; a silent empty Decision would be
+  ## indistinguishable from "the brain had nothing to say".
+  result = Decision(text: "", tags: @[], tier: "refused", cached: false,
+                    engine: llmEngine(), ms: 0, notes: @[], segments: @[])
+  directives = 0
+  tagNote = ""
+  if normalizeText(utterance).len == 0:
+    result.notes.add "REFUSED: the utterance is empty after normalisation, " &
+      "so the brain was not asked. Nothing was spoken and no directive was " &
+      "emitted. With push-to-talk this means `up` arrived before the " &
+      "recorder wrote any audio, or the transcript was blank -- GET " &
+      StatusRoute & " and read `ptt` for the recorder's own account."
+    return
   let pi = findPerson(personId)
   gSayPerson = personId
   gSayVoice = (if pi >= 0: personVoice(pi) else: "")
@@ -377,14 +391,17 @@ proc onStatus(url, body, session: string): string =
   o.put("enabled", gEnabled)
   o.put("dataLoad", gLoadNote)
   o.put("engines", engines)
-  o.put("world", worldSummary())
-  o.put("brain", brainStats())
-  o.put("stream", streamStats())
-  o.put("tts", ttsStats())
-  o.put("sttSessions", sttSessionCount())
-  o.put("ptt", pttStatus())
-  o.put("pushSession", pushSession())
-  o.put("encounters", encounterJson())
+  # Every one of these WALKS a global seq that the tick thread mutates, so they
+  # are read under the mod lock for the same reason `/events` now is.
+  withModLock:
+    o.put("world", worldSummary())
+    o.put("brain", brainStats())
+    o.put("stream", streamStats())
+    o.put("tts", ttsStats())
+    o.put("sttSessions", sttSessionCount())
+    o.put("ptt", pttStatus())
+    o.put("pushSession", pushSession())
+    o.put("encounters", encounterJson())
   o.put("leashM", leashM())
   o.put("presetDir", gPresetDir)
   var io = obj()
@@ -434,12 +451,12 @@ proc onWorldNew(url, body, session: string): string =
   let po = jr.asText(jr.field(body, "worldPrompt"), gWorldPromptOverride)
   var note = ""
   var ok = false
+  var o = obj()
   withModLock:
     ok = newWorld(presetId, seed, po, note)
-  var o = obj()
-  o.put("ok", ok)
-  o.put("note", note)
-  o.put("world", worldSummary())
+    o.put("ok", ok)
+    o.put("note", note)
+    o.put("world", worldSummary())
   if not ok: o.put("err", note)
   result = done(o).text
 
@@ -728,7 +745,8 @@ proc onPtt(url, body, session: string): string =
     o.put("err", "state must be \"down\", \"up\" or \"poll\" (got '" &
           state & "'); `poll` feeds whatever the recorder has written so far " &
           "and is what the backend tick does every tickMs")
-  o.put("ptt", pttStatus())
+  withModLock:
+    o.put("ptt", pttStatus())
   result = done(o).text
 
 proc onEvents(url, body, session: string): string =
@@ -744,17 +762,37 @@ proc onEvents(url, body, session: string): string =
   let limit = queryInt(url, "limit", 200)
   let t0 = nowMs()
   var spins = 0
-  while wait > 0 and latestSeq() <= since and (nowMs() - t0) < int64(wait):
+  # THE POLL IS UNLOCKED, THE PAYLOAD IS NOT. This is the bug that killed the
+  # backend on 2026-09-07: the whole route ran without `withModLock` while the
+  # tick thread's `expirePending` -> `dropPendingAt` REBUILDS gPendSeq /
+  # gPendKind / gPendDue and `emitEvent` appends to the ring. `pendingAcks`
+  # then read `gPendKind[i]` after `gPendSeq.len` had already been replaced by
+  # a shorter seq, and nimony killed the process with
+  # `seqimpl.nim(167, 41): i < s.len and 0 <= i [AssertionDefect]` -- no stack,
+  # every subsequent request refused because there was no process left.
+  #
+  # The spin must NOT hold the lock (`sync.nim`: never hold it across a wait,
+  # and the tick needs it to make progress or `latestSeq` could never change),
+  # so each probe takes it for one read and drops it again. The payload is then
+  # built under ONE hold, so `events` and `pending` describe the same instant.
+  var latest = 0
+  withModLock:
+    latest = latestSeq()
+  while wait > 0 and latest <= since and (nowMs() - t0) < int64(wait):
     spins = spins + 1
+    withModLock:
+      latest = latestSeq()
   var o = obj()
   o.put("ok", true)
   o.put("since", since)
-  o.put("latestSeq", latestSeq())
   o.put("waitedMs", int(nowMs() - t0))
   o.put("mechanism", (if wait > 0: "bounded poll on the request thread (no " &
                         "sleep primitive in the mod SDK)" else: "immediate"))
-  o.put("events", eventsSince(since, limit))
-  o.put("pending", pendingAcks())
+  withModLock:
+    o.put("latestSeq", latestSeq())
+    o.put("events", eventsSince(since, limit))
+    o.put("pending", pendingAcks())
+    o.put("tornReads", streamTornReads())
   result = done(o).text
 
 proc onAck(url, body, session: string): string =
@@ -762,15 +800,17 @@ proc onAck(url, body, session: string): string =
   let ok = jr.asBool(jr.field(body, "ok"), true)
   let note = jr.asText(jr.field(body, "note"), "")
   var cleared = false
+  var o = obj()
   withModLock:
     cleared = ackEvent(s, ok, note)
-  var o = obj()
-  o.put("ok", cleared)
-  o.put("seq", s)
-  if not cleared:
-    o.put("err", "seq " & $s & " is not a pending directive (already acked, " &
-          "expired, or never needed an ack)")
-  o.put("pending", pendingAcks())
+    o.put("ok", cleared)
+    o.put("seq", s)
+    if not cleared:
+      o.put("err", "seq " & $s & " is not a pending directive (already " &
+            "acked, expired, or never needed an ack)")
+    # Inside the lock with the ack itself: read outside it and the tick's
+    # `expirePending` can rebuild the pending columns mid-walk.
+    o.put("pending", pendingAcks())
   result = done(o).text
 
 proc onSpawn(url, body, session: string): string =
@@ -782,19 +822,22 @@ proc onSpawn(url, body, session: string): string =
   var x = 0.0
   var y = 0.0
   var z = 0.0
-  playerPos(map, x, y, z)
   var reason = "resume where the world left the player"
-  let held = captiveOf()
-  if held.len > 0:
-    let hp = findPerson(held)
-    if hp >= 0:
-      map = personMap(hp)
-      personPos(hp, x, y, z)
-      reason = "held prisoner by " & personName(hp)
-  if map.len == 0 and placeCount() > 0:
-    map = placeMap(0)
-    placePos(0, x, y, z)
-    reason = "no recorded position; first place in the world"
+  # Under the lock like every other route that reads world rows: the tick moves
+  # people and rebuilds the stream on another thread.
+  withModLock:
+    playerPos(map, x, y, z)
+    let held = captiveOf()
+    if held.len > 0:
+      let hp = findPerson(held)
+      if hp >= 0:
+        map = personMap(hp)
+        personPos(hp, x, y, z)
+        reason = "held prisoner by " & personName(hp)
+    if map.len == 0 and placeCount() > 0:
+      map = placeMap(0)
+      placePos(0, x, y, z)
+      reason = "no recorded position; first place in the world"
   var o = obj()
   o.put("map", map)
   o.put("x", x)
@@ -802,7 +845,8 @@ proc onSpawn(url, body, session: string): string =
   o.put("z", z)
   o.put("reason", reason)
   let payload = done(o).text
-  discard emitEvent("player.spawn", payload, true, 60000)
+  withModLock:
+    discard emitEvent("player.spawn", payload, true, 60000)
   if gAutoRaid:
     discard broadcast("basement.raid.request", payload)
   var root = obj()
@@ -1570,10 +1614,20 @@ proc chk14PushToTalk() =
   ## Push-to-talk end to end, in one route, with no game and no client.
   ##
   ## The falsifiable property is the FINISHED STATE, not our own write: after
-  ## `down` + a bounded wait, the file the recorder was told to write must
-  ## EXIST and must have grown past its 44-byte header; after `up`, the stt
-  ## session must be GONE from the session table and a `heard.final` must be on
-  ## the stream. A second `up` is the negative control -- it must be refused.
+  ## `up` the file the recorder was told to write must EXIST and be past its
+  ## 44-byte header, PCM must actually have been fed into the session, and the
+  ## stt session must be GONE from the session table. A second `up` is the
+  ## negative control -- it must be refused.
+  ##
+  ## TWO THINGS THIS USED TO GET WRONG, both MEASURED 2026-09-07:
+  ## * it read the wav size BEFORE `up`. recorder.exe writes the RIFF sizes and
+  ##   closes the file only when it stops, so the size was always -1 and the
+  ##   check reported INCONCLUSIVE ("the recorder produced no audio") in the
+  ##   same breath as a note quoting 40684 bytes on disk.
+  ## * it looked for `heard.final` on the stream. `pttStop` does not emit that
+  ##   -- the ROUTE does -- and the route cannot be called from here, because
+  ##   the selfcheck already holds the non-reentrant mod lock. That half is
+  ##   asserted through the real route by tools/basement_check.py.
   ##
   ## Three outcomes. A missing recorder.exe, or a recorder that exited
   ## NO_DEVICES because `waveInGetNumDevs()` is 0 on this machine (aowl.voice
@@ -1605,9 +1659,8 @@ proc chk14PushToTalk() =
   var partial = ""
   var pumpNote = ""
   let pumped = pttPump(partial, pumpNote)
-  let grew = sizeOfFile(wav) > 44
+  let midBytes = sizeOfFile(wav)
   let statusMid = pttStatus()
-  let beforeSeq = latestSeq()
   var closed = ""
   var finalText = ""
   var stopNote = ""
@@ -1617,24 +1670,173 @@ proc chk14PushToTalk() =
   var f2 = ""
   var n2 = ""
   let secondRefused = not pttStop(c2, f2, n2)
-  var sawFinal = false
-  let evText = done(objOf("events", eventsSince(beforeSeq, 50))).text
-  for e in jr.each(jr.field(evText, "events")):
-    if jr.asText(jr.child(e, "kind"), "") == "heard.final": sawFinal = true
+  # Read AFTER `up`: that is when the recorder has closed the file.
+  let finalBytes = sizeOfFile(wav)
+  let grew = finalBytes > 44
+  let statusEnd = pttStatus()
+  let fed = jr.asInt(jr.field(done(statusEnd).text, "pcmFed"), 0)
   let sessionGone = not pttActive()
-  let evidence = "wav " & wav & " is " & $sizeOfFile(wav) & " bytes (>44 " &
-    $grew & "), pump " & $pumped & ": " & pumpNote & "; mid-recording status " &
-    done(statusMid).text & "; `up` " & $stopped & " final text " &
-    $finalText.len & " chars, heard.final on the stream " & $sawFinal &
-    ", session closed " & $sessionGone & ", a second `up` refused " &
-    $secondRefused & " (" & n2 & "); " & stopNote
+  let evidence = "wav " & wav & " is " & $finalBytes & " bytes after `up` " &
+    "(>44 " & $grew & "; mid-recording it was " & $midBytes &
+    ", which is EXPECTED -- the recorder writes the sizes only when it " &
+    "stops), " & $fed & " PCM byte(s) fed, pump " & $pumped & ": " & pumpNote &
+    "; mid-recording status " & done(statusMid).text & "; `up` " & $stopped &
+    " final text " & $finalText.len & " chars, session closed " &
+    $sessionGone & ", a second `up` refused " & $secondRefused & " (" & n2 &
+    "); " & stopNote
   if not grew:
     check(14, "push to talk", "INCONCLUSIVE",
           "the recorder produced no audio -- this is a capture-device " &
           "question, not a code one. " & evidence)
     return
   check(14, "push to talk",
-        verdictOf(stopped and sawFinal and sessionGone and secondRefused),
+        verdictOf(stopped and fed > 0 and sessionGone and secondRefused),
+        evidence)
+
+proc chk15AckFlagAndEmptyTurn() =
+  ## The two halves of the 2026-09-07 live failure, both asserted on the
+  ## FINISHED STATE that is actually SERVED -- never on our own write.
+  ##
+  ## A. THE ACK FLAG. `bm/stream` kept `needsAck` only in the server-side
+  ##    pending list, so the served event carried no ack field at all and the
+  ##    SPT client (`Link.cs`, which reads `ack`) could not know any directive
+  ##    wanted one. Every needsAck directive was therefore dropped after its
+  ##    ttl while the client logged "carries no ack. Ignored". The assertion
+  ##    parses the SERVED document out of `eventsSince` and demands ack:true
+  ##    on the needsAck event AND ack:false on the plain one -- the second half
+  ##    is the negative control: a `put("ack", true)` on every event would pass
+  ##    the first and fail this.
+  ##
+  ## B. THE EMPTY TURN. `ptt down` then `up` with the recorder having written
+  ##    nothing: 0 PCM bytes, an empty transcript. The finished state must be a
+  ##    `heard.final` on the stream carrying the empty text AND a REFUSAL note
+  ##    naming why the brain was not asked -- not a silent skip, and not a turn
+  ##    spoken with an empty utterance. This is the exact sequence that ran on
+  ##    the live sidecar immediately before it died.
+  let base = latestSeq()
+  let sPlain = emitEvent("selfcheck.ackflag.plain", "{\"i\":1}", false)
+  let sAck = emitEvent("selfcheck.ackflag.needsack", "{\"i\":2}", true, 30000)
+  var plainFlag = -2
+  var ackFlag = -2
+  var ackTtl = -1
+  let served = done(objOf("events", eventsSince(base, 100))).text
+  for e in jr.each(jr.field(served, "events")):
+    let k = jr.asText(jr.child(e, "kind"), "")
+    if k == "selfcheck.ackflag.plain":
+      plainFlag = (if jr.asBool(jr.child(e, "ack"), true): 1 else: 0)
+    elif k == "selfcheck.ackflag.needsack":
+      ackFlag = (if jr.asBool(jr.child(e, "ack"), false): 1 else: 0)
+      ackTtl = jr.asInt(jr.child(e, "ttlMs"), -1)
+  discard ackEvent(sAck, true, "selfcheck")
+  let flagsOk = plainFlag == 0 and ackFlag == 1 and ackTtl == 30000
+
+  # B -- the empty push-to-talk turn.
+  if pttActive():
+    var s0 = ""
+    var f0 = ""
+    var n0 = ""
+    discard pttStop(s0, f0, n0)
+  let emptyBase = latestSeq()
+  var wav = ""
+  var already = false
+  var startNote = ""
+  var emptyOk = false
+  var emptyWhy = ""
+  if not pttStart("selfcheck-emptyturn", wav, already, startNote):
+    emptyWhy = "`down` refused (" & startNote & ") -- the empty-turn half " &
+               "could not be exercised"
+  else:
+    var closed = ""
+    var finalText = ""
+    var stopNote = ""
+    # NO pump and no wait: `up` lands before the recorder has written a byte,
+    # which is the live sequence (1563 ms held, 0 PCM bytes fed, wav -1 bytes).
+    let stopped = pttStop(closed, finalText, stopNote)
+    # `heard.final` is emitted by the ROUTE (`onPtt`), not by `pttStop`, and
+    # the route cannot be called from here -- the selfcheck already holds the
+    # mod lock and it is not reentrant. So what is asserted here is what
+    # `pttStop` itself finishes with; `tools/basement_check.py` asserts the
+    # `heard.final` half through the real route, where it belongs.
+    let sawFinal = closed == "selfcheck-emptyturn"
+    let finalWasEmpty = finalText.len == 0
+    let sessionGone = not pttActive()
+    # The say path must REFUSE an empty utterance with a note, not speak it.
+    var directives = 0
+    var tagNote = ""
+    var spokeAnyway = false
+    if personCount() > 0:
+      let pid = personId(0)
+      let before = latestSeq()
+      let d = speakTurn(pid, "", directives, tagNote)
+      spokeAnyway = d.text.len > 0 or latestSeq() != before
+    emptyOk = stopped and sawFinal and finalWasEmpty and sessionGone and
+              not spokeAnyway
+    emptyWhy = "`up` " & $stopped & " closed session '" & closed & "' (" &
+               $sawFinal & ") with an EMPTY transcript " & $finalWasEmpty &
+               ", session gone " & $sessionGone &
+               "; an empty utterance was spoken anyway " & $spokeAnyway &
+               " (must be false); " & stopNote
+
+  check(15, "ack flag on the wire + the empty push-to-talk turn",
+        verdictOf(flagsOk and emptyOk),
+        "SERVED ack flags: plain=" & $plainFlag & " (must be 0), needsAck=" &
+        $ackFlag & " (must be 1), ttlMs=" & $ackTtl & " (must be 30000); " &
+        "torn stream reads " & $streamTornReads() & " (must be 0); " & emptyWhy)
+
+proc chk16BarkCarriesWav() =
+  ## An ENCOUNTER-emitted line must arrive with a playable wav.
+  ##
+  ## MEASURED 2026-09-07: `/say` produced piper wavs while the threat bark
+  ## after `player_aimed_at` reached the client as `"wav":""` -- the plugin
+  ## logged "(no wav -- TTS is off, missing or failed; the text IS the line)".
+  ## Two copies of the say payload had drifted; only one called `ttsSegment`.
+  ##
+  ## The assertion is on the SERVED event, not on `emitBark`'s return value,
+  ## and on the FILE: the wav path in the payload must exist on disk. The
+  ## negative control is the `text` -- a payload with a wav and no text would
+  ## fail, so this cannot pass by emitting an empty segment.
+  ##
+  ## With `ttsEngine` none or an absent piper the honest answer is
+  ## INCONCLUSIVE with the probe's own note; it is never a PASS.
+  if personCount() == 0:
+    check(16, "an encounter bark carries a wav", "INCONCLUSIVE",
+          "no people in the world to bark at")
+    return
+  let tp = ttsProbe()
+  let pid = personId(0)
+  let base = latestSeq()
+  var note = ""
+  let n = observe("player_aimed_at", pid, "", "{}", note)
+  var sayText = ""
+  var sayWav = ""
+  var sayNote = ""
+  var source = ""
+  let served = done(objOf("events", eventsSince(base, 100))).text
+  for e in jr.each(jr.field(served, "events")):
+    if jr.asText(jr.child(e, "kind"), "") == "say":
+      let d = jr.child(e, "data")
+      if jr.asText(jr.child(d, "source"), "") == "encounter":
+        sayText = jr.asText(jr.child(d, "text"), "")
+        sayWav = jr.asText(jr.child(d, "wav"), "")
+        sayNote = jr.asText(jr.child(d, "ttsNote"), "")
+        source = "encounter"
+  let evidence = "observe emitted " & $n & " directive(s) (" & note &
+    "); the served encounter say is text=" & $sayText.len & " chars, wav='" &
+    sayWav & "' exists=" & $exists(sayWav) & ", ttsNote=" & sayNote &
+    "; tts probe " & tp.engine & " ok=" & $tp.ok & " (" & tp.note & ")"
+  if source.len == 0:
+    check(16, "an encounter bark carries a wav", "FAIL",
+          "no `say` event with source=encounter reached the stream at all. " &
+          evidence)
+    return
+  if not tp.ok:
+    check(16, "an encounter bark carries a wav", "INCONCLUSIVE",
+          "tts is unavailable, so whether the bark WOULD carry a wav cannot " &
+          "be established here -- and a missing engine is never a PASS. " &
+          evidence)
+    return
+  check(16, "an encounter bark carries a wav",
+        verdictOf(sayText.len > 0 and sayWav.len > 0 and exists(sayWav)),
         evidence)
 
 proc onSelfcheck(url, body, session: string): string =
@@ -1657,6 +1859,8 @@ proc onSelfcheck(url, body, session: string): string =
     chk12KnownIds()
     chk13LootBus()
     chk14PushToTalk()
+    chk15AckFlagAndEmptyTurn()
+    chk16BarkCarriesWav()
     # Put back whatever was on disk: the checks above generated and advanced a
     # world in memory, and leaving that in place would quietly replace the
     # player's.

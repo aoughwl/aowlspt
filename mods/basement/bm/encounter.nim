@@ -38,6 +38,7 @@ import rng
 import util
 import items
 import gen
+import speech
 
 # ---------------------------------------------------------------------------
 # Configuration. Literal initialisers only — nimony zeroes a DLL global whose
@@ -241,14 +242,26 @@ proc emitBark(personId, text: string): int =
   ## A canned line from the machine itself, NOT from the brain. It is tagged
   ## `"source":"encounter"` precisely so nobody reads a barked threat as model
   ## output on the stream.
-  var o = obj()
-  o.put("personId", personId)
-  o.put("text", text)
-  o.put("wav", "")
-  o.put("segmentIdx", 0)
-  o.put("final", true)
-  o.put("source", "encounter")
-  result = directive("say", done(o).text, false)
+  ##
+  ## It goes through `speech.sayPayload`, the same builder `/say` uses, so a
+  ## bark is SPOKEN and not merely printed: before 2026-09-07 this built its
+  ## own object with `"wav":""` hardcoded and every encounter line arrived at
+  ## the client mute. Split per sentence for the same reason the brain streams
+  ## per sentence -- the client plays segments in order.
+  result = 0
+  let pi = findPerson(personId)
+  let voice = (if pi >= 0: personVoice(pi) else: "")
+  var parts = splitSentences(text)
+  if parts.len == 0: parts = @[text]
+  var i = 0
+  while i < parts.len:
+    var wav = ""
+    var cached = false
+    var note = ""
+    let payload = sayPayload(personId, voice, parts[i], i,
+                             i == parts.len - 1, "encounter", wav, cached, note)
+    result = result + directive("say", payload, false)
+    i = i + 1
 
 # ---------------------------------------------------------------------------
 # Captivity

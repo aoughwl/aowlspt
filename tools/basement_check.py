@@ -519,7 +519,7 @@ def check_grounding(rep, store):
 # ---------------------------------------------------------------------------
 
 def check_ptt(rep, store):
-    """`down` -> a wav that GROWS -> `up` -> heard.final -> a second `up` refused.
+    """`down` -> `up` -> a complete wav + heard.final -> a second `up` refused.
 
     Two things this has to be careful about, and neither is optional:
 
@@ -531,9 +531,9 @@ def check_ptt(rep, store):
     * NO CAPTURE DEVICE IS INCONCLUSIVE, NEVER PASS AND NEVER "SILENCE".
       aowl.voice DESIGN 5.1 measured `waveInGetNumDevs()==0` on this machine;
       the recorder exits 2 with NO_DEVICES in that case. The mod runs it
-      through a .cmd wrapper that captures the exit code precisely so this
-      check can quote it instead of guessing, and `ptt.outcome` is that
-      string.
+      through a PowerShell wrapper that owns the child, stops it on a stop
+      file and captures the exit code precisely so this check can quote it
+      instead of guessing, and `ptt.outcome` is that string.
     """
     sess = "check-ptt"
     routes = [
@@ -574,18 +574,25 @@ def check_ptt(rep, store):
     # `riffDataSizeField` is what the file's own header CLAIMS -- printing both
     # is the measurement, not a decoration: the recorder leaves that field at 0
     # until it exits, which is why the pump takes the data chunk's offset.
-    st = (status or {}).get("ptt", {})
+    # MEASURED 2026-09-07: recorder.exe writes the RIFF size fields and closes
+    # the file only when it STOPS, so "the wav grows while recording" was a
+    # property the recorder does not have -- a check that could only ever come
+    # back INCONCLUSIVE. What IS observable is the finished state after `up`:
+    # a wav past its 44-byte header with PCM actually fed into the session.
+    st_mid = (status or {}).get("ptt", {})
+    st = (up or {}).get("ptt", {})
     wav_bytes = st.get("wavBytes", -1)
     outcome = st.get("outcome", "")
     poll_note = (poll or {}).get("note", "")
     if wav_bytes is None or wav_bytes <= 44:
-        rep.add(INCONCLUSIVE, "ptt: the wav grows while recording",
-                "wavBytes=%s (a header is 44) -- recorder %s; poll said %r. "
-                "This is a capture-device question, not a code one."
-                % (wav_bytes, outcome, poll_note[:200]))
+        rep.add(INCONCLUSIVE, "ptt: `up` leaves a complete wav on disk",
+                "wavBytes=%s after `up` (a header is 44); mid-recording it was "
+                "%s -- recorder %s; poll said %r. This is a capture-device "
+                "question, not a code one."
+                % (wav_bytes, st_mid.get("wavBytes"), outcome, poll_note[:200]))
     else:
         rep.add(PASS if st.get("pcmFed", 0) > 0 else FAIL,
-                "ptt: the wav grows while recording",
+                "ptt: `up` leaves a complete wav on disk",
                 "wavBytes=%s pcmFed=%s riffDataSizeField=%s (%s Hz %sch %s-bit); "
                 "recorder %s"
                 % (wav_bytes, st.get("pcmFed"), st.get("riffDataSizeField"),
@@ -610,6 +617,125 @@ def check_ptt(rep, store):
             "ptt: a second up without a down is refused (negative control)",
             "ok=%s note=%r"
             % ((up2 or {}).get("ok"), (up2 or {}).get("note", "")[:200]))
+
+
+# ---------------------------------------------------------------------------
+# 5. the 2026-09-07 live crash sequence, through the ROUTES
+# ---------------------------------------------------------------------------
+#
+# The backend died with
+#     ../../../../nimony/lib/std/system/seqimpl.nim(167, 41):
+#     i < s.len and 0 <= i [AssertionDefect]
+# during a raid, with no stack. Root cause: `/events` built its payload
+# WITHOUT the mod lock while the tick thread's `expirePending` ->
+# `dropPendingAt` rebuilt the pending columns under it, so `pendingAcks`
+# indexed `gPendKind[i]` past the new end.
+#
+# A single-threaded simulator cannot reproduce a data race, and pretending it
+# can would be a check that cannot fail. What IS asserted here is the whole
+# observable sequence plus the two properties that make the race impossible to
+# reach silently again:
+#
+#   * every served event carries `ack` and `ttlMs` -- the field the SPT client
+#     reads. Without them the client acks nothing and every directive is
+#     dropped after its ttl (which is what the live log showed).
+#   * `stream.tornReads` on /status is 0. It counts every time the parallel
+#     event/pending columns were found at DIFFERENT lengths, which is exactly
+#     the state the assertion fired on. A non-zero value is the race, observed.
+#
+# The negative control is the `ack` flag on a plain event: it must be FALSE.
+# A build that stamped `"ack": true` on everything would pass the positive
+# half and fail this one.
+
+
+def check_crash_sequence(rep, store):
+    docs, raw, err = run_sim(store, [
+        (BASE + "/world/new", '{"preset":"warlords","seed":11}'),
+        (BASE + "/world/people", ""),
+    ])
+    if err:
+        rep.add(INCONCLUSIVE, "crash seq: world/new", err)
+        return
+    people = docs[1]
+    person = None
+    for p in (people or {}).get("people", []):
+        if p.get("alive", True):
+            person = p
+            break
+    if person is None:
+        rep.add(INCONCLUSIVE, "crash seq: world/people",
+                "the generated world has nobody alive to aim at")
+        return
+    pid = person["id"]
+    routes = [
+        (BASE + "/world/new", '{"preset":"warlords","seed":11}'),
+        (BASE + "/spawn", ""),
+        (BASE + "/observe",
+         json.dumps({"kind": "player_seen", "personId": pid, "distanceM": 8})),
+        (BASE + "/observe",
+         json.dumps({"kind": "player_aimed_at", "personId": pid})),
+        (BASE + "/speech/ptt", '{"session":"crashseq","state":"down"}'),
+        (BASE + "/speech/ptt", '{"session":"crashseq","state":"up"}'),
+        (BASE + "/say", json.dumps({"person": pid, "text": ""})),
+        (BASE + "/events?since=0&wait=0", ""),
+        (BASE + "/status", ""),
+    ]
+    docs, raw, err = run_sim(store, routes)
+    if err:
+        rep.add(INCONCLUSIVE, "crash seq: the run", err)
+        return
+    ev, status = docs[7], docs[8]
+    if ev is None or status is None:
+        rep.add(FAIL, "crash seq: the backend survived the whole sequence",
+                "the simulator stopped answering partway through -- exactly "
+                "the shape of the live death. Last output: %s" % raw[-600:])
+        return
+
+    rep.add(PASS, "crash seq: the backend survived the whole sequence",
+            "spawn + seen + aimed_at + ptt down/up (0 PCM bytes) + say with "
+            "an empty text + events + status all answered")
+
+    # `/say` with an empty text must REFUSE with a note, never speak.
+    say = docs[6]
+    said = (say or {}).get("text", "") or (say or {}).get("reply", "")
+    rep.add(PASS if isinstance(say, dict) and not said and
+            (say.get("err") or say.get("note") or say.get("notes"))
+            else FAIL,
+            "crash seq: /say with an empty text refuses with a note",
+            "answered %s" % json.dumps(say)[:200])
+
+    # ack / ttlMs on the wire, both polarities.
+    plain, needs = None, None
+    for e in (ev or {}).get("events", []):
+        if not isinstance(e, dict):
+            continue
+        if e.get("kind") == "player.spawn":
+            needs = e
+        elif e.get("kind") in ("npc.stance", "say") and plain is None:
+            plain = e
+    if needs is None or plain is None:
+        rep.add(INCONCLUSIVE, "crash seq: ack/ttlMs on every served event",
+                "the stream carried no needsAck (player.spawn) and/or plain "
+                "(npc.stance|say) event to compare: kinds=%s"
+                % sorted(set(kinds_on_stream(ev))))
+    else:
+        ok = (needs.get("ack") is True and int(needs.get("ttlMs") or 0) > 0
+              and plain.get("ack") is False
+              and plain.get("ttlMs") == 0)
+        rep.add(PASS if ok else FAIL,
+                "crash seq: ack/ttlMs on every served event (negative control: "
+                "a plain event must read ack=false)",
+                "player.spawn ack=%r ttlMs=%r ; %s ack=%r ttlMs=%r"
+                % (needs.get("ack"), needs.get("ttlMs"), plain.get("kind"),
+                   plain.get("ack"), plain.get("ttlMs")))
+
+    torn = ((status or {}).get("stream") or {}).get("tornReads")
+    rep.add(PASS if torn == 0 else (FAIL if isinstance(torn, int)
+                                    else INCONCLUSIVE),
+            "crash seq: stream.tornReads is 0 (the columns never disagreed)",
+            "tornReads=%r -- any other value means a route walked the stream "
+            "without the mod lock while the tick rebuilt it, which is the "
+            "AssertionDefect that killed the backend" % (torn,))
 
 
 def main():
@@ -639,6 +765,8 @@ def main():
         check_grounding(rep, store)
         print("")
         check_ptt(rep, store)
+        print("")
+        check_crash_sequence(rep, store)
     finally:
         if cfg_path and original is not None:
             open(cfg_path, "w", encoding="utf-8").write(original)

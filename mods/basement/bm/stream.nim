@@ -60,6 +60,10 @@ var gSeqNo: seq[int] = @[]
 var gAtMs: seq[int64] = @[]
 var gKind: seq[string] = @[]
 var gData: seq[string] = @[]       ## already-JSON text, "{}" when absent
+var gAck: seq[bool] = @[]          ## did this event ask to be acknowledged
+var gTtl: seq[int64] = @[]         ## its ttl in ms (0 when it needs no ack)
+
+var gTorn: int = 0                 ## reads that found the columns disagreeing
 
 var gNext: int = 0                 ## the seq the NEXT event gets
 var gDropped: int = 0              ## events evicted from the ring (overflow)
@@ -114,24 +118,79 @@ proc firstSeq*(): int =
 
 proc eventCount*(): int = gSeqNo.len
 
+proc ringLen(): int =
+  ## How many events every parallel column ACTUALLY has.
+  ##
+  ## Under the mod lock these six seqs are always the same length. They can
+  ## only disagree if a reader ran WITHOUT the lock while a writer rebuilt the
+  ## ring -- MEASURED 2026-09-07: `onEvents` built its payload unlocked while
+  ## the tick's `expirePending` swapped in shorter seqs, and the reader indexed
+  ## past the new end. nimony answers that with
+  ## `seqimpl.nim(167, 41): i < s.len and 0 <= i [AssertionDefect]` and the
+  ## whole backend process dies with no stack.
+  ##
+  ## The lock is the fix; this is the guard that makes the failure LOUD instead
+  ## of fatal if the lock is ever dropped again. It returns the shortest column
+  ## and `gTorn` counts every disagreement, which `streamStats` reports -- a
+  ## torn read is announced, never silently rounded away.
+  result = gSeqNo.len
+  if gAtMs.len < result: result = gAtMs.len
+  if gKind.len < result: result = gKind.len
+  if gData.len < result: result = gData.len
+  if gAck.len < result: result = gAck.len
+  if gTtl.len < result: result = gTtl.len
+  if result != gSeqNo.len: gTorn = gTorn + 1
+
+proc pendLen(): int =
+  ## The same property for the pending-ack columns, which `dropPendingAt`
+  ## REBUILDS -- so an unlocked reader sees them shrink under it.
+  result = gPendSeq.len
+  if gPendKind.len < result: result = gPendKind.len
+  if gPendDue.len < result: result = gPendDue.len
+  if result != gPendSeq.len: gTorn = gTorn + 1
+
+proc streamTornReads*(): int = gTorn
+
 proc trimRing() =
   ## Enforce the bound by rebuilding without the oldest entries -- nimony's seq
   ## has no `delete`, so this is a copy, not an in-place shift.
   if gSeqNo.len <= gMax: return
-  let cut = gSeqNo.len - gMax
+  let n = ringLen()
+  let cut = n - gMax
+  if cut <= 0: return
   var s2: seq[int] = @[]; var a2: seq[int64] = @[]
   var k2: seq[string] = @[]; var d2: seq[string] = @[]
+  var q2: seq[bool] = @[]; var t2: seq[int64] = @[]
   var i = cut
-  while i < gSeqNo.len:
+  while i < n:
     s2.add gSeqNo[i]; a2.add gAtMs[i]; k2.add gKind[i]; d2.add gData[i]
+    q2.add gAck[i]; t2.add gTtl[i]
     i = i + 1
-  gSeqNo = s2; gAtMs = a2; gKind = k2; gData = d2
+  gSeqNo = s2; gAtMs = a2; gKind = k2; gData = d2; gAck = q2; gTtl = t2
   gDropped = gDropped + cut
 
 proc eventJsonText(i: int): string =
   ## One event as JSON text. `data` is spliced in raw -- it is JSON produced by
   ## a caller inside this mod, never a request body -- and an empty/blank data
   ## becomes `{}` so the document is always parseable.
+  ##
+  ## `ack` and `ttlMs` are per EVENT because they are the client's only way to
+  ## know a directive must be acknowledged: the pending list is server-side
+  ## state the client never sees. Without them every needsAck directive is
+  ## dropped after its ttl while the client logs "carries no ack. Ignored" --
+  ## MEASURED 2026-09-07 on the first live SPT 4.1.5 raid.
+  if i < 0 or i >= ringLen():
+    var t = obj()
+    t.put("seq", -1)
+    t.put("atMs", 0)
+    t.put("kind", "stream.torn")
+    t.put("data", server.raw("{}"))
+    t.put("ack", false)
+    t.put("ttlMs", 0)
+    t.put("note", "REFUSED: event index " & $i & " is outside the ring (" &
+          $ringLen() & " entries). The stream was read without the mod lock " &
+          "while it was being rebuilt. No event is invented here.")
+    return done(t).text
   var d = gData[i].strip()
   if d.len == 0: d = "{}"
   var o = obj()
@@ -139,6 +198,8 @@ proc eventJsonText(i: int): string =
   o.put("atMs", int(gAtMs[i]))
   o.put("kind", gKind[i])
   o.put("data", server.raw(d))
+  o.put("ack", gAck[i])
+  o.put("ttlMs", int(gTtl[i]))
   result = done(o).text
 
 proc emitEvent*(kind, json: string; needsAck: bool; ttlMs: int64 = 0): int =
@@ -148,20 +209,24 @@ proc emitEvent*(kind, json: string; needsAck: bool; ttlMs: int64 = 0): int =
   ## read as delivery.
   gNext = gNext + 1
   let s = gNext
+  var ttl = 0'i64
+  if needsAck:
+    ttl = ttlMs
+    if ttl <= 0: ttl = gDefaultTtlMs
   gSeqNo.add s
   gAtMs.add nowMs()
   gKind.add kind
   gData.add json
+  gAck.add needsAck
+  gTtl.add ttl
   trimRing()
   if needsAck:
-    var ttl = ttlMs
-    if ttl <= 0: ttl = gDefaultTtlMs
     gPendSeq.add s
     gPendKind.add kind
     gPendDue.add (nowMs() + ttl)
   if gPushSession.len > 0 and notifyReady():
     let sess = gPushSession
-    let payload = eventJsonText(gSeqNo.len - 1)
+    let payload = eventJsonText(ringLen() - 1)
     let st = notifyPush(sess, payload)
     if st == Ok: gPushOk = gPushOk + 1
     else: gPushFail = gPushFail + 1
@@ -172,7 +237,8 @@ proc eventsSince*(since: int; limit: int): JsonArray =
   var a = arr()
   var n = 0
   var i = 0
-  while i < gSeqNo.len:
+  let stop = ringLen()
+  while i < stop:
     if gSeqNo[i] > since:
       if limit > 0 and n >= limit: break
       a.add server.raw(eventJsonText(i))
@@ -182,16 +248,18 @@ proc eventsSince*(since: int; limit: int): JsonArray =
 
 proc findPending(s: int): int =
   var i = 0
-  while i < gPendSeq.len:
+  let stop = pendLen()
+  while i < stop:
     if gPendSeq[i] == s: return i
     i = i + 1
   result = -1
 
 proc dropPendingAt(idx: int) =
-  if idx < 0 or idx >= gPendSeq.len: return
+  if idx < 0 or idx >= pendLen(): return
   var s2: seq[int] = @[]; var k2: seq[string] = @[]; var d2: seq[int64] = @[]
   var i = 0
-  while i < gPendSeq.len:
+  let stop = pendLen()
+  while i < stop:
     if i != idx:
       s2.add gPendSeq[i]; k2.add gPendKind[i]; d2.add gPendDue[i]
     i = i + 1
@@ -217,7 +285,8 @@ proc ackEvent*(seq: int; ok: bool; note: string): bool =
 proc pendingAcks*(): JsonArray =
   var a = arr()
   var i = 0
-  while i < gPendSeq.len:
+  let stop = pendLen()
+  while i < stop:
     var o = obj()
     o.put("seq", gPendSeq[i])
     o.put("kind", gPendKind[i])
@@ -233,7 +302,7 @@ proc expirePending*(nowMs: int64; dropped: var seq[int]): int =
   ## of the code rather than a promise.
   dropped = @[]
   var i = 0
-  while i < gPendSeq.len:
+  while i < pendLen():
     if gPendDue[i] <= nowMs:
       let s = gPendSeq[i]
       let k = gPendKind[i]
@@ -264,6 +333,12 @@ proc streamStats*(): JsonObject =
   o.put("pushSession", gPushSession)
   o.put("pushReady", notifyReady())
   o.put("pushOk", gPushOk)
+  o.put("tornReads", gTorn)
+  o.put("tornReadsNote",
+    "how many times the parallel event/pending columns were found at " &
+    "DIFFERENT lengths. It must stay 0: any other number means a route read " &
+    "the stream without the mod lock while the tick rebuilt it, which is the " &
+    "AssertionDefect that killed the backend on 2026-09-07.")
   o.put("pushFail", gPushFail)
   o.put("pushNote",
     (if notifyReady(): "host can push; each event is also notifyPush()ed"
@@ -279,12 +354,14 @@ proc streamStats*(): JsonObject =
 proc streamSnapshotJson*(): string =
   var a = arr()
   var i = 0
-  while i < gSeqNo.len:
+  let stop = ringLen()
+  while i < stop:
     a.add server.raw(eventJsonText(i))
     i = i + 1
   var p = arr()
   i = 0
-  while i < gPendSeq.len:
+  let pstop = pendLen()
+  while i < pstop:
     var o = obj()
     o.put("seq", gPendSeq[i])
     o.put("kind", gPendKind[i])
@@ -298,6 +375,17 @@ proc streamSnapshotJson*(): string =
   root.put("pending", done(p))
   result = done(root).text
 
+proc streamAckFlag*(s: int): int =
+  ## -1 = no such seq in the ring, 0 = ack:false, 1 = ack:true. The selfcheck
+  ## asserts the SERVED flag through `eventsSince`, not this -- this exists so
+  ## a caller can ask about one seq without parsing the whole document.
+  var i = 0
+  let stop = ringLen()
+  while i < stop:
+    if gSeqNo[i] == s: return (if gAck[i]: 1 else: 0)
+    i = i + 1
+  result = -1
+
 proc streamRestore*(text: string): int =
   ## Replace the ring with a snapshot. Returns the number of events restored,
   ## or -1 when the text is not a stream snapshot (so a corrupt document is a
@@ -306,6 +394,7 @@ proc streamRestore*(text: string): int =
   if jr.asText(jr.field(text, "schema"), "") != "aowlspt.basement.stream/1":
     return -1
   gSeqNo = @[]; gAtMs = @[]; gKind = @[]; gData = @[]
+  gAck = @[]; gTtl = @[]
   gPendSeq = @[]; gPendKind = @[]; gPendDue = @[]
   var maxSeen = 0
   for e in jr.each(jr.field(text, "events")):
@@ -315,6 +404,8 @@ proc streamRestore*(text: string): int =
     gAtMs.add int64(jr.asInt(jr.child(e, "atMs"), 0))
     gKind.add jr.asText(jr.child(e, "kind"), "")
     gData.add jr.raw(jr.child(e, "data"))
+    gAck.add jr.asBool(jr.child(e, "ack"), false)
+    gTtl.add int64(jr.asInt(jr.child(e, "ttlMs"), 0))
     if s > maxSeen: maxSeen = s
   for e in jr.each(jr.field(text, "pending")):
     let s = jr.asInt(jr.child(e, "seq"), 0)
