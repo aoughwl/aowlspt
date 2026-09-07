@@ -58,6 +58,7 @@ namespace Basement.Client
         private static AudioClip _clip;
         private static string _dev;
         private static int _readPos;
+        private static bool _prewarmFailed;
         private static float _lastChunkAt, _downAt, _startedAt;
         private static int _seq;
         private static Resampler _rs;
@@ -75,6 +76,16 @@ namespace Basement.Client
             if (!Plugin.Started) return;
             var key = Plugin.PushToTalkKey.Value;
             if (key == KeyCode.None) return;
+            // Pre-warm: open the device the moment a raid starts, off the press
+            // path, and close it when the raid ends. A failure is noted once and
+            // the press falls back to the backend recorder as before.
+            if (See.InRaid && _clip == null && Plugin.CaptureInProcess.Value && !_prewarmFailed)
+            {
+                string pw;
+                if (!StartMic(out pw)) { _prewarmFailed = true; if (Plugin.Once("mic-prewarm")) Plugin.Log.LogWarning("basement hear: could not pre-open the microphone at raid start (" + pw + "); presses will use the backend recorder."); }
+                else if (Plugin.Once("mic-prewarm-ok")) Plugin.Log.LogInfo("basement hear: microphone pre-opened at raid start and kept running; a press only marks the read position.");
+            }
+            else if (!See.InRaid && _clip != null) { StopMic(); _prewarmFailed = false; }
             if (!Holding && Input.GetKeyDown(key)) Down();
             else if (Holding && (Input.GetKeyUp(key) || !Input.GetKey(key))) Up();
             if (Holding && Mode == "mic")
@@ -129,7 +140,8 @@ namespace Basement.Client
             if (Mode == "mic")
             {
                 PumpMic(true);
-                StopMic();
+                // The device stays open until the raid ends (see Tick): closing
+                // and reopening it per press is what hitched the main thread.
             }
             else Post("up");
         }
@@ -172,6 +184,24 @@ namespace Basement.Client
                 if (!(min == 0 && max == 0)) { if (freq < min) freq = min; else if (freq > max) freq = max; }
             }
             catch (Exception ex) { if (Plugin.Once("mic-caps")) Plugin.Log.LogInfo("basement hear: GetDeviceCaps threw " + ex.Message + "; asking for 16000 Hz anyway."); }
+            // The device is opened ONCE per raid and kept running; a press only
+            // moves the read position. MEASURED 2026-09-07: opening the device on
+            // every V press stalled the main thread long enough that the player
+            // floated upward and snapped back on release (the game's position
+            // correction after a hitch).
+            bool running = false;
+            try { running = _clip != null && Microphone.IsRecording(_dev); } catch { running = false; }
+            if (running)
+            {
+                try { _readPos = Microphone.GetPosition(_dev); } catch { _readPos = 0; }
+                _rs = new Resampler(MicRate, 16000);
+                _seq = 0;
+                _startedAt = Time.unscaledTime;
+                _lastChunkAt = _startedAt;
+                MicWarmupMs = 0;
+                EnsureSender();
+                return true;
+            }
             try
             {
                 if (_clip != null) StopMic();
