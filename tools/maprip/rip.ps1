@@ -4,52 +4,49 @@
   D:\SPT415 with a PINNED AssetRipper, headless, one Unity project per location.
 
 .DESCRIPTION
-  MEASURED 2026-09-07 (see docs/MAP-RIP-AND-REIMPORT.md): the maps are NOT asset
-  bundles. Every location is a set of scenes BUILT INTO THE PLAYER as
+  MEASURED 2026-09-07 (docs/MAP-RIP-AND-REIMPORT.md): the maps are NOT asset bundles.
+  Every location is a set of scenes BUILT INTO THE PLAYER as
   EscapeFromTarkov_Data\level{N} + sharedassets{N}.assets (+ .resS); the only thing
   under StreamingAssets\Windows\maps\ is a 6-64 KB ScenesPreset that names those
-  scenes. So this script stages, per location, exactly the level/sharedassets files
-  its preset names (indices from tools\maprip\maps.json) plus the global files and
-  Managed\, as HARD LINKS (same volume, zero copy), and points AssetRipper at that
-  staging folder.
+  scenes. And the sharedassets files reference each other transitively: the
+  dependency closure of ONE map is 344-662 files / 17-19 GB (all 13: 1,542 files /
+  22.6 GB). So per map this script stages, as HARD LINKS (same volume, zero copy):
+  the map's level{N} files + the measured closure of sharedassets (+.resS) +
+  globalgamemanagers/resources.assets + Managed\, listed in maps.json
+  (`closureFiles`), and points AssetRipper at that folder. Scenes exported = that
+  map's only; assets exported = most of the game's (unavoidable, see the doc).
 
   AssetRipper 2.0.0 has NO export command line (measured: `--help` lists only
   --headless, --port, --log, --log-path, --local-web-file, --version). It is driven
-  through its HTTP API instead (measured from /openapi.json):
-     POST /LoadFolder            form Path=<dir>
-     POST /Settings/Update       form <SettingName>=<value>
-     POST /Export/UnityProject   form Path=<outdir>
-  This script starts it with --headless --port and POSTs those.
-
-  UNVERIFIED until the user runs it once: that LoadFolder / Export block until done
-  (they are plain form POSTs; the script also polls /Collections/Count as a loaded
-  signal), that a staged folder with only a subset of sharedassets{N} resolves every
-  cross-file reference (sharedassets0 + resources.assets are always included; a
-  missing reference exports as a missing PPtr, not a crash), and the export time
-  (estimate: ~1-3 min per GB of staged data; Streets ~4 GB, Customs ~6.3 GB).
+  through its HTTP API (measured from /openapi.json):
+     POST /LoadFolder            form Path=<dir>      -> 302 immediately, work is ASYNC
+     POST /Settings/Update       form <Setting>=<value>
+     POST /Export/UnityProject   form Path=<outdir>   -> 302 immediately, work is ASYNC
+  Progress and completion are only visible on the process's STDOUT (measured):
+     "Processing : Finished processing assets"   = load done
+     "Export : Finished post-export"             = export done
+  so the script redirects stdout to <OutRoot>\<map>.assetripper.log and polls it.
+  (`/Collections/Count` is per-collection and 404s without a Path -- it is NOT a
+  global readiness signal; measured.)
 
 .PARAMETER Maps
   Location ids to rip (keys of maps.json). Default: factory4_day only -- the
-  falsifiable first milestone. Use 'all' for every location.
-
-.PARAMETER OutRoot
-  Output root. Each map exports to <OutRoot>\<map>\ (a Unity project folder).
-
-.PARAMETER DryRun
-  Print what would be staged / posted; download nothing, run nothing.
+  falsifiable first milestone. 'all' = every location.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File tools\maprip\rip.ps1 -DryRun
-  powershell -ExecutionPolicy Bypass -File tools\maprip\rip.ps1                 # factory4_day
-  powershell -ExecutionPolicy Bypass -File tools\maprip\rip.ps1 -Maps Woods,bigmap
+  powershell -ExecutionPolicy Bypass -File tools\maprip\rip.ps1 -OutRoot D:\aowlspt-maprip -ToolRoot D:\aowlspt-tools\assetripper -TempDir D:\aowlspt-tools\tmp
 #>
 [CmdletBinding()]
 param(
   [string[]]$Maps = @('factory4_day'),
   [string]$GameData = 'D:\SPT415\EscapeFromTarkov_Data',
   [string]$OutRoot = 'D:\aowlspt-maprip',
-  [string]$ToolRoot = (Join-Path $env:LOCALAPPDATA 'aowlspt\assetripper'),
+  [string]$ToolRoot = 'D:\aowlspt-tools\assetripper',
+  [string]$TempDir = 'D:\aowlspt-tools\tmp',
   [int]$Port = 47311,
+  [int]$LoadTimeoutMin = 180,
+  [int]$ExportTimeoutMin = 720,
   [switch]$DryRun,
   [switch]$KeepStaging
 )
@@ -63,7 +60,7 @@ $ArExe     = 'AssetRipper.GUI.Free.exe'
 
 # ---- export settings (names measured from GET /Settings/Edit on 2.0.0)
 $ArSettings = @{
-  ScriptExportMode            = 'Hybrid'      # measured default; decompiles game scripts, keeps DLLs for the rest
+  ScriptExportMode            = 'Hybrid'      # measured default; decompiles what it can, keeps DLLs
   ShaderExportMode            = 'Dummy'       # measured default; EFT shaders are stripped -> Dummy avoids pink-material compile errors at reimport
   ScriptContentLevel          = 'Level1'
   BundledAssetsExportMode     = 'DirectExport'
@@ -71,26 +68,26 @@ $ArSettings = @{
   ImageExportFormat           = 'Png'
   EnableStaticMeshSeparation  = 'true'
   EnablePrefabOutlining       = 'false'
-  IgnoreStreamingAssets       = 'true'        # we stage nothing from StreamingAssets on purpose
+  IgnoreStreamingAssets       = 'true'
 }
 
-function Say([string]$m) { Write-Host "[maprip] $m" }
+function Say([string]$m) { Write-Host ("[maprip {0:HH:mm:ss}] {1}" -f (Get-Date), $m) }
 function Fail([string]$m) { Write-Host "[maprip] FAIL: $m" -ForegroundColor Red; exit 1 }
 
 # ---- 0. inputs
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $mapsJson = Join-Path $here 'maps.json'
-if (-not (Test-Path $mapsJson)) { Fail "missing $mapsJson (generated from the measured BuildSettings; see the doc)" }
+if (-not (Test-Path $mapsJson)) { Fail "missing $mapsJson" }
 $catalog = Get-Content -Raw $mapsJson | ConvertFrom-Json
 if (-not (Test-Path (Join-Path $GameData 'globalgamemanagers'))) { Fail "$GameData has no globalgamemanagers -- is this EscapeFromTarkov_Data?" }
-
 $unity = (Get-Item (Join-Path (Split-Path $GameData) 'UnityPlayer.dll')).VersionInfo.ProductVersion
-if ($unity -notlike '2022.3.43f1*') { Say "WARNING: UnityPlayer.dll reports '$unity', the catalog was measured on 2022.3.43f1 -- level indices may not match" }
+if ($unity -notlike '2022.3.43f1*') { Say "WARNING: UnityPlayer.dll reports '$unity'; maps.json was measured on 2022.3.43f1 -- level indices may not match" }
 
 $allNames = @($catalog.locations.PSObject.Properties.Name)
 $Maps = @($Maps | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })   # `powershell -File` hands "-Maps a,b" over as ONE string
 if ($Maps -contains 'all') { $Maps = $allNames }
 foreach ($m in $Maps) { if ($allNames -notcontains $m) { Fail "unknown map '$m'; known: $($allNames -join ', ')" } }
+if ((Split-Path -Qualifier $OutRoot) -ieq 'C:') { Say "WARNING: OutRoot is on C: (measured 8.8 GB free on 2026-09-07); exports are tens of GB" }
 
 # ---- 1. tool
 $arDir = Join-Path $ToolRoot $ArVersion
@@ -109,95 +106,129 @@ if ($DryRun) {
   if (-not (Test-Path $arPath)) { Fail "zip did not contain $ArExe" }
 }
 
-# ---- 2. per map
-$globalFiles = @('globalgamemanagers','globalgamemanagers.assets','resources.assets','resources.assets.resS','resources.resource',
-                 'sharedassets0.assets','sharedassets0.assets.resS','level0','level0.resS')
-
+# ---- 2. helpers
 function Stage-Map([string]$map, [string]$stage) {
   $loc = $catalog.locations.$map
+  $files = @($loc.closureFiles)
+  if (-not $files -or $files.Count -eq 0) { Fail "maps.json has no closureFiles for $map (regenerate with the UnityPy closure script in the doc)" }
   if (-not $DryRun) {
     if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
     New-Item -ItemType Directory -Force $stage | Out-Null
   }
-  $files = New-Object System.Collections.Generic.List[string]
-  foreach ($g in $globalFiles) { if (Test-Path (Join-Path $GameData $g)) { $files.Add($g) } }
-  foreach ($s in $loc.scenes) {
-    $i = $s.buildIndex
-    foreach ($f in @("level$i", "level$i.resS", "sharedassets$i.assets", "sharedassets$i.assets.resS")) {
-      if (Test-Path (Join-Path $GameData $f)) { $files.Add($f) }
-    }
-  }
-  $bytes = 0
+  $bytes = 0; $n = 0
   foreach ($f in $files) {
-    $src = Join-Path $GameData $f; $dst = Join-Path $stage $f
-    $bytes += (Get-Item $src).Length
+    $src = Join-Path $GameData $f
+    if (-not (Test-Path $src)) { continue }
+    $bytes += (Get-Item $src).Length; $n++
     if (-not $DryRun) {
-      try { New-Item -ItemType HardLink -Path $dst -Target $src | Out-Null }
-      catch { Copy-Item $src $dst }   # different volume -> copy
+      $dst = Join-Path $stage $f
+      try { New-Item -ItemType HardLink -Path $dst -Target $src | Out-Null } catch { Copy-Item $src $dst }
     }
   }
-  # Managed\ is needed for script typetrees (AssetRipper "Mono scripts from bundles" note); link the whole dir
-  $man = Join-Path $stage 'Managed'
   if (-not $DryRun) {
-    New-Item -ItemType Directory -Force $man | Out-Null
+    $man = Join-Path $stage 'Managed'; New-Item -ItemType Directory -Force $man | Out-Null
     Get-ChildItem (Join-Path $GameData 'Managed') -Filter *.dll | ForEach-Object {
       try { New-Item -ItemType HardLink -Path (Join-Path $man $_.Name) -Target $_.FullName | Out-Null } catch { Copy-Item $_.FullName $man }
     }
   }
-  Say ("staged {0}: {1} scenes, {2} files, {3:N2} GB (+Managed)" -f $map, $loc.scenes.Count, $files.Count, ($bytes/1GB))
+  Say ("staged {0}: {1} scenes, {2} files, {3:N2} GB (+Managed)" -f $map, $loc.scenes.Count, $n, ($bytes/1GB))
   return $bytes
 }
 
-function Post-Form([string]$path, [hashtable]$form, [int]$timeoutSec) {
+function Post-Form([string]$path, [hashtable]$form) {
   $body = ($form.GetEnumerator() | ForEach-Object { [uri]::EscapeDataString($_.Key) + '=' + [uri]::EscapeDataString([string]$_.Value) }) -join '&'
-  return Invoke-WebRequest -Uri "http://127.0.0.1:$Port$path" -Method Post -Body $body -ContentType 'application/x-www-form-urlencoded' -UseBasicParsing -TimeoutSec $timeoutSec
+  # both Load and Export answer 302 at once; -MaximumRedirection 0 keeps IWR from following it and throwing
+  try { Invoke-WebRequest -Uri "http://127.0.0.1:$Port$path" -Method Post -Body $body -ContentType 'application/x-www-form-urlencoded' -UseBasicParsing -TimeoutSec 120 -MaximumRedirection 0 -ErrorAction SilentlyContinue | Out-Null } catch { }
 }
 
-function Start-Ripper([string]$logPath) {
-  $p = Start-Process -FilePath $arPath -ArgumentList @('--headless','--port',"$Port",'--log','true','--log-path',"`"$logPath`"") -PassThru -WindowStyle Hidden
-  $deadline = (Get-Date).AddSeconds(60)
+function Start-Ripper([string]$outLog, [string]$errLog) {
+  New-Item -ItemType Directory -Force $TempDir | Out-Null
+  $env:TEMP = $TempDir; $env:TMP = $TempDir
+  $p = Start-Process -FilePath $arPath -ArgumentList @('--headless','--port',"$Port") -PassThru -WindowStyle Hidden -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+  $deadline = (Get-Date).AddSeconds(120)
   while ((Get-Date) -lt $deadline) {
+    if ($p.HasExited) { Fail "AssetRipper exited at startup (code $($p.ExitCode)); see $errLog" }
     try { Invoke-WebRequest -Uri "http://127.0.0.1:$Port/" -UseBasicParsing -TimeoutSec 5 | Out-Null; return $p } catch { Start-Sleep -Milliseconds 500 }
   }
   Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-  Fail "AssetRipper did not answer on port $Port within 60 s (log: $logPath)"
+  Fail "AssetRipper did not answer on port $Port within 120 s (stderr: $errLog)"
 }
 
+# Poll the stdout log for a done-line; track peak RAM; return 'done' | 'died' | 'timeout' | 'error'
+function Wait-LogLine($proc, [string]$log, [string]$doneMarker, [int]$timeoutMin, [ref]$peakGB) {
+  $deadline = (Get-Date).AddMinutes($timeoutMin); $lastReport = Get-Date; $lastLine = ''
+  while ((Get-Date) -lt $deadline) {
+    try { $proc.Refresh(); $ws = $proc.PeakWorkingSet64 / 1GB; if ($ws -gt $peakGB.Value) { $peakGB.Value = $ws } } catch { }
+    $text = ''
+    try { $text = [IO.File]::ReadAllText($log) } catch { }
+    if ($text -match [regex]::Escape($doneMarker)) { return 'done' }
+    if ($text -match '(?m)^(Unhandled exception|.*OutOfMemory|Fatal error)') { return 'error' }
+    if ($proc.HasExited) { return 'died' }
+    if (((Get-Date) - $lastReport).TotalSeconds -ge 60) {
+      $lines = @($text -split "`r?`n" | Where-Object { $_ -ne '' }); if ($lines.Count) { $lastLine = $lines[-1] }
+      Say ("  ... {0}  (RAM now {1:N1} GB, peak {2:N1} GB)" -f $lastLine, ($proc.WorkingSet64/1GB), $peakGB.Value)
+      $lastReport = Get-Date
+    }
+    Start-Sleep -Seconds 5
+  }
+  return 'timeout'
+}
+
+# ---- 3. per map
 if (-not $DryRun) { New-Item -ItemType Directory -Force $OutRoot | Out-Null }
 $report = @()
 foreach ($map in $Maps) {
   $stage = Join-Path $OutRoot "_staging\$map`_Data"
   $out   = Join-Path $OutRoot $map
   $log   = Join-Path $OutRoot "$map.assetripper.log"
+  $elog  = Join-Path $OutRoot "$map.assetripper.err.log"
   $bytes = Stage-Map $map $stage
   if ($DryRun) {
-    Say "DRYRUN: would start `"$arPath`" --headless --port $Port; POST /Settings/Update; POST /LoadFolder Path=$stage; POST /Export/UnityProject Path=$out"
+    Say "DRYRUN: would start `"$arPath`" --headless --port $Port (stdout -> $log); POST /Settings/Update; POST /LoadFolder Path=$stage; wait 'Finished processing assets'; POST /Export/UnityProject Path=$out; wait 'Finished post-export'"
     continue
   }
-  if (Test-Path $out) { Say "output $out exists -- AssetRipper clears its export dir; delete it yourself if you want a clean run" }
-  $proc = Start-Ripper $log
+  if (Test-Path $out) { Say "output $out exists -- AssetRipper clears its export dir" }
+  $proc = Start-Ripper $log $elog
+  $peak = 0.0; $t0 = Get-Date; $verdict = 'INCONCLUSIVE'; $loadSecs = 0; $exportSecs = 0; $have = @()
   try {
-    $t0 = Get-Date
-    Post-Form '/Settings/Update' $ArSettings 60 | Out-Null
-    Say "loading $stage"
-    Post-Form '/LoadFolder' @{ Path = $stage } 7200 | Out-Null
-    $cnt = (Invoke-WebRequest -Uri "http://127.0.0.1:$Port/Collections/Count" -UseBasicParsing -TimeoutSec 60).Content
-    Say "loaded: collections=$cnt in $([int]((Get-Date)-$t0).TotalSeconds)s"
-    if ("$cnt" -match '^\s*0\s*$') { Fail "AssetRipper loaded 0 collections from $stage -- nothing to export (check $log)" }
-    Say "exporting Unity project -> $out (this is the slow part)"
-    Post-Form '/Export/UnityProject' @{ Path = $out } 21600 | Out-Null
-    $secs = [int]((Get-Date)-$t0).TotalSeconds
-    # a verification that can fail: the export must contain scene files named like the preset's scenes
+    Post-Form '/Settings/Update' $ArSettings
+    Say "loading $stage (async; polling $log)"
+    Post-Form '/LoadFolder' @{ Path = $stage }
+    $r = Wait-LogLine $proc $log 'Processing : Finished processing assets' $LoadTimeoutMin ([ref]$peak)
+    $loadSecs = [int]((Get-Date) - $t0).TotalSeconds
+    if ($r -ne 'done') { $verdict = "INCONCLUSIVE (load $r after ${loadSecs}s, peak RAM $([math]::Round($peak,1)) GB; read $log / $elog)"; throw 'load' }
+    Say "loaded in ${loadSecs}s (peak RAM $([math]::Round($peak,1)) GB); exporting -> $out"
+    $t1 = Get-Date
+    Post-Form '/Export/UnityProject' @{ Path = $out }
+    $r = Wait-LogLine $proc $log 'Export : Finished post-export' $ExportTimeoutMin ([ref]$peak)
+    $exportSecs = [int]((Get-Date) - $t1).TotalSeconds
+    if ($r -ne 'done') { $verdict = "INCONCLUSIVE (export $r after ${exportSecs}s, peak RAM $([math]::Round($peak,1)) GB; read $log / $elog)"; throw 'export' }
+    # a verification that can fail: the export must contain a .unity for every scene the preset names
     $want = @($catalog.locations.$map.scenes | ForEach-Object { $_.name })
     $have = @(Get-ChildItem -Recurse -Filter *.unity $out -ErrorAction SilentlyContinue | ForEach-Object { $_.BaseName })
     $missing = @($want | Where-Object { $have -notcontains $_ })
     $verdict = if ($have.Count -eq 0) { 'INCONCLUSIVE (no .unity files at all -- read the log)' } elseif ($missing.Count -gt 0) { "FAIL (missing scenes: $($missing -join ', '))" } else { 'PASS' }
-    Say "$map : $verdict  scenes exported=$($have.Count)/$($want.Count) in ${secs}s"
-    $report += [pscustomobject]@{ map=$map; verdict=$verdict; scenes="$($have.Count)/$($want.Count)"; seconds=$secs; stagedGB=[math]::Round($bytes/1GB,2); out=$out }
+  } catch {
+    if ($_.ToString() -notin @('load','export')) { $verdict = "INCONCLUSIVE (script error: $_)" }
   } finally {
+    try { $proc.Refresh(); if ($proc.PeakWorkingSet64/1GB -gt $peak) { $peak = $proc.PeakWorkingSet64/1GB } } catch { }
     Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
     if (-not $KeepStaging) { Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue }
   }
+  # log census (counts are evidence, the .unity check above is the verdict)
+  $text = ''; try { $text = [IO.File]::ReadAllText($log) } catch { }
+  $depMissing = ([regex]::Matches($text, "Dependency '[^']+' wasn't found")).Count
+  $errors     = ([regex]::Matches($text, '(?m)^(Error|.*Exception)')).Count
+  $outGB = 0; $meshes = 0; $mats = 0; $prefabs = 0
+  if (Test-Path $out) {
+    $outGB = [math]::Round(((Get-ChildItem -Recurse -File $out | Measure-Object Length -Sum).Sum/1GB), 2)
+    $meshes  = @(Get-ChildItem -Recurse -File $out -Include *.fbx,*.obj,*.mesh -ErrorAction SilentlyContinue).Count + @(Get-ChildItem -Recurse -Path (Join-Path $out 'ExportedProject\Assets\Mesh') -File -Filter *.asset -ErrorAction SilentlyContinue).Count
+    $mats    = @(Get-ChildItem -Recurse -File $out -Filter *.mat -ErrorAction SilentlyContinue).Count
+    $prefabs = @(Get-ChildItem -Recurse -File $out -Filter *.prefab -ErrorAction SilentlyContinue).Count
+  }
+  $line = "VERDICT $map : $verdict | scenes=$($have.Count)/$(@($catalog.locations.$map.scenes).Count) meshes=$meshes materials=$mats prefabs=$prefabs | load=${loadSecs}s export=${exportSecs}s peakRAM=$([math]::Round($peak,1))GB staged=$([math]::Round($bytes/1GB,2))GB out=${outGB}GB | log: depMissing=$depMissing errorLines=$errors"
+  Say $line
+  $report += $line
 }
-if ($report.Count) { $report | Format-Table -AutoSize | Out-String | Write-Host }
-if ($report | Where-Object { $_.verdict -ne 'PASS' }) { exit 1 }
+if ($report.Count) { $report | ForEach-Object { Write-Host $_ } }
+if ($report | Where-Object { $_ -notmatch ': PASS ' }) { exit 1 }
