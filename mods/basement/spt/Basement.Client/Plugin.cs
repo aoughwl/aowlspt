@@ -25,6 +25,8 @@ namespace Basement.Client
     /// </summary>
     [BepInPlugin("aowl.basement", "Escape From My Basement", "0.1.0")]
     [BepInDependency(AowlApi.Guid, BepInDependency.DependencyFlags.HardDependency)]
+    [BepInDependency("xyz.drakia.bigbrain", BepInDependency.DependencyFlags.HardDependency)]   // Orders.cs layer host (measured guid)
+    [BepInDependency("me.sol.sain", BepInDependency.DependencyFlags.SoftDependency)]           // load after SAIN so our layer outranks its registration
     public sealed class Plugin : BaseUnityPlugin
     {
         internal static ManualLogSource Log;
@@ -93,6 +95,9 @@ namespace Basement.Client
             BindUnmatchedBots = Config.Bind("Voice", "BindUnmatchedBots", true,
                 "FALLBACK binding: a live bot with no nickname match becomes the nearest unbound world person on this map (else any unbound person, logged as relocated). Without it, ordinary SPT bots (random nicknames) are never addressable and nobody talks.");
 
+            // [Subtitles]: preset + per-entry overrides, live-updating (Hud.cs).
+            Hud.Bind(Config);
+
             SpawnOnMenu = Config.Bind("Raid", "SpawnOnMenu", true,
                 "On the main menu, GET /spawn and log the map the world wants the player on.");
             AutoRaidStart = Config.Bind("Raid", "AutoRaidStart", false,
@@ -118,7 +123,10 @@ namespace Basement.Client
             AowlEvents.Directives.Register("say", e =>
             {
                 var s = SaySegment.From(e);
-                Say.Enqueue(s.PersonId, s.Seq, s.SegmentIdx, s.Wav, s.Text, s.Final, e.WantsAck);
+                // The hearing-aware overload: it reads `audible`/`mode`/
+                // `distanceM` off the raw event and DROPS what the player
+                // could not have heard. See Say.Enqueue(SaySegment, AowlEvent).
+                Say.Enqueue(s, e);
             });
             AowlEvents.Directives.Register("heard.partial", e => Hear.ShowPartial(e.Str("text")));
             AowlEvents.Directives.Register("heard.final", e =>
@@ -147,12 +155,13 @@ namespace Basement.Client
             AowlEvents.Directives.Register("world.saved", logOnly);
             AowlEvents.Directives.Register("player.spawn", e => { if (e.WantsAck) Spawn.OnDirective(e.Seq, e.Data); });
             // The kinds this client KNOWS it cannot run, acked ok:false with the exact reason (never "unsupported kind" alone).
-            Refuse("unsupported kind: Basement.Client 0.1.0 has NO bot actuator (BotOwner.Mover/Memory orders are not wired yet).",
-                "npc.stance", "npc.follow", "npc.hold", "npc.goto", "npc.attack");
+            // npc.goto/hold/follow/attack/stance -> Orders (a BigBrain layer above SAIN's); group.spawn -> GroupSpawn
+            // (the client's own BotSpawner). Both are measured-member code that has NOT run live yet; each acks
+            // ok:false with the exact reason when it cannot act (docs/SPT415-BOT-CONTROL.md).
+            Orders.Install();
+            GroupSpawn.Install();
             Refuse("unsupported kind: inventory and captivity are not wired in Basement.Client 0.1.0.",
                 "npc.give", "npc.take", "player.captive", "player.release");
-            Refuse("unsupported kind: Basement.Client 0.1.0 does not drive SPT's BotSpawner; people are mapped to live bots by nickname instead (MatchPeopleByName).",
-                "group.spawn");
             // Re-read the population after a hole or a backend restart (link thread; RefreshSync is a background call).
             AowlEvents.OnResync += reason => People.RefreshSync(null);
         }

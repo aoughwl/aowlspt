@@ -72,6 +72,16 @@
       <HintPath>$(GameManagedDir)\UnityEngine.InputLegacyModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <!-- BigBrain (DrakiaXYZ-BigBrain 1.5.0, measured [BepInPlugin]) is the layer host SAIN 4.5.1 itself builds on;
+         Orders.cs registers a CustomLayer through it. UnityEngine.AIModule carries NavMeshPathStatus. -->
+    <Reference Include="DrakiaXYZ-BigBrain">
+      <HintPath>$(SptInstallDir)\BepInEx\plugins\DrakiaXYZ-BigBrain.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.AIModule">
+      <HintPath>$(GameManagedDir)\UnityEngine.AIModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <ProjectReference Include="..\Aowl.Api\Aowl.Api.csproj">
       <Private>false</Private>
     </ProjectReference>

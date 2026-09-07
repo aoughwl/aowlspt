@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Basement.Server: the SPT 4.1.5 SERVER mod (C#, SPTarkov.Server.Core) that hands
+       bot generation, naming, loadouts and location waves to the aowlspt basement
+       sidecar (aowlspt-backend.exe, port 6970), so ONE backend brain serves both the
+       aowlspt emulator and a stock SPT install.
+
+       Every SPT member this project touches was verified offline with
+       mods/basement/spt/MemberCheck against D:\SPT415\SPT_Runtime\SPTarkov.Server.Core.dll
+       (4.1.5.0). The map and the measured facts live in docs/SPT415-BOT-CONTROL.md.
+
+         dotnet build -c Release                       => bin\Release\net10.0\ (never installs)
+         dotnet build -c Release -p:OutDir=<dir>\      => anywhere else
+       Installing means copying Basement.Server.dll plus config.json to
+       D:\SPT415\SPT_Runtime\user\mods\Basement.Server\ (a deliberate human step). -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>Basement.Server</AssemblyName>
+    <RootNamespace>Basement.Server</RootNamespace>
+    <Version>0.1.0</Version>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <SptInstallDir Condition="'$(SptInstallDir)' == '' and '$(SPT_INSTALL_DIR)' != ''">$(SPT_INSTALL_DIR)</SptInstallDir>
+    <SptInstallDir Condition="'$(SptInstallDir)' == ''">D:\SPT415</SptInstallDir>
+    <SptRuntime>$(SptInstallDir)\SPT_Runtime</SptRuntime>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="config.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
+    <Reference Include="SPTarkov.Common"><HintPath>$(SptRuntime)\SPTarkov.Common.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="SPTarkov.DI"><HintPath>$(SptRuntime)\SPTarkov.DI.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="SPTarkov.Server.Core"><HintPath>$(SptRuntime)\SPTarkov.Server.Core.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="SPTarkov.Reflection"><HintPath>$(SptRuntime)\SPTarkov.Reflection.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="0Harmony"><HintPath>$(SptRuntime)\0Harmony.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="SemanticVersioning"><HintPath>$(SptRuntime)\SemanticVersioning.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+</Project>
