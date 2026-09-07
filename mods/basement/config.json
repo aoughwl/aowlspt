@@ -92,6 +92,25 @@
   "noticeM": 60.0,
   "threatM": 18.0,
 
+  "_hearing": "WHO CAN HEAR A LINE. hearSpeakM: how far a normal speaking voice carries (25 m). hearYellM: how far a SHOUT carries (70 m). Between the two, a line is REWRITTEN as a shout -- the ontology row's `yell` variant when it has one, otherwise the first sentence, shortened and upper-cased -- and goes out as mode:\"yell\" with voiceSpec.yell:true so the TTS engine can actually shout it. Beyond hearYellM NOTHING is emitted: the person's memory records that they saw the player and could not be heard, and say.suppressed is journaled, because a line dropped without a trace is indistinguishable from a broken state machine. The distance is always the CLIENT's (player_seen.distanceM, player_aimed_at.distanceM, or npc_moved vs player_moved); a distance nobody has reported is treated as AUDIBLE and every such segment says so in hearingNote -- refusing to speak on missing data would silently mute the whole mod.",
+  "hearSpeakM": 25.0,
+  "hearYellM": 70.0,
+
+  "_bystanderReactChance": "The user, 2026-09-07: \"everyone in the vicinity replies even if I can't hear their reply -- that's not good\". A push-to-talk final now answers EXACTLY the addressee. Anyone else within hearSpeakM of the player may throw in ONE short bark from data/ontology.json's `bystander` table -- never an LLM turn, never a reply -- with this probability and bystanderCooldownMs between them. Every one is marked reaction:true on the wire, which is how selfcheck 22 tells a reaction from a reply.",
+  "bystanderReactChance": 0.3,
+  "bystanderCooldownMs": 20000,
+
+  "_chatterLevel": "How much people speak on their OWN initiative: 0 off entirely, 1 normal, 2 talkative (every trigger's rate limit is halved). The triggers are first_sight (the first time they see you this raid), approach (you close 10+ m on them within 3 s), linger (10 s within 8 m without talking), hurt (they are shot), saw_death (someone dies within 30 m of them), combat_taunt (every 8-15 s while fighting, yelled), push (you close 15+ m in 3 s -- a sprint), bystander (overhearing). Each has its own switch below, and every line comes from the `barks` table in data/ontology.json, never from code.",
+  "chatterLevel": 1,
+  "trigger_first_sight": true,
+  "trigger_approach": true,
+  "trigger_linger": true,
+  "trigger_hurt": true,
+  "trigger_saw_death": true,
+  "trigger_combat_taunt": true,
+  "trigger_push": true,
+  "trigger_bystander": true,
+
   "_barkCooldownMs": "How long a person stays barked-out after a threat line. MEASURED 2026-09-07: the client reports player_aimed_at every tick the crosshair rests on someone, so without this window every tick re-fired the threat transition -- one sentence repeated forever and ~40 un-acked npc.attack directives in two minutes. Inside the window the ticks are COUNTED (the journal row carries suppressedAimTicks) and nothing is emitted.",
   "barkCooldownMs": 20000,
 

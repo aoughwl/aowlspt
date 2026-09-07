@@ -40,6 +40,7 @@ import "bm" / sim
 import "bm" / encounter
 import "bm" / prompt
 import "bm" / ontology
+import "bm" / hearing
 import "bm" / llm
 import "bm" / brain
 import "bm" / speech
@@ -146,6 +147,25 @@ proc loadConfig() =
                      noticeM = setting("noticeM").asFloat(60.0),
                      threatM = setting("threatM").asFloat(18.0))
   encounterConfigureBarks(setting("barkCooldownMs").asInt(20000))
+  # --- hearing (agent R) ----------------------------------------------------
+  hearingConfigure(speakM = setting("hearSpeakM").asFloat(25.0),
+                   yellM = setting("hearYellM").asFloat(70.0),
+                   bystanderChance = setting("bystanderReactChance").asFloat(0.3),
+                   chatterLevel = setting("chatterLevel").asInt(1),
+                   bystanderCooldownMs = setting("bystanderCooldownMs").asInt(20000))
+  # Written out one by one, NOT as a loop over TriggerNames: the build's
+  # `every declared setting resolves to a key in its mod config.json` audit
+  # reads `setting("literal")` and cannot follow a computed key -- a loop
+  # compiles and then silently escapes the check that these keys exist.
+  discard hearingConfigureTrigger("first_sight", setting("trigger_first_sight").asBool(true))
+  discard hearingConfigureTrigger("approach", setting("trigger_approach").asBool(true))
+  discard hearingConfigureTrigger("linger", setting("trigger_linger").asBool(true))
+  discard hearingConfigureTrigger("hurt", setting("trigger_hurt").asBool(true))
+  discard hearingConfigureTrigger("saw_death", setting("trigger_saw_death").asBool(true))
+  discard hearingConfigureTrigger("combat_taunt", setting("trigger_combat_taunt").asBool(true))
+  discard hearingConfigureTrigger("push", setting("trigger_push").asBool(true))
+  discard hearingConfigureTrigger("bystander", setting("trigger_bystander").asBool(true))
+  # --- end hearing ----------------------------------------------------------
   streamConfigure(maxEvents = setting("streamMax").asInt(2048),
                   defaultTtlMs = int64(setting("directiveTtlSeconds").asInt(30)) * 1000)
   setSimConfig(maxCatchUpMs = int64(setting("simMaxCatchUpHours").asInt(24)) * 3600000,
@@ -202,6 +222,18 @@ proc loadConfig() =
                   voicesDir = defaultedPath(setting("voicesDir").asText(""),
                                             joinPath(dataDir(), "voices")),
                   localAppData = getEnv("LOCALAPPDATA", ""))
+  llmConfigureOpenAi(baseUrl = setting("openAiBaseUrl").asText(""),
+                     keyEnv = setting("openAiKeyEnv").asText(""),
+                     extraJson = setting("openAiExtraJson").asText(""))
+  speechConfigureCloud(sttBaseUrl = setting("sttBaseUrl").asText(""),
+                       sttKeyEnv = setting("sttKeyEnv").asText(""),
+                       sttModel = setting("sttModel").asText(""),
+                       ttsBaseUrl = setting("ttsBaseUrl").asText(""),
+                       ttsKeyEnv = setting("ttsKeyEnv").asText(""),
+                       ttsModel = setting("ttsModel").asText(""))
+  speechConfigureAsync(async = setting("ttsAsync").asBool(true),
+                       timeoutMs = setting("ttsTimeoutMs").asInt(8000))
+  spawnModeConfigure(setting("spawnMode").asText("process"))
   pttConfigure(recorderExe = setting("recorderExe").asText(""),
                maxSeconds = setting("pttMaxSeconds").asInt(20))
   brainConfigure(cacheDir = cache,
@@ -210,6 +242,28 @@ proc loadConfig() =
                  ontologyMinConfidence = minConfidenceFor(
                    setting("llmEngine").asText("builtin"),
                    setting("ontologyMinConfidence").asFloat(0.0)))
+
+var gTickMaxMs: int64 = 0
+var gTickLastMs: int64 = 0
+var gTickSlowN: int = 0        ## ticks over gTickSlowMs
+var gTickSlowMs: int = 300
+var gTickSlowest: string = "no tick has run yet"
+
+proc tickTimingJson(): JsonObject =
+  ## The one instrument that answers "did anything block the tick". A route
+  ## cannot run while `onTick` holds the mod lock, so the LONGEST tick IS the
+  ## worst latency a route could have suffered -- which is why this is measured
+  ## here and not guessed at from a client-side stopwatch.
+  result = obj()
+  result.put("ticks", gTicks)
+  result.put("lastMs", int(gTickLastMs))
+  result.put("maxMs", int(gTickMaxMs))
+  result.put("slowThresholdMs", gTickSlowMs)
+  result.put("slowTicks", gTickSlowN)
+  result.put("slowest", gTickSlowest)
+  result.put("note", "maxMs is the longest single onTick since load. With " &
+    "synthesis ON the tick it was ~1300 ms per kokoro sentence; the whole " &
+    "point of ttsAsync is that this stays small while a turn streams")
 
 proc disabledJson(): string =
   var o = obj()
@@ -268,6 +322,9 @@ proc worldSummary(): JsonObject =
   result.put("facts", factCount())
   result.put("journal", journalCount())
   result.put("encounters", encounterCount())
+  # --- hearing (agent R) ----------------------------------------------------
+  result.put("hearing", hearingJson())
+  # --- end hearing ----------------------------------------------------------
   result.put("captiveOf", captiveOf())
   result.put("note", gWorldNote)
 
@@ -283,18 +340,22 @@ proc saySink(sentence: string; final: bool) =
   ## before `decide`, because a closure over locals in a DLL is a footgun this
   ## project does not need.
   if sentence.len == 0 and not final: return
-  var ttsNote = ""
-  var cached = false
-  var wav = ""
-  # The SAME builder the encounter machine's barks go through: one shape, one
-  # decision about the wav, so the two paths cannot drift apart again.
-  let payload = sayPayload(gSayPerson, gSayVoice, sentence, gSegmentIdx, final,
-                           "brain", wav, cached, ttsNote)
+  # QUEUED, not synthesised here. MEASURED 2026-09-07 on the live sidecar: this
+  # line used to call `ttsSegment` -> curl -> kokoro, ~1.3 s per sentence,
+  # INSIDE `onTick`'s `withModLock`; a five-sentence turn held the lock for
+  # ~6 s and an `/events` long-poll timed out waiting for it. `sayEnqueue`
+  # starts the request and returns; `sayDrain` emits the segment when the wav
+  # lands, in order, from the tick.
+  discard sayEnqueue(gSayPerson, gSayVoice, sentence, gSegmentIdx, final,
+                     "brain", false)
   if sentence.len > 0:
     gSaySegments.add sentence
-    gSayWavs.add wav
-  discard emitEvent("say", payload, false)
-  discard broadcast("basement.say", payload)
+    # The wav is not known yet for kokoro/chatterbox. The /say RESPONSE
+    # therefore reports "" for it and the `say` EVENT carries the real path --
+    # said out loud in the reply's notes rather than left to look like a
+    # failure.
+    gSayWavs.add ""
+  discard sayDrain()
   gSegmentIdx = gSegmentIdx + 1
 
 proc sayReplyJson(personId: string; d: Decision; tagNote: string;
@@ -512,6 +573,14 @@ proc speakTurn(personId, utterance: string; directives: var int;
   gSegmentIdx = 0
   gSaySegments = @[]
   gSayWavs = @[]
+  # --- hearing (agent R) ----------------------------------------------------
+  # ONLY THE ADDRESSEE ANSWERS. Everyone else close enough to overhear may
+  # throw in a short table bark, marked `reaction:true`; nobody else gets a
+  # brain turn. See `encounter.bystanderReactions`.
+  notePlayerSpokeTo(personId, wallMs())
+  var bystNote = ""
+  let bystDirs = bystanderReactions(personId, utterance, bystNote)
+  # --- end hearing ----------------------------------------------------------
   let card = cardFor(personId)
   let situation = situationFor(personId)
   var hits = ""
@@ -528,6 +597,10 @@ proc speakTurn(personId, utterance: string; directives: var int;
     # here: applying a tag for a reply that has not arrived would act on a
     # sentence nobody said.
     if pi >= 0: remember(pi, "Player: " & utterance)
+    # --- hearing (agent R) --------------------------------------------------
+    directives = directives + bystDirs
+    if bystNote.len > 0: result.notes.add bystNote
+    # --- end hearing --------------------------------------------------------
     gCtxId.add turnId
     gCtxPerson.add personId
     gCtxVoice.add gSayVoice
@@ -540,6 +613,10 @@ proc speakTurn(personId, utterance: string; directives: var int;
     remember(pi, "Player: " & utterance)
     if result.text.len > 0: remember(pi, personName(pi) & ": " & result.text)
   directives = applyTags(personId, result.tags, tagNote)
+  # --- hearing (agent R) ----------------------------------------------------
+  directives = directives + bystDirs
+  if bystNote.len > 0: result.notes.add bystNote
+  # --- end hearing ----------------------------------------------------------
   discard journal("said", personId, "player",
                   done(objOf("text", result.text)).text)
 
@@ -609,6 +686,8 @@ proc onStatus(url, body, session: string): string =
     o.put("stream", llmStreamStats())
     o.put("stream", streamStats())
     o.put("tts", ttsStats())
+    o.put("ttsAsync", ttsAsyncStats())
+    o.put("tick", tickTimingJson())
     o.put("sttSessions", sttSessionCount())
     o.put("ptt", pttStatus())
     o.put("pushSession", pushSession())
@@ -2410,6 +2489,250 @@ proc chk20StreamingParser() =
         "; curl invocations " & $curlBefore & "->" & $curlAfter &
         " (the fixture must not start a process)")
 
+proc saySurvey(fromSeq: int; person: var string; mode: var string;
+               text: var string; audible: var bool; reaction: var bool;
+               reactions: var int; others: var int; who: string): int =
+  ## Every `say` served since `fromSeq`, reported as the FINISHED STATE of the
+  ## stream. `person`/`mode`/`text` are the LAST non-reaction segment, which is
+  ## the one a player would call "the answer"; `reactions` and `others` are the
+  ## two counts checks 22 and 23 turn on.
+  result = 0
+  person = ""
+  mode = ""
+  text = ""
+  audible = false
+  reaction = false
+  reactions = 0
+  others = 0
+  let served = done(objOf("events", eventsSince(fromSeq, 400))).text
+  for e in jr.each(jr.field(served, "events")):
+    if jr.asText(jr.child(e, "kind"), "") != "say": continue
+    result = result + 1
+    let d = jr.child(e, "data")
+    let pid = jr.asText(jr.child(d, "personId"), "")
+    let isReaction = jr.asBool(jr.child(d, "reaction"), false)
+    if isReaction: reactions = reactions + 1
+    elif who.len > 0 and pid != who: others = others + 1
+    if not isReaction:
+      person = pid
+      mode = jr.asText(jr.child(d, "mode"), "")
+      text = jr.asText(jr.child(d, "text"), "")
+      audible = jr.asBool(jr.child(d, "audible"), false)
+      reaction = isReaction
+
+proc journalHas(kind: string; n: int): bool =
+  ## Is there a row of this kind in the last `n` journal entries? The journal
+  ## is the only record a suppressed line leaves, so "it was not said" is
+  ## checked HERE and not by the absence of a directive -- an absence is also
+  ## what a broken state machine produces.
+  let tail = done(objOf("rows", journalTail(n))).text
+  for r in jr.each(jr.field(tail, "rows")):
+    if jr.asText(jr.child(r, "kind"), "") == kind: return true
+  result = false
+
+proc chk21Hearing() =
+  ## THE HEARING BANDS. Three distances, three different outcomes, and the
+  ## far one must leave a JOURNAL ROW rather than merely nothing.
+  ##
+  ## The user, 2026-09-07: *"everyone in the vicinity replies even if I can't
+  ## hear their reply"*. Before this, all three distances produced the same
+  ## audible line.
+  if personCount() == 0:
+    check(21, "hearing bands", "INCONCLUSIVE", "no people in the world")
+    return
+  let pid = personId(0)
+
+  resetEncounters()
+  encounterConfigureBarks(0)
+  noteDistance(pid, 500.0, wallMs())
+  let b1 = latestSeq()
+  var note = ""
+  discard observe("player_aimed_at", pid, "", "{}", note)
+  var p1 = ""
+  var m1 = ""
+  var t1 = ""
+  var a1 = false
+  var r1 = false
+  var rc1 = 0
+  var ot1 = 0
+  let far = saySurvey(b1, p1, m1, t1, a1, r1, rc1, ot1, pid)
+  let farJournaled = journalHas("say.suppressed", 12)
+
+  resetEncounters()
+  encounterConfigureBarks(0)
+  noteDistance(pid, 45.0, wallMs())
+  let b2 = latestSeq()
+  discard observe("player_aimed_at", pid, "", "{}", note)
+  var p2 = ""
+  var m2 = ""
+  var t2 = ""
+  var a2 = false
+  var r2 = false
+  var rc2 = 0
+  var ot2 = 0
+  let mid = saySurvey(b2, p2, m2, t2, a2, r2, rc2, ot2, pid)
+
+  resetEncounters()
+  encounterConfigureBarks(0)
+  noteDistance(pid, 10.0, wallMs())
+  let b3 = latestSeq()
+  discard observe("player_aimed_at", pid, "", "{}", note)
+  var p3 = ""
+  var m3 = ""
+  var t3 = ""
+  var a3 = false
+  var r3 = false
+  var rc3 = 0
+  var ot3 = 0
+  let near = saySurvey(b3, p3, m3, t3, a3, r3, rc3, ot3, pid)
+
+  loadConfig()
+  let ok = far == 0 and farJournaled and
+           mid >= 1 and m2 == "yell" and a2 and
+           near >= 1 and m3 == "speak" and a3 and
+           t2 != t3 and t2.len > 0 and t3.len > 0
+  check(21, "hearing: 500 m silent, 45 m shouted, 10 m spoken", verdictOf(ok),
+        "at 500 m the stream carried " & $far & " say (expected 0) and the " &
+        "journal " & (if farJournaled: "DOES" else: "does NOT") &
+        " hold a say.suppressed row; at 45 m " & $mid & " say, mode=" & m2 &
+        " audible=" & $a2 & " text=" & t2 & "; at 10 m " & $near &
+        " say, mode=" & m3 & " audible=" & $a3 & " text=" & t3 &
+        " -- the yelled and spoken texts must DIFFER, and they " &
+        (if t2 != t3: "do" else: "DO NOT"))
+
+proc chk22OneReply() =
+  ## ONE utterance, three people in earshot: exactly ONE of them replies.
+  ##
+  ## The others may bark a REACTION, and the assertion separates the two by
+  ## the `reaction` flag on the wire rather than by counting -- a check that
+  ## only counted `say` would pass a build where the reply itself had been
+  ## turned into a bark. The NEGATIVE CONTROL is the second half: with
+  ## `bystanderReactChance` at 0 the same utterance must produce ZERO
+  ## reactions, so "3 people were in range" cannot be passing vacuously.
+  if personCount() < 3:
+    check(22, "only the addressee replies", "INCONCLUSIVE",
+          "fewer than three people in the world")
+    return
+  let a = personId(0)
+  let b = personId(1)
+  let c = personId(2)
+  resetEncounters()
+  # The three of them have to EXIST as encounter rows and have to have a
+  # reported distance, and `player_seen` is the one fact that does both. It is
+  # done before `base` so their first_sight greetings are not counted as
+  # replies -- and, having fired, cannot fire again inside the window below.
+  var seen = obj()
+  seen.put("distanceM", 5.0)
+  var note0 = ""
+  discard observe("player_seen", a, "", done(seen).text, note0)
+  var seenB = obj()
+  seenB.put("distanceM", 8.0)
+  discard observe("player_seen", b, "", done(seenB).text, note0)
+  var seenC = obj()
+  seenC.put("distanceM", 12.0)
+  discard observe("player_seen", c, "", done(seenC).text, note0)
+  hearingConfigure(0.0, 0.0, 1.0, 1, 0)     # every bystander reacts
+  let base = latestSeq()
+  var dirs = 0
+  var tagNote = ""
+  discard speakTurn(a, "hey there, how are you doing", dirs, tagNote)
+  var person = ""
+  var mode = ""
+  var text = ""
+  var audible = false
+  var reaction = false
+  var reactions = 0
+  var others = 0
+  let total = saySurvey(base, person, mode, text, audible, reaction,
+                        reactions, others, a)
+
+  # negative control: nobody reacts.
+  resetEncounters()
+  discard observe("player_seen", a, "", done(seen).text, note0)
+  discard observe("player_seen", b, "", done(seenB).text, note0)
+  discard observe("player_seen", c, "", done(seenC).text, note0)
+  hearingConfigure(0.0, 0.0, 0.0, 1, 0)
+  let base2 = latestSeq()
+  var p2 = ""
+  var m2 = ""
+  var t2 = ""
+  var a2 = false
+  var r2 = false
+  var rc2 = 0
+  var ot2 = 0
+  discard speakTurn(a, "hey there, how are you doing", dirs, tagNote)
+  discard saySurvey(base2, p2, m2, t2, a2, r2, rc2, ot2, a)
+  loadConfig()
+
+  let ok = total > 0 and others == 0 and reactions >= 1 and
+           person == a and rc2 == 0
+  check(22, "one utterance, three in earshot: one reply", verdictOf(ok),
+        "the stream carried " & $total & " say: " & $reactions &
+        " marked reaction:true and " & $others &
+        " NON-reaction segments from somebody other than the addressee " &
+        "(expected 0). The reply came from " & person & " (expected " & a &
+        "), " & b & " and " & c & " were 8 m and 12 m away. NEGATIVE " &
+        "CONTROL with bystanderReactChance 0: " & $rc2 &
+        " reactions (expected 0)")
+
+proc chk23Triggers() =
+  ## PROACTIVE SPEECH, and the two negatives that make it falsifiable:
+  ## a second `player_seen` must be SILENT (first_sight is once per raid), and
+  ## a 3 m drift must NOT read as an approach.
+  if personCount() == 0:
+    check(23, "proactive triggers", "INCONCLUSIVE", "no people in the world")
+    return
+  let pid = personId(0)
+  var note = ""
+  var person = ""
+  var mode = ""
+  var text = ""
+  var audible = false
+  var reaction = false
+  var reactions = 0
+  var others = 0
+
+  resetEncounters()
+  var so = obj()
+  so.put("distanceM", 20.0)
+  let seen1 = done(so).text
+  let b1 = latestSeq()
+  discard observe("player_seen", pid, "", seen1, note)
+  let first = saySurvey(b1, person, mode, text, audible, reaction,
+                        reactions, others, pid)
+  let firstText = text
+
+  # negative: seen again, same distance -> nothing.
+  let b2 = latestSeq()
+  discard observe("player_seen", pid, "", seen1, note)
+  let second = saySurvey(b2, person, mode, text, audible, reaction,
+                         reactions, others, pid)
+
+  # a 3 m drift is not an approach.
+  var s3 = obj()
+  s3.put("distanceM", 17.0)
+  let b3 = latestSeq()
+  discard observe("player_seen", pid, "", done(s3).text, note)
+  let drift = saySurvey(b3, person, mode, text, audible, reaction,
+                        reactions, others, pid)
+
+  # a 12 m drop in one step is.
+  var s4 = obj()
+  s4.put("distanceM", 5.0)
+  let b4 = latestSeq()
+  discard observe("player_seen", pid, "", done(s4).text, note)
+  let closed = saySurvey(b4, person, mode, text, audible, reaction,
+                         reactions, others, pid)
+
+  let ok = first >= 1 and second == 0 and drift == 0 and closed >= 1
+  check(23, "first_sight once per raid; approach needs 10 m in 3 s",
+        verdictOf(ok),
+        "first player_seen at 20 m served " & $first & " say (expected >=1): " &
+        firstText & "; the SECOND at the same distance served " & $second &
+        " (expected 0 -- first_sight is once per raid); a 3 m drift to 17 m " &
+        "served " & $drift & " (expected 0); a 12 m drop to 5 m served " &
+        $closed & " (expected >=1): " & text)
+
 proc onSelfcheck(url, body, session: string): string =
   gCheckLines = @[]
   gPassN = 0
@@ -2436,6 +2759,9 @@ proc onSelfcheck(url, body, session: string): string =
     chk18TalkWhileThreatened()
     chk19DistinctVoices()
     chk20StreamingParser()
+    chk21Hearing()
+    chk22OneReply()
+    chk23Triggers()
     # Put back whatever was on disk: the checks above generated and advanced a
     # world in memory, and leaving that in place would quietly replace the
     # player's.
@@ -2512,13 +2838,70 @@ proc basementSchema(): seq[Setting] =
                  "ontology's fallback line and says in its note that it " &
                  "timed out -- it is never mistaken for a short reply"),
     enumSetting("sttEngine", "Speech to text", "whisper-server",
-                @["whisper-server", "none"], category = "Engines"),
+                @["whisper-server", "openai-whisper", "none"],
+                category = "Engines",
+                description = "openai-whisper = any OpenAI-compatible " &
+                  "/audio/transcriptions endpoint, which is how Groq's " &
+                  "whisper-large-v3-turbo is reached (MEASURED 2026-09-07: " &
+                  "0.53 s round trip for a 42 KB wav)"),
+    stringSetting("openAiBaseUrl", "OpenAI-compatible chat base URL", "",
+                  category = "Engines",
+                  description = "Empty = https://api.openai.com/v1. Groq " &
+                    "serves the identical chat + SSE shapes at " &
+                    "https://api.groq.com/openai/v1"),
+    stringSetting("openAiKeyEnv", "Env var holding the chat key", "",
+                  category = "Engines",
+                  description = "Empty = OPENAI_API_KEY. This NAMES a " &
+                    "variable; the key itself is never read from config.json " &
+                    "or from source"),
+    stringSetting("openAiExtraJson", "Extra chat request fields", "",
+                  category = "Engines",
+                  description = "A raw JSON fragment WITHOUT braces spliced " &
+                    "into the request, e.g. \"reasoning_effort\":\"low\". " &
+                    "MEASURED 2026-09-07 on Groq openai/gpt-oss-120b: without " &
+                    "it the model spent max_tokens on a `reasoning` field and " &
+                    "the spoken content came back empty at 80 tokens; with it " &
+                    "reasoning fell 487 -> 57 chars. Real OpenAI would 400 on " &
+                    "that field, which is why it is configuration"),
+    stringSetting("sttBaseUrl", "Cloud STT base URL", "", category = "Engines"),
+    stringSetting("sttKeyEnv", "Env var holding the STT key", "",
+                  category = "Engines"),
+    stringSetting("sttModel", "Cloud STT model", "", category = "Engines",
+                  description = "Empty = whisper-large-v3-turbo"),
+    stringSetting("ttsBaseUrl", "Cloud TTS base URL", "", category = "Engines"),
+    stringSetting("ttsKeyEnv", "Env var holding the TTS key", "",
+                  category = "Engines"),
+    stringSetting("ttsModel", "Cloud TTS model", "", category = "Engines",
+                  description = "Empty = canopylabs/orpheus-v1-english"),
     enumSetting("ttsEngine", "Text to speech", "piper",
-                @["piper", "kokoro", "chatterbox", "client", "sapi", "none"],
+                @["piper", "kokoro", "chatterbox", "openai-tts", "client",
+                  "sapi", "none"],
                 category = "Engines",
                 description = "kokoro = local CPU (onnx), chatterbox = local " &
                   "CUDA voice cloning from data/voices/*.wav, client = the " &
                   "game-side plugin synthesises (no wav from here)"),
+    boolSetting("ttsAsync", "Synthesise off the tick", true,
+                category = "Engines",
+                description = "kokoro/chatterbox only: the request is spawned " &
+                  "detached and the segment is emitted when the wav lands, so " &
+                  "the mod lock is never held across a network call. MEASURED " &
+                  "2026-09-07 with it OFF: one kokoro sentence blocked every " &
+                  "route for ~1.3 s and a 5-sentence turn timed an /events " &
+                  "long-poll out. piper and sapi are subprocesses we run to " &
+                  "completion and stay synchronous whatever this says"),
+    intSetting("ttsTimeoutMs", "Bounded wait for a wav (ms)", 8000,
+               lo = 500, hi = 120000, step = 500, category = "Engines",
+               description = "After this the segment is emitted WITHOUT audio " &
+                 "and the note says the wait was given up on -- the client " &
+                 "shows the subtitle. The request is still watched, so a late " &
+                 "wav still fills the cache"),
+    enumSetting("spawnMode", "How a detached process is started", "process",
+                @["process", "powershell"], category = "Engines",
+                description = "process = CreateProcess directly (MEASURED " &
+                  "2026-09-07: ~1 ms). powershell = Start-Process (~200 ms " &
+                  "idle, 300-500 ms on the live sidecar). cmd /c start is NOT " &
+                  "offered: it hung our own runCmd for the child's full " &
+                  "lifetime, 10110 ms, measured"),
     stringSetting("toolsDir", "Tools directory", "", category = "Paths",
                   description = "Holds whisper/ and piper/"),
     floatSetting("leashM", "Captivity leash (m)", 25.0, lo = 5.0, hi = 200.0,
@@ -2597,6 +2980,7 @@ proc onDirectiveDropped(seqNo: int; kind: string) =
 
 proc onTick(payload: string): string =
   gTicks = gTicks + 1
+  let tickT0 = nowMs()
   var note = ""
   withModLock:
     discard observe("tick", "", "", "{}", note)
@@ -2605,6 +2989,12 @@ proc onTick(payload: string): string =
     var simNote = ""
     discard simAdvance(int64(gTickMs), simNote)
     pumpStreamingTurns()
+    # Both are pure memory/stat work: `sayDrain` emits the segments whose wav
+    # has appeared on disk and `ttsPumpLate` files the ones that arrived after
+    # their bounded wait. Neither opens a socket or waits on a process, which
+    # is the whole point -- the lock is held across reads, never across I/O.
+    discard sayDrain()
+    discard ttsPumpLate()
     if pttActive():
       # The progressive half of push-to-talk. Pumping every tick is free: the
       # session only runs whisper once `sttPartialMs` of NEW audio has arrived.
@@ -2619,6 +3009,14 @@ proc onTick(payload: string): string =
       if saveWorld(saveNote):
         discard emitEvent("world.saved",
                           done(objOf("version", worldVersion())).text, false)
+  gTickLastMs = nowMs() - tickT0
+  if gTickLastMs > gTickMaxMs:
+    gTickMaxMs = gTickLastMs
+    gTickSlowest = "tick " & $gTicks & " took " & $gTickLastMs &
+                   " ms (streams in flight " & $brainStreamCount() &
+                   ", say queue " & $sayQueueDepth() & ", tts pending " &
+                   $ttsPendingCount() & ")"
+  if gTickLastMs > int64(gTickSlowMs): gTickSlowN = gTickSlowN + 1
   result = ""
 
 proc onDebugTick(url, body, session: string): string =

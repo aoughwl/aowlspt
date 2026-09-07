@@ -66,8 +66,9 @@ Send facts **as they happen**, not on a timer, with the two exceptions marked
 | `raid_ended` | `reason: "extract"\|"death"\|"disconnect"` | leaving the world |
 | `tick` | `nowMs: int` | *throttled*: once per second while in world. Drives contract expiry and the sim clock. |
 | `player_moved` | `map`, `x`,`y`,`z: float`, `yaw: float` | *throttled*: on movement, at most 4 Hz, and always immediately after a teleport/spawn |
-| `player_seen` | `personId: string`, `distanceM: float`, `inViewCone: bool` | a backend-known person entered the player's view (see §6) |
+| `player_seen` | `personId: string`, `distanceM: float`, `inViewCone: bool`, `refresh: bool` | a backend-known person entered the player's view (see §6) |
 | `player_lost` | `personId` | that person left view or died out of sight |
+| `npc_moved` | `map: string`, `people: [{personId, x, y, z}]` | *throttled*: every 2 s, **ONE batched POST** carrying every person the client has bound to a live bot. This is how the backend knows who is close enough to be heard when they are NOT in the view cone -- somebody shouting at your back is exactly what `player_seen` cannot report. A single-person body (`personId`,`x`,`y`,`z`) is accepted too, for a hand-written probe. |
 | `player_aimed_at` | `personId`, `distanceM` | the aim reticle rested on that person for ≥ 400 ms while a weapon is raised |
 | `player_lowered_weapon` | — | the player holstered or lowered for ≥ 1 s |
 | `player_fired` | `at: string` (a personId or `""`), `hit: bool` | a shot leaves the player's weapon |
@@ -79,6 +80,12 @@ Send facts **as they happen**, not on a timer, with the two exceptions marked
 | `player_took` | `item`, `count`, `fromId: string` | looted or was given |
 | `player_extracted` | `exitName: string` | |
 | `escape_attempt` | `captorId`, `distanceM` | the client's own leash check tripped (§5.6). The backend re-checks from `player_moved`; sending this only makes it immediate. |
+
+`player_seen` is sent AGAIN, with `refresh:true`, whenever that person's
+distance has changed by 2 m or more and 0.5 s has passed. That is not chatter:
+the `approach` and `push` triggers of 7.1 are derived from CONSECUTIVE
+distances, and with an edge-only report there is never a second sample, so they
+could never fire at all.
 
 **Unknown `kind` is not an error.** The backend answers `ok:true` with
 `note:"unknown fact kind '<k>' — ignored"`. That keeps an older client working
@@ -227,7 +234,7 @@ into a mystery.
 
 | kind | data fields | ack | ttl | the client does |
 |---|---|---|---|---|
-| `say` | `personId`, `text`, `wav` (absolute path or `""`), `segmentIdx: int`, `final: bool` | no | — | see §7 |
+| `say` | `personId`, `text`, `wav` (absolute path or `""`), `segmentIdx: int`, `final: bool`, `voice`, `tts`, `voiceSpec`, `cachedWav`, `ttsNote`, and the hearing fields **`distanceM`, `mode`, `audible`, `reaction`, `hearSpeakM`, `hearYellM`, `hearingNote`** (7.1) | no | — | see §7 |
 | `heard.partial` | `session`, `text` | no | — | optional subtitle |
 | `heard.final` | `session`, `text` | no | — | show what was understood |
 | `npc.stance` | `personId`, `stance: "hostile"\|"neutral"\|"friendly"` | yes | 10 000 | set the bot's hostility toward the player |
@@ -261,6 +268,15 @@ the backend decide the consequence — **the client does not decide.**
 ---
 
 ## 6. Who is the player talking to
+
+**Exactly one person answers.** A push-to-talk final is a question put to the
+addressee, and the reply -- the brain turn -- belongs to them alone. Anyone else
+within `hearSpeakM` of the player may throw in ONE short bark from the
+ontology's `bystander` table, with probability `bystanderReactChance` (0.3) and
+a 20 s cooldown; every one of those carries `reaction: true`. A client can
+therefore separate the answer from the murmuring without heuristics -- the reply
+is the non-`reaction` segment from the person it addressed.
+
 
 The backend supplies the population; the client picks the addressee. It is the
 client's decision because only the client knows the camera.
@@ -314,6 +330,59 @@ the first sentence is audible while the model is still writing the last.
 * If a NEW utterance starts for the same person (a `say` with
   `segmentIdx == 0`) while the queue is still playing, **flush the queue** —
   the world moved on.
+
+### 7.1 Hearing: `distanceM`, `mode`, `audible`
+
+The user, 2026-09-07: *"everyone in the vicinity replies even if I can't hear
+their reply -- that's not good"*, and *"only talk when they are in distance, or
+have a way to YELL"*. Every `say` segment now carries the backend's answer to
+"could the player have heard that", and the client obeys it.
+
+| field | meaning |
+|---|---|
+| `distanceM` | speaker to player, in metres, from the last distance THIS CLIENT reported (`player_seen.distanceM`, `player_aimed_at.distanceM`, or `npc_moved` against `player_moved`). **`-1` means nobody has reported one**; the backend then treats the line as audible and says so in `hearingNote`. `-1` is not "far". |
+| `mode` | `"speak"` within `hearSpeakM` (25 m default); `"yell"` within `hearYellM` (70 m); `"mutter"` an aside within ~6 m that was not addressed to the player |
+| `audible` | `false` only ever appears on a segment kept for the record. **Do not play it and do not subtitle it.** In practice the backend does not emit those at all -- it journals `say.suppressed` instead -- so a client that ignores `audible` is wrong but not loud. |
+| `reaction` | `true` = a short bark from someone who merely OVERHEARD the player. Not a reply. See section 6. |
+| `hearSpeakM` / `hearYellM` | the ranges in force, so the client can size its rolloff without a second config of its own |
+| `hearingNote` | the sentence saying which band it fell in and why. Log it when something surprises you; never parse it. |
+
+**A `yell` is REWRITTEN, not amplified.** The backend replaced the line with its
+shouted form before synthesis -- the ontology row's `yell` variant when the
+table has one, otherwise the first sentence, shortened and upper-cased -- and
+set `voiceSpec.yell = true` so a TTS engine that can shout does. The client must
+**not** upper-case anything itself. What it should do:
+
+* `maxDistance = max(hearYellM, 40)` on the AudioSource for a yell. At the
+  default 40 m rolloff, a shout the backend sent for a 60 m gap is inaudible on
+  arrival: the same bug in the other direction.
+* louder: `Basement.Client` plays `speak` at volume 0.5 and `yell` at 1.0
+  (exactly +6 dB) with pitch 1.06, and `mutter` at 0.3. That is on top of
+  whatever the engine did, and is meant to be -- a recorded shout played at
+  conversational volume still sounds like a conversation.
+
+**Subtitle only what you played.** `Basement.Client` drops `audible:false` at
+the queue, so every subtitle it draws is a line the player could hear.
+
+### 7.2 Proactive speech
+
+People also speak when nobody asked them to. Each trigger is rate-limited per
+person, gated by the same hearing rules, and every line comes from the `barks`
+table in `data/ontology.json` -- never from code, and never from the LLM.
+
+| trigger | when | example (neutral) |
+|---|---|---|
+| `first_sight` | the first time this raid that person sees the player | "You there. You alive, or just walking?" |
+| `approach` | the player closes 10 m or more within 3 s | "Keep coming, then. Slowly." |
+| `push` | the player closes 15 m or more within 3 s (a sprint) inside `hearYellM` | "WALK IT IN!" |
+| `linger` | the player stays within 8 m for 10 s without talking | "Well? You came over here for something." |
+| `hurt` | that person is shot | "What in hell was that for?" |
+| `saw_death` | someone dies within 30 m of them | "Who did that?" |
+| `combat_taunt` | every 8-15 s while fighting, yelled | "I SEE YOU MOVING!" |
+| `bystander` | they overheard the player address somebody else | "Mm-hm." (`reaction:true`) |
+
+`chatterLevel` is 0 off / 1 normal / 2 talkative (every gap halved), and each
+trigger has its own switch in the backend's `config.json`.
 
 ---
 

@@ -47,6 +47,7 @@ import aowlspt
 import aowlspt/server as server
 import aowlspt/json as jr
 import util
+import hearing
 
 # ---------------------------------------------------------------------------
 # State. Literal initialisers only -- a mod is a DLL and nimony silently zeroes
@@ -207,6 +208,30 @@ proc emitEvent*(kind, json: string; needsAck: bool; ttlMs: int64 = 0): int =
   ## and the host can push -- and counts the pushes that failed, because
   ## `ErrNotFound` (no socket for that session) is a normal answer and must not
   ## read as delivery.
+  ##
+  ## ------------------------------------------------------------------ hearing
+  ## THE ONE CHOKE POINT for "could the player have heard that". Every `say`
+  ## reaches the client through here -- the encounter machine's barks, the
+  ## brain's streamed sentences out of `speech.sayDrain`, and anything added
+  ## later -- so the gate is here rather than at each emitter, where the third
+  ## one would inevitably forget it. A payload that already carries `audible`
+  ## has been decided by its emitter (`encounter.emitBarkEx`, which needs the
+  ## verdict BEFORE it picks the words) and is passed through untouched.
+  ##
+  ## Beyond `hearYellM` the event is NOT APPENDED AT ALL and 0 is returned:
+  ## the record is the journaled `say.suppressed` row, not a directive the
+  ## client would have to be trusted to ignore.
+  var body = json
+  if kind == "say" and find(body, "\"audible\"") < 0:
+    let pid = jr.asText(jr.field(body, "personId"), "")
+    var mode = "speak"
+    var audible = true
+    var why = ""
+    let d = hearingDecide(pid, false, mode, audible, why)
+    if not audible:
+      journalSuppressed(pid, jr.asText(jr.field(body, "text"), ""), why)
+      return 0
+    body = decorateSay(body, d, mode, audible, false, why)
   gNext = gNext + 1
   let s = gNext
   var ttl = 0'i64
@@ -216,7 +241,7 @@ proc emitEvent*(kind, json: string; needsAck: bool; ttlMs: int64 = 0): int =
   gSeqNo.add s
   gAtMs.add nowMs()
   gKind.add kind
-  gData.add json
+  gData.add body
   gAck.add needsAck
   gTtl.add ttl
   trimRing()

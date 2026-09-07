@@ -19,6 +19,13 @@ namespace Basement.Client
     ///   tick                        1 Hz in raid.
     ///   player_moved                every 2 s in raid, and once right after raid_started.
     ///   player_seen / player_lost   MAPPED people, alive, within NoticeM, inside 35 deg of the camera forward.
+    ///                               RE-SENT for someone already in view when their distance has moved
+    ///                               2 m or more and 0.5 s has passed. That is not noise: the backend's
+    ///                               `approach` and `push` triggers are derived from CONSECUTIVE
+    ///                               distances, and with the old edge-only report there was never a
+    ///                               second sample to derive them from.
+    ///   npc_moved                   every 2 s, ONE batched POST carrying every BOUND person's position,
+    ///                               so the backend can decide who is close enough to be heard.
     ///   player_aimed_at             HandsController.IsAiming held 400 ms with an addressee.
     ///   player_lowered_weapon       not aiming for 1 s after an aimed episode.
     ///   player_fired                FirearmController.OnShot (hit is NOT known: hitKnown:false is sent).
@@ -33,6 +40,8 @@ namespace Basement.Client
         private const float MovedEvery = 2f;
         private const float TickEvery = 1f;
         private const float ScanEvery = 0.1f;
+        private const float SeenRefreshEvery = 0.5f;
+        private const float SeenRefreshM = 2f;
         private const float PeopleEvery = 10f;
         private const float AimHold = 0.4f;
         private const float LowerHold = 1f;
@@ -52,6 +61,11 @@ namespace Basement.Client
         private static string _exitStatus;
         private static bool _mainDied;
         private static readonly HashSet<string> InView = new HashSet<string>(StringComparer.Ordinal);
+        // What we last TOLD the backend about each in-view person, so a refresh
+        // is sent on a real change and not on every 0.1 s scan.
+        private static readonly Dictionary<string, float> SentDist = new Dictionary<string, float>(StringComparer.Ordinal);
+        private static readonly Dictionary<string, float> SentAt = new Dictionary<string, float>(StringComparer.Ordinal);
+        public static int SeenRefreshes, NpcMoves;
         private static readonly HashSet<string> Subscribed = new HashSet<string>(StringComparer.Ordinal);
 
         private static readonly Comparison<Candidate> ByRank = (a, b) =>
@@ -85,7 +99,7 @@ namespace Basement.Client
                 _lastTick = now; Ticks++;
                 Plugin.Link.Observe("tick", new JObject { ["nowMs"] = (long)(now * 1000) });
             }
-            if (now - _lastMove >= MovedEvery) { _lastMove = now; SendMoved(main); }
+            if (now - _lastMove >= MovedEvery) { _lastMove = now; SendMoved(main); SendNpcMoved(gw); }
             if (now - _lastPeople >= PeopleEvery)
             {
                 _lastPeople = now;
@@ -106,6 +120,8 @@ namespace Basement.Client
             _exitStatus = null;
             _mainDied = false;
             InView.Clear();
+            SentDist.Clear();
+            SentAt.Clear();
             Addressee = null;
             Map = gw.LocationId ?? "";
             var p = main.Position;
@@ -153,6 +169,8 @@ namespace Basement.Client
             _main = null; _hands = null; _firearm = null;
             foreach (var id in InView) Plugin.Link.Observe("player_lost", new JObject { ["personId"] = id });
             InView.Clear();
+            SentDist.Clear();
+            SentAt.Clear();
             Subscribed.Clear();
             People.ClearBots();
             Addressee = null;
@@ -239,7 +257,20 @@ namespace Basement.Client
                 if (InView.Add(c.Id))
                 {
                     Seen++;
+                    SentDist[c.Id] = c.Dist; SentAt[c.Id] = now;
                     Plugin.Link.Observe("player_seen", new JObject { ["personId"] = c.Id, ["distanceM"] = c.Dist, ["inViewCone"] = true });
+                    continue;
+                }
+                // Already in view. The backend needs a SECOND sample to see an
+                // approach at all, but not sixty of them: 0.5 s and 2 m.
+                float was, at;
+                if (!SentDist.TryGetValue(c.Id, out was)) was = c.Dist;
+                if (!SentAt.TryGetValue(c.Id, out at)) at = 0f;
+                if (now - at >= SeenRefreshEvery && Mathf.Abs(was - c.Dist) >= SeenRefreshM)
+                {
+                    SeenRefreshes++;
+                    SentDist[c.Id] = c.Dist; SentAt[c.Id] = now;
+                    Plugin.Link.Observe("player_seen", new JObject { ["personId"] = c.Id, ["distanceM"] = c.Dist, ["inViewCone"] = true, ["refresh"] = true });
                 }
             }
             var gone = new List<string>();
@@ -247,6 +278,7 @@ namespace Basement.Client
             foreach (var id in gone)
             {
                 InView.Remove(id); Lost++;
+                SentDist.Remove(id); SentAt.Remove(id);
                 Plugin.Link.Observe("player_lost", new JObject { ["personId"] = id });
             }
             var next = cands.Count > 0 ? cands[0].Id : null;
@@ -262,6 +294,33 @@ namespace Basement.Client
             float yaw = 0f;
             try { yaw = main.Rotation.x; } catch { }
             Plugin.Link.Observe("player_moved", new JObject { ["map"] = Map, ["x"] = p.x, ["y"] = p.y, ["z"] = p.z, ["yaw"] = yaw });
+        }
+
+        /// <summary>
+        /// Where every BOUND person is, in ONE POST. The backend needs it to
+        /// decide who is close enough to hear a line, and it needs it for
+        /// people who are NOT in the view cone -- someone shouting at your back
+        /// is exactly the case `player_seen` cannot report.
+        ///
+        /// One request, not one per person: at 40 bound bots the per-person
+        /// shape would be 40 fire-and-forget POSTs every 2 s, which is a
+        /// different bug wearing this one's clothes.
+        /// </summary>
+        private static void SendNpcMoved(GameWorld gw)
+        {
+            var arr = new JArray();
+            var alive = gw != null ? gw.AllAlivePlayersList : null;
+            foreach (var kv in People.Mapped())
+            {
+                var bot = kv.Value;
+                if (bot == null) continue;
+                if (alive != null && !alive.Contains(bot)) continue;
+                var p = bot.Position;
+                arr.Add(new JObject { ["personId"] = kv.Key, ["x"] = p.x, ["y"] = p.y, ["z"] = p.z });
+            }
+            if (arr.Count == 0) return;
+            NpcMoves++;
+            Plugin.Link.Observe("npc_moved", new JObject { ["map"] = Map, ["people"] = arr });
         }
 
         private static void OnMainDamaged(EBodyPart part, float damage, EFT.Ballistics.DamageInfo info)

@@ -43,6 +43,12 @@ type
     groupSize*: int
     timeOfDay*: string
     recentEvents*: string
+    yell*: bool
+      ## The player is too far for a normal voice but still inside shouting
+      ## range (`bm/hearing`). It is in the VOLATILE half and NOT in
+      ## `situationSignature`: two otherwise identical moments that differ only
+      ## in whether the person has to shout need two different lines, and a
+      ## cache that served the quiet one for both would be the bug.
 
 proc distanceBand*(d: float): string =
   ## Three bands, deliberately coarse: the cache must match "the same KIND of
@@ -153,6 +159,11 @@ proc volatileSuffix*(c: PersonCard; s: Situation; memory, facts,
         $int(s.npcHp * 100.0) & " percent. "
   if s.groupSize > 1: v.add "You have " & $(s.groupSize - 1) & " with you. "
   v.add "It is " & (if s.timeOfDay.len > 0: s.timeOfDay else: "day") & ".\n"
+  if s.yell:
+    v.add "Yell: true. They are " & $int(s.distanceM) &
+          " m away -- too far to talk to. SHOUT one short line, six words at " &
+          "most, the way a person shouts across a yard. No sentences, no " &
+          "explanation.\n"
   v.add "Toward this person: " & attitudeWord(c.attitude) &
         " (attitude " & $c.attitude & ", your faction's standing with them " &
         $c.factionRep & "). Your mood is " & moodWord(c.mood) & ".\n"

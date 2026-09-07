@@ -38,6 +38,7 @@ this file exists to catch, and `ok` is therefore never the assertion.
 """
 
 import argparse
+import glob
 import json
 import os
 import random
@@ -46,6 +47,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SIM = os.path.join(REPO, "host", "Aowlspt.Sim", "bin", "aowlspt-sim.exe")
@@ -1226,6 +1228,510 @@ def check_streaming(rep, store):
                [t for t, _, _ in says], notes[:200]))
 
 
+KOKORO_TEST_URL = "http://127.0.0.1:6972"
+
+
+def _server_up(url, timeout=3):
+    """True when <url>/health answers ok. Never raises; a down server is a
+    normal answer here and must read as INCONCLUSIVE, not as a failure."""
+    try:
+        import urllib.request
+        with urllib.request.urlopen(url + "/health", timeout=timeout) as r:
+            return b'"ok": true' in r.read(400) or b'"ok":true' in r.read(0)
+    except Exception:                              # noqa: BLE001 -- reported
+        return False
+
+
+def _tick_max_ms(status):
+    t = (status or {}).get("tick") or {}
+    v = t.get("maxMs")
+    return v if isinstance(v, int) else None
+
+
+def check_tts_async(rep, store):
+    """A streamed turn must not block the tick, and therefore not a route.
+
+    THE INSTRUMENT is `/status`.tick.maxMs -- the longest single `onTick` the
+    mod measured for itself. A route cannot run while `onTick` holds the mod
+    lock, so the longest tick IS the worst latency a route could have suffered.
+    Measuring it inside the mod is the only place that is true of: the
+    simulator runs EVERY ROUTE BEFORE IT RUNS A SINGLE TICK, so an outside
+    stopwatch here would time the queue and not the block.
+
+    THIS CHECK CARRIES ITS OWN NEGATIVE CONTROL. The same five-sentence turn
+    runs twice against the same real kokoro server, with a FRESH tts cache each
+    time so neither half can be answered from disk:
+
+        ttsAsync = true   -> tick.maxMs must be UNDER the bound
+        ttsAsync = false  -> tick.maxMs must be OVER it
+
+    If the control does NOT exceed the bound then synthesis was not actually
+    slow during this run (a warm cache, a stubbed engine) and the positive half
+    proves nothing -- INCONCLUSIVE, never PASS.
+
+    AND THE AUDIO MUST STILL ARRIVE. The mechanism only counts if the detached
+    requests really complete, so after the simulator has EXITED this waits on
+    the finished state on disk: one `<wav>.done` marker per sentence in the
+    asynchronous half's own cache directory. Those files are written by curl
+    processes that outlived the simulator, which is what "detached" means and
+    is the part a `starts` counter could never establish.
+    """
+    bound = 300
+    want = 5
+    if not _server_up(KOKORO_TEST_URL):
+        rep.add(INCONCLUSIVE, "tts async: the tick stays under %d ms" % bound,
+                "no kokoro test server answering at %s/health, so whether "
+                "synthesis blocks the tick cannot be established here -- and "
+                "an absent server is never a PASS. Start it with: "
+                "%%LOCALAPPDATA%%\\aowlspt\\kokoro\\venv\\Scripts\\python.exe "
+                "tools/kokoro/server.py --port 6972" % KOKORO_TEST_URL)
+        return
+
+    fixture = os.path.join(store, "async-stream.sse")
+    open(fixture, "w", encoding="utf-8").write(FIXTURE_SSE_5)
+    cache_async = os.path.join(store, "tts-async")
+
+    def cfg(name, is_async):
+        return {"llmEngine": "openai",
+                "llmFakeStreamFile": fixture.replace("\\", "/"),
+                "llmFakeChunkBytes": 120, "debugTickRoute": True,
+                "turnTimeoutMs": 60000, "llmFakeStreamStall": False,
+                "ttsEngine": "kokoro", "kokoroUrl": KOKORO_TEST_URL,
+                "ttsAsync": is_async, "ttsTimeoutMs": 1500,
+                # A FRESH cache per half. Sharing one would let the control
+                # answer every sentence from disk in microseconds and report a
+                # small maxMs -- the check would then pass for both settings
+                # and mean nothing.
+                "cacheDir": os.path.join(store,
+                                         "tts-%s" % name).replace("\\", "/")}
+
+    def run(name, is_async):
+        docs, raw, err = run_sim_cfg(store, [
+            (BASE + "/world/new", '{"preset":"warlords","seed":7}'),
+            (BASE + "/world/people", ""),
+        ], cfg(name, is_async))
+        if err:
+            return None, err
+        person = pick_person(docs[1], "grunt") or pick_person(docs[1], "slaver")
+        if not person:
+            return None, "the generated world has nobody to talk to"
+        routes = [
+            (BASE + "/world/new", '{"preset":"warlords","seed":7}'),
+            (BASE + "/say",
+             json.dumps({"person": person["id"],
+                         "text": "tell me about the %s tunnels" % name})),
+            (BASE + "/tick", '{"n":80}'),
+            (BASE + "/status", ""),
+        ]
+        docs, raw, err = run_sim_cfg(store, routes, cfg(name, is_async),
+                                     timeout=900)
+        if err:
+            return None, err
+        return docs[3], None
+
+    st_a, err = run("async", True)
+    if err:
+        rep.add(INCONCLUSIVE, "tts async: the tick stays under %d ms" % bound,
+                "the asynchronous run did not complete: %s" % err)
+        return
+    st_c, err_c = run("sync", False)
+    max_a, max_c = _tick_max_ms(st_a), _tick_max_ms(st_c)
+    stats = (st_a or {}).get("ttsAsync") or {}
+
+    if max_a is None:
+        rep.add(FAIL, "tts async: the tick stays under %d ms" % bound,
+                "/status carried no tick.maxMs, so the instrument this check "
+                "depends on is not reporting: %s" % json.dumps(st_a)[:300])
+        return
+
+    # The finished state on disk, AFTER the simulator exited. The bound is
+    # generous because a cold kokoro loads its model first; what is being
+    # asserted is that the requests complete at all without us waiting on them.
+    deadline = time.time() + 90
+    markers = []
+    tts_dir = os.path.join(cache_async, "tts")
+    while time.time() < deadline:
+        markers = (glob.glob(os.path.join(tts_dir, "*.wav.done"))
+                   if os.path.isdir(tts_dir) else [])
+        if len(markers) >= want:
+            break
+        time.sleep(1.0)
+    playable = [m[:-5] for m in markers
+                if os.path.exists(m[:-5]) and os.path.getsize(m[:-5]) > 44]
+
+    evidence = ("async run: tick.maxMs=%s over %s ticks; ttsAsync.starts=%s "
+                "arrived=%s timedOut=%s pending=%s spawnMode=%s "
+                "spawnLastMs=%s; %d/%d wavs finished on disk AFTER the "
+                "simulator exited (%d playable). SYNCHRONOUS CONTROL: "
+                "tick.maxMs=%s%s"
+                % (max_a, ((st_a or {}).get("tick") or {}).get("ticks"),
+                   stats.get("starts"), stats.get("arrived"),
+                   stats.get("timedOut"), stats.get("pending"),
+                   stats.get("spawnMode"), stats.get("spawnLastMs"),
+                   len(markers), want, len(playable), max_c,
+                   (" (control error: %s)" % err_c) if err_c else ""))
+
+    if err_c or max_c is None:
+        rep.add(INCONCLUSIVE, "tts async: the tick stays under %d ms" % bound,
+                "the synchronous NEGATIVE CONTROL did not complete, so a small "
+                "maxMs on the asynchronous run cannot be told apart from a run "
+                "where nothing was synthesised at all. %s" % evidence)
+        return
+    if max_c <= bound:
+        rep.add(INCONCLUSIVE, "tts async: the tick stays under %d ms" % bound,
+                "the negative control did NOT exceed the bound, so synthesis "
+                "was not actually slow during this run and the positive half "
+                "proves nothing. %s" % evidence)
+        return
+
+    ok = (max_a < bound and stats.get("starts", 0) >= want
+          and len(playable) >= want)
+    rep.add(PASS if ok else FAIL,
+            "tts async: the tick stays under %d ms while a turn streams" % bound,
+            "%s -- the audio must still ARRIVE, or this would pass by going "
+            "mute" % evidence)
+
+
+def check_groq(rep, store):
+    """The OpenAI-compatible cloud engines, against Groq, when a key is set."""
+    key_env = "GROQ_API_KEY"
+    if not os.environ.get(key_env):
+        rep.add(INCONCLUSIVE, "groq: chat + transcription",
+                "%s is not set in this process's environment, so the cloud "
+                "engines cannot be exercised. The key is never read from "
+                "config.json or from source -- openAiKeyEnv/sttKeyEnv only "
+                "NAME the variable." % key_env)
+        return
+    base = "https://api.groq.com/openai/v1"
+
+    docs, raw, err = run_sim_cfg(store, [
+        (BASE + "/world/new", '{"preset":"warlords","seed":7}'),
+        (BASE + "/world/people", ""),
+    ], {"llmEngine": "openai", "openAiBaseUrl": base,
+        "openAiKeyEnv": key_env, "openAiModel": "openai/gpt-oss-120b"})
+    if err:
+        rep.add(INCONCLUSIVE, "groq: chat + transcription", err)
+        return
+    person = pick_person(docs[1], "grunt") or pick_person(docs[1], "slaver")
+    if not person:
+        rep.add(INCONCLUSIVE, "groq: chat + transcription",
+                "the generated world has nobody to talk to")
+        return
+
+    cfg = {"llmEngine": "openai", "openAiBaseUrl": base,
+           "openAiKeyEnv": key_env, "openAiModel": "openai/gpt-oss-120b",
+           "openAiExtraJson": '"reasoning_effort":"low"',
+           "maxTokens": 220, "llmStreaming": False,
+           "sttEngine": "openai-whisper", "sttBaseUrl": base,
+           "sttKeyEnv": key_env, "sttModel": "whisper-large-v3-turbo",
+           "ttsEngine": "none",
+           "cacheDir": os.path.join(store, "groq").replace("\\", "/")}
+    t0 = time.time()
+    docs, raw, err = run_sim_cfg(store, [
+        (BASE + "/world/new", '{"preset":"warlords","seed":7}'),
+        (BASE + "/say", json.dumps({"person": person["id"],
+                                    "text": "who are you and what do you want"})),
+        (BASE + "/status", ""),
+    ], cfg, timeout=180)
+    elapsed = time.time() - t0
+    if err:
+        rep.add(INCONCLUSIVE, "groq: the chat engine answers", err)
+        return
+    say, status = docs[1], docs[2]
+    probe = ((status or {}).get("engines") or {})
+    text = (say or {}).get("text") or ""
+    tier = (say or {}).get("tier")
+    ok = (tier not in (None, "refused") and len(text) > 20
+          and elapsed < 120)
+    rep.add(PASS if ok else FAIL, "groq: the chat engine answers",
+            "tier=%r engine=%r %d chars in %.2f s (whole simulator run, not "
+            "just the request); notes=%s"
+            % (tier, (say or {}).get("engine"), len(text), elapsed,
+               json.dumps((say or {}).get("notes"))[:400]))
+
+    # STT needs REAL SPEECH, and the push-to-talk path needs a microphone, so
+    # the fixture is synthesised by the local kokoro test server and fed
+    # through the ordinary chunk session -- which is the same funnel the live
+    # client uses, so this exercises the code that actually runs.
+    spoken = "The basement door is locked and the key is gone."
+    wav = os.path.join(store, "groq-stt-fixture.wav")
+    if not _server_up(KOKORO_TEST_URL):
+        rep.add(INCONCLUSIVE, "groq: whisper transcribes a spoken fixture",
+                "no kokoro test server at %s to synthesise the fixture with, "
+                "and the push-to-talk path needs a microphone -- so there is "
+                "nothing to transcribe. Not a PASS." % KOKORO_TEST_URL)
+        return
+    try:
+        import urllib.request
+        body = json.dumps({"text": spoken, "voice": "am_michael",
+                           "speed": 1.0}).encode("utf-8")
+        req = urllib.request.Request(KOKORO_TEST_URL + "/tts", data=body,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            open(wav, "wb").write(r.read())
+    except Exception as e:                         # noqa: BLE001 -- reported
+        rep.add(INCONCLUSIVE, "groq: whisper transcribes a spoken fixture",
+                "could not synthesise the fixture: %r" % (e,))
+        return
+    if not os.path.exists(wav) or os.path.getsize(wav) <= 44:
+        rep.add(INCONCLUSIVE, "groq: whisper transcribes a spoken fixture",
+                "the fixture wav is %s bytes"
+                % (os.path.getsize(wav) if os.path.exists(wav) else "absent"))
+        return
+
+    t1 = time.time()
+    docs, raw, err = run_sim_cfg(store, [
+        (BASE + "/speech/chunk",
+         json.dumps({"session": "groqstt", "seq": 1, "final": True,
+                     "path": wav.replace("\\", "/")})),
+    ], cfg, timeout=180)
+    stt_elapsed = time.time() - t1
+    if err or not isinstance(docs[0], dict):
+        rep.add(INCONCLUSIVE, "groq: whisper transcribes a spoken fixture",
+                "the chunk route did not answer: %s" % (err or json.dumps(docs)[:300]))
+        return
+    heard = (docs[0].get("final") or docs[0].get("text")
+             or docs[0].get("heard") or "")
+    # The assertion is on the CONTENT, not merely on a non-empty string: an
+    # endpoint that answered "you" would otherwise pass. Two content words from
+    # the sentence that was actually spoken have to come back.
+    low = heard.lower()
+    hits = [w for w in ("basement", "door", "locked", "key") if w in low]
+    rep.add(PASS if len(hits) >= 2 else FAIL,
+            "groq: whisper transcribes a spoken fixture",
+            "spoke %r, heard %r in %.2f s (whole simulator run); matched %s "
+            "of basement/door/locked/key -- two are required, so a plausible "
+            "but wrong transcription fails. note=%s"
+            % (spoken, heard[:160], stt_elapsed, hits,
+               json.dumps(docs[0].get("note"))[:200]))
+
+
+def _find_fixture_wav(store):
+    for root, _dirs, files in os.walk(store):
+        for f in files:
+            if f.lower().endswith(".wav"):
+                p = os.path.join(root, f)
+                if os.path.getsize(p) > 44:
+                    return p
+    return None
+
+
+FIXTURE_SSE_5 = (
+    'data: {"choices":[{"delta":{"content":"Hold still and listen. "}}]}\n\n'
+    'data: {"choices":[{"delta":{"content":"There is a way out through '
+    'the old service tunnels. "}}]}\n\n'
+    'data: {"choices":[{"delta":{"content":"It floods when it rains, '
+    'so move fast. "}}]}\n\n'
+    'data: {"choices":[{"delta":{"content":"Take the left fork at the '
+    'broken pipe. "}}]}\n\n'
+    'data: {"choices":[{"delta":{"content":"Do not stop for anything you '
+    'hear down there. "}}]}\n\n'
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+    'data: [DONE]\n\n'
+)
+
+
+
+# ---------------------------------------------------------------------------
+# the hearing model: who can hear a line, and who is allowed to answer
+# ---------------------------------------------------------------------------
+
+def _say_rows(doc):
+    """Every `say` event in an /events response, as (personId, mode, audible,
+    reaction, text)."""
+    out = []
+    for e in (doc or {}).get("events", []):
+        if not isinstance(e, dict) or e.get("kind") != "say":
+            continue
+        d = e.get("data") or {}
+        out.append((d.get("personId", ""), d.get("mode", ""),
+                    d.get("audible", None), bool(d.get("reaction", False)),
+                    d.get("text", "")))
+    return out
+
+
+def check_hearing(rep, store):
+    """THE THREE BANDS, against the SERVED stream, in one simulator run.
+
+    The user, 2026-09-07: *"everyone in the vicinity replies even if I can't
+    hear their reply -- that's not good"*.
+
+    The same person is aimed at from three distances -- 500 m, 45 m, 10 m --
+    reported the way the live client reports them (`npc_moved` against
+    `player_moved`, which is the path that has to work in a raid, NOT a
+    hand-set field). The assertions are on what the stream actually carried:
+
+      500 m -> NO say at all, and a `say.suppressed` row in the journal
+       45 m -> mode "yell", audible, and text DIFFERENT from the 10 m text
+       10 m -> mode "speak", audible
+
+    The last clause is the one that cannot pass vacuously: a build that
+    ignored the bands entirely would serve the same sentence at 45 m and at
+    10 m, and "they differ" would fail.
+    """
+    routes = [(BASE + "/world/new", '{"preset":"warlords","seed":7}'),
+              (BASE + "/world/people", "")]
+    docs, raw, err = run_sim(store, routes)
+    if err or docs[1] is None:
+        rep.add(INCONCLUSIVE, "hearing bands",
+                err or "no /world/people answer\n" + raw[-800:])
+        return
+    people = (docs[1] or {}).get("people", [])
+    if len(people) < 3:
+        rep.add(INCONCLUSIVE, "hearing bands",
+                "the generated world has %d people; this needs 3" % len(people))
+        return
+    a, b, cc = people[0]["id"], people[1]["id"], people[2]["id"]
+
+    def moved(x):
+        return '{"kind":"player_moved","map":"woods","x":0,"y":0,"z":0}'
+
+    def npc(pid, dist):
+        return ('{"kind":"npc_moved","map":"woods","people":[{"personId":"%s",'
+                '"x":%f,"y":0,"z":0}]}' % (pid, float(dist)))
+
+    obs = BASE + "/observe"
+    ev = BASE + "/events?since=%d"
+    routes = [
+        (BASE + "/world/new", '{"preset":"warlords","seed":7}'),
+        (obs, '{"kind":"raid_started","map":"woods"}'),
+        (obs, moved(0)),
+        # --- 500 m -----------------------------------------------------------
+        (obs, npc(a, 500)),
+        (obs, '{"kind":"player_aimed_at","personId":"%s"}' % a),
+        (BASE + "/events?since=0&limit=400", ""),
+        # --- 45 m ------------------------------------------------------------
+        (obs, '{"kind":"raid_started","map":"woods"}'),
+        (obs, moved(0)),
+        (obs, npc(a, 45)),
+        (obs, '{"kind":"player_aimed_at","personId":"%s"}' % a),
+        (BASE + "/events?since=0&limit=400", ""),
+        # --- 10 m ------------------------------------------------------------
+        (obs, '{"kind":"raid_started","map":"woods"}'),
+        (obs, moved(0)),
+        (obs, npc(a, 10)),
+        (obs, '{"kind":"player_aimed_at","personId":"%s"}' % a),
+        (BASE + "/events?since=0&limit=400", ""),
+    ]
+    # barkCooldownMs 0, or the 20 s aim hysteresis (selfcheck 17) swallows the
+    # second and third aim at the same person and bands 2 and 3 come back
+    # empty for a reason that has nothing to do with hearing. MEASURED: that
+    # is exactly how this check first failed.
+    docs, raw, err = run_sim_cfg(store, routes, {"barkCooldownMs": 0,
+                                                 "ttsEngine": "none"})
+    if err:
+        rep.add(INCONCLUSIVE, "hearing bands", err)
+        return
+
+    def window(i_events, i_prev_events):
+        """The say events that appeared between two /events snapshots."""
+        now = _say_rows(docs[i_events])
+        was = _say_rows(docs[i_prev_events]) if i_prev_events is not None else []
+        return now[len(was):]
+
+    far = window(5, None)
+    mid = window(10, 5)
+    near = window(15, 10)
+
+    # The mod's own account of the 500 m aim. `/journal` has no route, so the
+    # journal row itself is asserted by selfcheck 21 (which can read it
+    # directly); here the instrument is the note the route returned.
+    far_note = (docs[4] or {}).get("note", "")
+    suppressed = "not said" in far_note and "beyond" in far_note
+
+    def one(rows, want_mode):
+        for pid, mode, aud, react, text in rows:
+            if pid == a and not react:
+                return mode == want_mode and aud is not False, mode, text
+        return False, "(no say)", ""
+
+    ok_mid, mode_mid, text_mid = one(mid, "yell")
+    ok_near, mode_near, text_near = one(near, "speak")
+    ok = (len(far) == 0 and suppressed and ok_mid and ok_near
+          and text_mid and text_near and text_mid != text_near)
+    rep.add(PASS if ok else FAIL, "hearing: 500 m silent / 45 m yelled / 10 m spoken",
+            "500 m served %d say (expected 0), the route said %r; "
+            "45 m mode=%s text=%r; 10 m mode=%s text=%r; the two texts must "
+            "DIFFER and they %s"
+            % (len(far), far_note, mode_mid, text_mid, mode_near, text_near,
+               "do" if text_mid != text_near else "DO NOT"))
+
+
+def check_one_reply(rep, store):
+    """One utterance, three people in earshot: ONE reply, the rest at most
+    reactions.
+
+    The reply is the non-`reaction` segment from the person addressed. The
+    negative control is the second half of the run, with
+    `bystanderReactChance` at 0: the same utterance must then produce ZERO
+    reactions, so "nobody else spoke" cannot be passing because nobody was
+    ever in range.
+    """
+    docs, raw, err = run_sim(store, [(BASE + "/world/new", '{"preset":"warlords","seed":7}'),
+                                     (BASE + "/world/people", "")])
+    if err or docs[1] is None:
+        rep.add(INCONCLUSIVE, "only the addressee replies",
+                err or "no /world/people answer")
+        return
+    people = (docs[1] or {}).get("people", [])
+    if len(people) < 3:
+        rep.add(INCONCLUSIVE, "only the addressee replies",
+                "the generated world has %d people; this needs 3" % len(people))
+        return
+    a, b, cc = people[0]["id"], people[1]["id"], people[2]["id"]
+    obs = BASE + "/observe"
+
+    def run(chance):
+        routes = [
+            (BASE + "/world/new", '{"preset":"warlords","seed":7}'),
+            (obs, '{"kind":"raid_started","map":"woods"}'),
+            (obs, '{"kind":"player_moved","map":"woods","x":0,"y":0,"z":0}'),
+            (obs, '{"kind":"npc_moved","map":"woods","people":['
+                  '{"personId":"%s","x":5,"y":0,"z":0},'
+                  '{"personId":"%s","x":8,"y":0,"z":0},'
+                  '{"personId":"%s","x":12,"y":0,"z":0}]}' % (a, b, cc)),
+            # Seen as well, so their once-per-raid `first_sight` greeting is
+            # spent BEFORE the baseline snapshot below. Otherwise it lands in
+            # the measured window as a non-reaction segment from somebody who
+            # was not addressed, and the check fails for the right rule and
+            # the wrong reason.
+            (obs, '{"kind":"player_seen","personId":"%s","distanceM":5}' % a),
+            (obs, '{"kind":"player_seen","personId":"%s","distanceM":8}' % b),
+            (obs, '{"kind":"player_seen","personId":"%s","distanceM":12}' % cc),
+            (BASE + "/events?since=0&limit=400", ""),
+            (BASE + "/say", '{"person":"%s","text":"hey there, how are you doing"}' % a),
+            (BASE + "/events?since=0&limit=400", ""),
+        ]
+        d, r, e = run_sim_cfg(store, routes, {"bystanderReactChance": chance,
+                                              "bystanderCooldownMs": 0,
+                                              "llmEngine": "builtin",
+                                              "ttsEngine": "none"})
+        if e or d is None:
+            return None, e or "no answer"
+        before = _say_rows(d[7])
+        after = _say_rows(d[9])
+        return after[len(before):], ""
+
+    hot, why1 = run(1.0)
+    cold, why2 = run(0.0)
+    if hot is None or cold is None:
+        rep.add(INCONCLUSIVE, "only the addressee replies", why1 or why2)
+        return
+    replies = [x for x in hot if not x[3]]
+    reactions = [x for x in hot if x[3]]
+    cold_reactions = [x for x in cold if x[3]]
+    wrong = [x for x in replies if x[0] != a]
+    ok = (len(replies) >= 1 and not wrong and len(reactions) >= 1
+          and len(cold_reactions) == 0)
+    rep.add(PASS if ok else FAIL, "one utterance, three in earshot: one reply",
+            "with bystanderReactChance 1.0 the stream carried %d non-reaction "
+            "segment(s) (all from the addressee: %s) and %d reaction(s); "
+            "NEGATIVE CONTROL at 0.0 carried %d reaction(s), expected 0. "
+            "Wrong speakers: %r"
+            % (len(replies), not wrong, len(reactions), len(cold_reactions),
+               [x[0] for x in wrong]))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--store", default="",
@@ -1255,6 +1761,10 @@ def main():
         print("")
         check_story(rep, store)
         print("")
+        check_hearing(rep, store)
+        print("")
+        check_one_reply(rep, store)
+        print("")
         check_grounding(rep, store)
         print("")
         check_dialogue(rep, store)
@@ -1264,6 +1774,10 @@ def main():
         check_crash_sequence(rep, store)
         print("")
         check_streaming(rep, store)
+        print("")
+        check_tts_async(rep, store)
+        print("")
+        check_groq(rep, store)
     finally:
         if cfg_path and original is not None:
             open(cfg_path, "w", encoding="utf-8").write(original)

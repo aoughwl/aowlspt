@@ -26,6 +26,17 @@ var gRowBucket: seq[string] = @[]
 var gRowText: seq[string] = @[]
 var gRowTags: seq[string] = @[]          ## "\x1f"-joined
 
+var gRowYell: seq[string] = @[]          ## unit-separator-joined SHOUTED variants, may be empty
+
+# The proactive bark tables (`barks` in ontology.json): trigger x bucket ->
+# four-plus plain lines and their shouted variants. These are NOT replies --
+# nothing the player said selects one. They are what a person says on their own
+# initiative when the encounter machine notices something.
+var gBarkTrigger: seq[string] = @[]
+var gBarkBucket: seq[string] = @[]
+var gBarkText: seq[string] = @[]         ## unit-separator-joined
+var gBarkYell: seq[string] = @[]         ## unit-separator-joined
+
 var gFbBucket: seq[string] = @[]
 var gFbText: seq[string] = @[]
 var gFbTags: seq[string] = @[]
@@ -36,6 +47,7 @@ var gLoadNote: string = "not loaded"
 proc ontologyIntentCount*(): int = gIntentId.len
 proc ontologyRowCount*(): int = gRowIntent.len
 proc ontologyFallbackCount*(): int = gFbBucket.len
+proc ontologyBarkRowCount*(): int = gBarkTrigger.len
 proc ontologyLoaded*(): bool = gLoaded
 proc ontologyNote*(): string = gLoadNote
 
@@ -68,7 +80,9 @@ proc ontologyLoad*(text: string; note: var string): bool =
   ## an empty table is never reported as a successful load.
   gIntentId = @[]; gIntentPatterns = @[]
   gRowIntent = @[]; gRowBucket = @[]; gRowText = @[]; gRowTags = @[]
+  gRowYell = @[]
   gFbBucket = @[]; gFbText = @[]; gFbTags = @[]
+  gBarkTrigger = @[]; gBarkBucket = @[]; gBarkText = @[]; gBarkYell = @[]
   gLoaded = false
   if text.len == 0:
     note = "ontology.json is missing or empty -- the ontology tier will never fire"
@@ -100,6 +114,18 @@ proc ontologyLoad*(text: string; note: var string): bool =
     gRowBucket.add b
     gRowText.add joinSep(variants)
     gRowTags.add joinSep(textsOf(jr.child(r, "tags")))
+    gRowYell.add joinSep(textsOf(jr.child(r, "yell")))
+
+  let barkItems = jr.each(jr.field(text, "barks"))
+  for bk in barkItems:
+    let tg = jr.asText(jr.child(bk, "trigger"), "")
+    let bb = jr.asText(jr.child(bk, "bucket"), "")
+    let texts = textsOf(jr.child(bk, "texts"))
+    if tg.len == 0 or bb.len == 0 or texts.len == 0: continue
+    gBarkTrigger.add tg
+    gBarkBucket.add bb
+    gBarkText.add joinSep(texts)
+    gBarkYell.add joinSep(textsOf(jr.child(bk, "yell")))
 
   let fbItems = jr.each(jr.field(text, "fallback"))
   for f in fbItems:
@@ -126,9 +152,17 @@ proc ontologyLoad*(text: string; note: var string): bool =
     let n = splitSep(rt).len
     variantN = variantN + n
     if n < 4: thinRows = thinRows + 1
+  var barkLines = 0
+  var thinBarks = 0
+  for bt in gBarkText:
+    let n = splitSep(bt).len
+    barkLines = barkLines + n
+    if n < 4: thinBarks = thinBarks + 1
   note = $gIntentId.len & " intents, " & $gRowIntent.len & " rows, " &
          $variantN & " lines, " & $thinRows & " row(s) with fewer than 4, " &
-         $gFbBucket.len & " fallback rows"
+         $gFbBucket.len & " fallback rows, " & $gBarkTrigger.len &
+         " bark rows (" & $barkLines & " bark lines, " & $thinBarks &
+         " with fewer than 4)"
   gLoadNote = note
   result = true
 
@@ -221,7 +255,7 @@ proc pickVariant(joined, personId, utterance: string): string =
   let vs = splitSep(joined)
   if vs.len == 0: return ""
   if vs.len == 1: return vs[0]
-  let h = fnv1a64(personId & "" & normalizeText(utterance))
+  let h = fnv1a64(personId & "\x1f" & normalizeText(utterance))
   result = vs[int(h mod uint64(vs.len))]
 
 proc bucketFor*(c: PersonCard; s: Situation): string =
@@ -285,3 +319,69 @@ proc ontologyFallback*(c: PersonCard; s: Situation; utterance: string;
   for t in fbT:
     tags.add fillSlots(t, c)
   result = true
+
+# ---------------------------------------------------------------------------
+# Yelling and proactive barks
+# ---------------------------------------------------------------------------
+
+proc ontologyYellFor*(text, personId: string): string =
+  ## The SHOUTED variant of a line this table served, or "" when the row that
+  ## produced it carries none. It is a reverse lookup on the exact variant
+  ## text, so it cannot invent a shout for a line that came from the LLM: the
+  ## caller must then fall back to its own rewrite AND say that it did.
+  if not gLoaded or text.len == 0: return ""
+  var i = 0
+  while i < gRowText.len:
+    if gRowYell[i].len > 0:
+      for v in splitSep(gRowText[i]):
+        if v == text:
+          let ys = splitSep(gRowYell[i])
+          let n = ys.len
+          if n == 0: return ""
+          return ys[int(fnv1a64("yell\x1f" & personId) mod uint64(n))]
+    i = i + 1
+  result = ""
+
+proc findBark(trigger, bucket: string): int =
+  result = -1
+  var i = 0
+  while i < gBarkTrigger.len:
+    if gBarkTrigger[i] == trigger and gBarkBucket[i] == bucket: return i
+    i = i + 1
+
+proc ontologyBark*(trigger, bucket, personId, salt: string;
+                   yell: bool; note: var string): string =
+  ## One proactive line. Deterministic per (person, trigger, salt): `salt`
+  ## is what makes the SECOND combat taunt from the same person differ from the
+  ## first, and it is the caller's -- usually a rate-limit counter.
+  ##
+  ## Returns "" with a note when the table has no row; a caller must never
+  ## substitute a line of its own for a missing row, because then the table is
+  ## no longer the record of what people can say.
+  note = ""
+  if not gLoaded:
+    note = "the ontology is not loaded (" & gLoadNote & ")"
+    return ""
+  var idx = findBark(trigger, bucket)
+  if idx < 0:
+    idx = findBark(trigger, "neutral")
+    if idx >= 0: note = "no '" & bucket & "' row for trigger '" & trigger &
+                        "'; used the neutral row"
+  if idx < 0:
+    note = "ontology.json has no bark row for trigger '" & trigger &
+           "' in any bucket (" & $gBarkTrigger.len & " bark rows loaded)"
+    return ""
+  var pool = splitSep(gBarkText[idx])
+  if yell:
+    let ys = splitSep(gBarkYell[idx])
+    if ys.len > 0: pool = ys
+    else:
+      note = (if note.len > 0: note & "; " else: "") &
+             "trigger '" & trigger & "'/'" & bucket &
+             "' has no yell variants; the spoken line is used unchanged"
+  if pool.len == 0:
+    note = "the bark row for '" & trigger & "'/'" & bucket & "' is empty"
+    return ""
+  let n = pool.len
+  let h = fnv1a64(trigger & "\x1f" & personId & "\x1f" & salt)
+  result = pool[int(h mod uint64(n))]

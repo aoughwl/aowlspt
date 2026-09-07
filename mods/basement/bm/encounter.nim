@@ -34,6 +34,7 @@ import world
 import stream
 import prompt
 import ontology
+import hearing
 import rng
 import util
 import items
@@ -210,6 +211,7 @@ proc captiveOf*(): string =
 proc encounterCount*(): int = gEncPerson.len
 
 proc resetEncounters*() =
+  hearingReset()
   gEncPerson = @[]
   gEncState = @[]
   gEncCaptor = @[]
@@ -314,7 +316,8 @@ proc standDownLineFor(personId: string): string =
                "Fine. You get one conversation out of me."]
   result = lines[int(fnv1a64("standdown\x1f" & personId) mod uint64(lines.len))]
 
-proc emitBark(personId, text: string): int =
+proc emitBarkEx(personId, text: string; reaction, quiet: bool;
+                yellText: string; note: var string): int =
   ## A canned line from the machine itself, NOT from the brain. It is tagged
   ## `"source":"encounter"` precisely so nobody reads a barked threat as model
   ## output on the stream.
@@ -324,20 +327,168 @@ proc emitBark(personId, text: string): int =
   ## own object with `"wav":""` hardcoded and every encounter line arrived at
   ## the client mute. Split per sentence for the same reason the brain streams
   ## per sentence -- the client plays segments in order.
+  ##
+  ## And since 2026-09-07 it is HEARING-GATED (`bm/hearing`). Three outcomes,
+  ## never two:
+  ##   * within `hearSpeakM` -> spoken, `mode:"speak"`;
+  ##   * within `hearYellM`  -> the line is REPLACED by its shouted form and
+  ##     goes out as `mode:"yell"`, so the player is not asked to overhear a
+  ##     conversational sentence from forty metres;
+  ##   * beyond that -> NOTHING is emitted, `say.suppressed` is journaled and
+  ##     the person remembers that they saw the player and could not be heard.
+  ## `note` always says which, including the distance it used.
   result = 0
+  note = ""
+  var mode = "speak"
+  var audible = true
+  var why = ""
+  let d = hearingDecide(personId, quiet, mode, audible, why)
+  if not audible:
+    journalSuppressed(personId, text, why)
+    note = "not said: " & why
+    return 0
+  var line = text
+  if mode == "yell":
+    if yellText.len > 0:
+      line = yellText
+      note = "shouted (table variant); " & why
+    else:
+      var yn = ""
+      line = yellVersionOf(personId, text, yn)
+      note = "shouted (" & yn & "); " & why
+  else:
+    note = why
   let pi = findPerson(personId)
   let voice = (if pi >= 0: personVoice(pi) else: "")
-  var parts = splitSentences(text)
-  if parts.len == 0: parts = @[text]
+  var parts = splitSentences(line)
+  if parts.len == 0: parts = @[line]
+  # QUEUED, not synthesised here -- MEASURED 2026-09-07: `sayPayload` called
+  # `ttsSegment`, which for kokoro is a ~1.3 s blocking HTTP round trip, and a
+  # bark raised from the tick ran it under the mod lock. `sayEnqueue` starts
+  # the request and returns; `sayDrain` emits the segment when the wav lands.
+  # The audibility verdict travels WITH the segment because `emitBarkEx`
+  # decided it before it picked these words -- re-deciding at drain time would
+  # use a distance a second or two stale.
   var i = 0
   while i < parts.len:
-    var wav = ""
-    var cached = false
-    var note = ""
-    let payload = sayPayload(personId, voice, parts[i], i,
-                             i == parts.len - 1, "encounter", wav, cached, note)
-    result = result + directive("say", payload, false)
+    discard sayEnqueue(personId, voice, parts[i], i, i == parts.len - 1,
+                       "encounter", false, deco = true, distanceM = d,
+                       mode = mode, audible = audible, reaction = reaction,
+                       why = why)
+    result = result + 1
     i = i + 1
+  # For a synchronous engine (piper, sapi) every segment is already resolved,
+  # so this emits all of them before the route returns and piper's timing is
+  # unchanged; a kokoro segment simply stays queued for the tick.
+  discard sayDrain()
+
+proc emitBark(personId, text: string): int =
+  var note = ""
+  result = emitBarkEx(personId, text, false, false, "", note)
+
+proc emitTrigger(personId, trigger: string; gapMs: int64;
+                 reaction, quiet, markOnSuppress: bool;
+                 note: var string): int =
+  ## The proactive path: a person speaks because the MACHINE noticed something,
+  ## not because the player said anything. Every one of them is
+  ##   rate-limited (`hearing.triggerAllowed`)  ->
+  ##   picked from `data/ontology.json`'s bark table (never written in code) ->
+  ##   hearing-gated exactly like any other line.
+  ## Returns the directive count; `note` names the gate that refused when it is
+  ## zero, because a silent NPC is the hardest symptom there is to diagnose.
+  result = 0
+  note = ""
+  let pi = findPerson(personId)
+  if pi < 0 or not personAlive(pi):
+    note = "'" & personId & "' is not a living person we know"
+    return 0
+  let now = wallMs()
+  var why = ""
+  if not triggerAllowed(personId, trigger, now, gapMs, why):
+    note = trigger & " refused: " & why
+    return 0
+  # Decide speak/yell FIRST, so the line is chosen from the right column of the
+  # table rather than written normally and then shouted.
+  var mode = "speak"
+  var audible = true
+  var hwhy = ""
+  discard hearingDecide(personId, quiet, mode, audible, hwhy)
+  if not audible:
+    # `markOnSuppress` is FALSE for `first_sight`, and that is a decision, not
+    # an oversight: a person who first laid eyes on the player at 200 m has not
+    # greeted them, and marking the trigger there would mean they never do,
+    # however close the player walks afterwards.
+    if markOnSuppress: markTrigger(personId, trigger, now)
+    journalSuppressed(personId, "(" & trigger & ")", hwhy)
+    note = trigger & " not said: " & hwhy
+    return 0
+  var onote = ""
+  let bucket = bucketOf(personId)
+  let salt = nextSalt(personId)
+  let text = ontologyBark(trigger, bucket, personId, salt, mode == "yell", onote)
+  if text.len == 0:
+    note = trigger & " produced no line: " & onote
+    return 0
+  # `text` is ALREADY in the right register (the table has a yell column), so
+  # the shout rewrite must not run over it again.
+  var bnote = ""
+  result = emitBarkEx(personId, text, reaction, quiet, text, bnote)
+  if result > 0:
+    markTrigger(personId, trigger, now)
+    var jo = obj()
+    jo.put("personId", personId)
+    jo.put("trigger", trigger)
+    jo.put("bucket", bucket)
+    jo.put("mode", mode)
+    jo.put("text", text)
+    discard journal("say.proactive", personId, "player", done(jo).text)
+  note = trigger & ": " & text & " [" & bucket & "/" & mode & "] " & bnote &
+         (if onote.len > 0: " (" & onote & ")" else: "")
+
+proc tauntGapMs(personId: string): int64 =
+  ## 8-15 s, fixed per person. A single constant would have every fighter in a
+  ## group taunt on the same beat, which reads as one voice with an echo.
+  result = 8000'i64 + int64(fnv1a64("taunt\x1f" & personId) mod 7000'u64)
+
+proc bystanderReactions*(addresseeId, utterance: string;
+                         note: var string): int =
+  ## ONLY THE ADDRESSEE ANSWERS. This is the other half of that rule.
+  ##
+  ## The user, 2026-09-07: *"everyone in the vicinity replies even if I can't
+  ## hear their reply -- that's not good"*. The full reply belongs to the person
+  ## the player was talking to, full stop. Everyone else who was close enough to
+  ## OVERHEAR it (within `hearSpeakM` -- a conversation does not carry as far as
+  ## a shout) may throw in at most a short table bark, marked `reaction:true` on
+  ## the wire so a client, a log or a check can tell the two apart. It is never
+  ## an LLM call: a reaction that cost a model turn would be a reply wearing a
+  ## different hat.
+  result = 0
+  note = ""
+  var spoke = 0
+  var considered = 0
+  var i = 0
+  while i < gEncPerson.len:
+    let who = gEncPerson[i]
+    if who != addresseeId and gEncState[i] != "dead":
+      let d = distanceOf(who)
+      if d >= 0.0 and d <= hearSpeakM():
+        considered = considered + 1
+        # A hash, not a die: the same person overhearing the same sentence
+        # behaves the same way twice, so this is reproducible in a check.
+        let roll = float(fnv1a64("react\x1f" & who & "\x1f" &
+                                 normalizeText(utterance)) mod 1000'u64) / 1000.0
+        if roll < bystanderReactChance():
+          var tn = ""
+          let n = emitTrigger(who, "bystander", bystanderCooldownMs(),
+                              true, true, true, tn)
+          if n > 0:
+            spoke = spoke + 1
+            result = result + n
+    i = i + 1
+  note = $considered & " bystander(s) within " & $int(hearSpeakM()) &
+         " m could hear it; " & $spoke & " reacted with a table bark " &
+         "(chance " & $int(bystanderReactChance() * 100.0) & "%). Only " &
+         addresseeId & " gets a reply."
 
 # ---------------------------------------------------------------------------
 # Captivity
@@ -587,7 +738,7 @@ proc situationFor*(personId: string): Situation =
                      playerAiming: gPlayerAiming == 1,
                      distanceM: 0.0, playerHp: playerHp(), npcHp: 1.0,
                      groupSize: 1, timeOfDay: timeOfDayText(),
-                     recentEvents: recentEventsText())
+                     recentEvents: recentEventsText(), yell: false)
   let i = findPerson(personId)
   if i < 0: return
   result.npcHp = personHp(i)
@@ -604,6 +755,12 @@ proc situationFor*(personId: string): Situation =
     result.distanceM = dist3(px, py, pz, x, y, z)
   else:
     result.distanceM = 9999.0
+  # A reported distance OVERRIDES the sim's, and it is the only one that can
+  # make the model shout: `Yell: true` in the volatile suffix.
+  let reported = distanceOf(personId)
+  if reported >= 0.0:
+    result.distanceM = reported
+    result.yell = reported > hearSpeakM() and reported <= hearYellM()
   let grp = personGroup(i)
   if grp.len > 0:
     var n = 0
@@ -1523,13 +1680,55 @@ proc observe*(kind, actorId, targetId, dataJson: string; note: var string): int 
     if pi < 0:
       note = "player_seen names no person we know ('" & who & "')"
       return 0
-    var d = dataFloat(dataJson, "distanceM", -1.0)
+    # The CLIENT's metres, kept apart from the sim's: only a reported distance
+    # feeds `bm/hearing` (see the header of that file for why).
+    let reported = dataFloat(dataJson, "distanceM", -1.0)
+    var d = reported
     if d < 0.0: d = situationFor(who).distanceM
     setPersonLastSeenMs(pi, worldClockMs())
+    let nowW = wallMs()
+    var prevMs = 0'i64
+    var prevD = -1.0
+    if reported >= 0.0:
+      prevD = distanceOf(who)
+      prevMs = distanceAtMs(who)
+      noteDistance(who, reported, nowW)
     if d <= gNoticeM and gEncState[ei] == "none":
       setState(ei, "noticed", "saw the player at " & $int(d) & " m")
       result = result + emitStance(who, stanceWord(pi))
     notes.add "distance " & $int(d) & " m, state " & gEncState[ei]
+
+    # --- proactive speech (DESIGN.md 6; the triggers are in data) -----------
+    var tn = ""
+    if triggerLastMs(who, "first_sight") < 0:
+      # ONCE PER RAID, and `hearingReset` is what makes "per raid" true.
+      result = result + emitTrigger(who, "first_sight", 0, false, false,
+                                    false, tn)
+      if tn.len > 0: notes.add tn
+    elif reported >= 0.0 and prevD >= 0.0 and prevMs > 0:
+      let dt = nowW - prevMs
+      let closed = prevD - reported
+      # A PUSH is an approach fast enough to be a sprint: more than 5 m/s of
+      # closing. Nothing else the client reports distinguishes the two, and
+      # inventing a `sprinting` flag we cannot measure would be worse.
+      # dt >= 0, not dt > 0. MEASURED 2026-09-07: two samples landing in the
+      # SAME wall millisecond -- which is what the offline check produces, and
+      # what a fast client tick can produce too -- gave dt == 0 and were
+      # rejected as "not within 3 s". Selfcheck 23 failed on exactly that leg.
+      if dt >= 0 and dt <= 3000 and closed >= 15.0 and reported <= hearYellM():
+        result = result + emitTrigger(who, "push", 20000, false, false,
+                                      true, tn)
+        if tn.len > 0: notes.add tn
+      elif dt >= 0 and dt <= 3000 and closed >= 10.0:
+        result = result + emitTrigger(who, "approach", 20000, false, false,
+                                      true, tn)
+        if tn.len > 0: notes.add tn
+    # LINGER is a clock, started here and read on `tick`.
+    if reported >= 0.0:
+      if reported <= 8.0:
+        if nearSince(who) < 0: setNearSince(who, nowW)
+      else:
+        setNearSince(who, -1)
 
   of "player_aimed_at":
     if pi < 0:
@@ -1537,6 +1736,8 @@ proc observe*(kind, actorId, targetId, dataJson: string; note: var string): int 
       return 0
     gPlayerAiming = 1
     gPlayerArmed = 1
+    let aimD = dataFloat(dataJson, "distanceM", -1.0)
+    if aimD >= 0.0: noteDistance(who, aimD, wallMs())
     # WALL milliseconds, and -1 for "never barked". The world clock starts at
     # 0 and advances in sim steps, so `worldClockMs()` made a fresh row's last
     # bark indistinguishable from a bark that happened this instant -- measured
@@ -1557,7 +1758,10 @@ proc observe*(kind, actorId, targetId, dataJson: string; note: var string): int 
       bump(pi, -15)
       setState(ei, "threatened", "the player aimed a weapon")
       result = result + emitStanceOnce(ei, who, "hostile")
-      result = result + emitBark(who, threatLineFor(who))
+      var bnote = ""
+      result = result + emitBarkEx(who, threatLineFor(who), false, false,
+                                   "", bnote)
+      if bnote.len > 0: notes.add bnote
       remember(pi, "The player pointed a gun at me.")
       var jo = obj()
       jo.put("by", "player")
@@ -1645,6 +1849,9 @@ proc observe*(kind, actorId, targetId, dataJson: string; note: var string): int 
     if pi >= 0:
       setState(ei, "fighting", "hit the player")
       result = result + emitStance(who, "hostile")
+      var tn = ""
+      result = result + emitTrigger(who, "hurt", 6000, false, false, true, tn)
+      if tn.len > 0: notes.add tn
     notes.add "player hp " & $int(hp * 100.0) & "%"
 
   of "npc_died":
@@ -1660,6 +1867,30 @@ proc observe*(kind, actorId, targetId, dataJson: string; note: var string): int 
       var n = ""
       result = result + endCaptivity(ei, "escaped", "the captor is dead", n)
       notes.add n
+    # Anyone standing within 30 m of the body shouts about it. The distance is
+    # between two PEOPLE, so it is measured in the sim's own frame (both
+    # coordinates come from the same place, and `npc_moved` overwrites them
+    # with live ones when the client reports them).
+    var dx = 0.0
+    var dy = 0.0
+    var dz = 0.0
+    personPos(pi, dx, dy, dz)
+    var k = 0
+    while k < gEncPerson.len:
+      let other = gEncPerson[k]
+      if other != who and gEncState[k] != "dead":
+        let oi = findPerson(other)
+        if oi >= 0 and personAlive(oi):
+          var ox = 0.0
+          var oy = 0.0
+          var oz = 0.0
+          personPos(oi, ox, oy, oz)
+          if dist3(dx, dy, dz, ox, oy, oz) <= 30.0:
+            var tn = ""
+            result = result + emitTrigger(other, "saw_death", 15000, false,
+                                          false, true, tn)
+            if tn.len > 0: notes.add tn
+      k = k + 1
     # Their faction remembers it.
     let fi = findFaction(personFaction(pi))
     if fi >= 0 and dataText(dataJson, "by", "") == "player":
@@ -1739,6 +1970,58 @@ proc observe*(kind, actorId, targetId, dataJson: string; note: var string): int 
     result = result + maybeAmbush(map, x, y, z, n2)
     if n2.len > 0: notes.add n2
 
+  of "npc_moved":
+    # Where the BOUND bots are, batched: the client posts one of these every
+    # 2 s carrying every person it has bound to a live bot, because forty
+    # separate POSTs a scan is a different kind of bug. A single-person body
+    # (`personId`,`x`,`y`,`z`) is accepted too, for a hand-written probe.
+    var pmap = ""
+    var px = 0.0
+    var py = 0.0
+    var pz = 0.0
+    playerPos(pmap, px, py, pz)
+    let mapName = dataText(dataJson, "map", pmap)
+    var moved = 0
+    var unknown = 0
+    let people = jr.each(jr.field(dataJson, "people"))
+    var rows: seq[string] = @[]
+    for e in people:
+      let id = jr.asText(jr.child(e, "personId"), "")
+      if id.len == 0: continue
+      let mi = findPerson(id)
+      if mi < 0:
+        unknown = unknown + 1
+        continue
+      let mx = jr.asFloat(jr.child(e, "x"), 0.0)
+      let my = jr.asFloat(jr.child(e, "y"), 0.0)
+      let mz = jr.asFloat(jr.child(e, "z"), 0.0)
+      setPersonPos(mi, mapName, personPlace(mi), mx, my, mz)
+      noteDistance(id, dist3(px, py, pz, mx, my, mz), wallMs())
+      # A row, so this person can OVERHEAR. Being close enough to hear
+      # something does not require having been seen: `player_seen` needs the
+      # view cone, and the whole point of the bystander rule is the people
+      # standing behind you.
+      discard ensureEnc(id)
+      moved = moved + 1
+      rows.add id
+    if people.len == 0 and pi >= 0:
+      let mx = dataFloat(dataJson, "x", 0.0)
+      let my = dataFloat(dataJson, "y", 0.0)
+      let mz = dataFloat(dataJson, "z", 0.0)
+      setPersonPos(pi, mapName, personPlace(pi), mx, my, mz)
+      noteDistance(who, dist3(px, py, pz, mx, my, mz), wallMs())
+      moved = 1
+      rows.add who
+    if moved == 0:
+      notes.add "npc_moved carried no person this world knows (" &
+                $unknown & " unknown id(s), " & $people.len &
+                " row(s)); no distance was updated, so nothing will be " &
+                "hearing-gated on it"
+    else:
+      notes.add $moved & " person position(s) updated on " & mapName &
+                (if unknown > 0: ", " & $unknown & " unknown id(s) ignored"
+                 else: "")
+
   of "loot.taken":
     let cid = dataText(dataJson, "cacheId", "")
     let iid = dataText(dataJson, "itemId", "")
@@ -1797,6 +2080,7 @@ proc observe*(kind, actorId, targetId, dataJson: string; note: var string): int 
     # The words themselves go through /say -> brain; this only records that a
     # conversation is happening, so `situationFor` is honest about the state.
     if pi >= 0:
+      notePlayerSpokeTo(who, wallMs())
       if gEncState[ei] == "none" or gEncState[ei] == "noticed":
         setState(ei, "hailed", "the player spoke")
       elif gEncState[ei] == "hailed":
@@ -1819,6 +2103,7 @@ proc observe*(kind, actorId, targetId, dataJson: string; note: var string): int 
       notes.add "player_spoke with nobody named"
 
   of "player_extracted", "raid_ended":
+    hearingReset()
     var i = 0
     while i < gEncPerson.len:
       if gEncState[i] != "dead" and gEncState[i] != "captive" and
@@ -1829,6 +2114,7 @@ proc observe*(kind, actorId, targetId, dataJson: string; note: var string): int 
     notes.add "encounters reset; captivity (if any) survives the raid"
 
   of "raid_started":
+    hearingReset()
     let map = dataText(dataJson, "map", "")
     setPlayerPos(map, dataFloat(dataJson, "x", 0.0),
                  dataFloat(dataJson, "y", 0.0), dataFloat(dataJson, "z", 0.0))
@@ -1841,6 +2127,27 @@ proc observe*(kind, actorId, targetId, dataJson: string; note: var string): int 
     var n = ""
     result = result + escortStep(n)
     if n.len > 0: notes.add n
+    # The two triggers that are about ELAPSED TIME rather than about a fact:
+    # standing near someone saying nothing, and a firefight that has gone
+    # quiet for a few seconds.
+    let nowW = wallMs()
+    var ti = 0
+    while ti < gEncPerson.len:
+      let who2 = gEncPerson[ti]
+      var tn = ""
+      if gEncState[ti] == "fighting":
+        result = result + emitTrigger(who2, "combat_taunt", tauntGapMs(who2),
+                                      false, false, true, tn)
+        if tn.len > 0 and find(tn, "refused") < 0: notes.add tn
+      elif gEncState[ti] != "dead":
+        let ns = nearSince(who2)
+        if ns >= 0 and nowW - ns >= 10000 and
+           nowW - playerSpokeToMs(who2) >= 10000:
+          result = result + emitTrigger(who2, "linger", 30000, false, false,
+                                        true, tn)
+          if tn.len > 0 and find(tn, "refused") < 0: notes.add tn
+          setNearSince(who2, nowW)
+      ti = ti + 1
 
   else:
     note = "unknown fact kind '" & kind & "'; nothing was applied. Known " &
@@ -1848,6 +2155,7 @@ proc observe*(kind, actorId, targetId, dataJson: string; note: var string): int 
            "player_lowered_weapon player_spoke player_hit npc_died " &
            "player_died player_moved player_gave player_took " &
            "player_extracted raid_started raid_ended tick loot.taken " &
+           "npc_moved " &
            "scene.built"
     return 0
 
@@ -1875,5 +2183,13 @@ proc encounterJson*(): JsonArray =
     o.put("escapeAttempts", gEncEscapes[i])
     o.put("sinceMs", int(gEncSinceMs[i]))
     o.put("distanceM", situationFor(gEncPerson[i]).distanceM)
+    o.put("reportedDistanceM", distanceOf(gEncPerson[i]))
+    var hm = "speak"
+    var ha = true
+    var hw = ""
+    discard hearingDecide(gEncPerson[i], false, hm, ha, hw)
+    o.put("hearingMode", hm)
+    o.put("audible", ha)
+    o.put("hearingNote", hw)
     result.add o
     i = i + 1
