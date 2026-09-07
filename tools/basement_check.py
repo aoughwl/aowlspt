@@ -130,12 +130,20 @@ def enabled_config(overrides=None):
     leaves the repo in a state where the mod is silently live.
     """
     path = os.path.join(MOD, "config.json")
-    original = open(path, "r", encoding="utf-8").read()
-    doc = json.loads(original)
+    # BYTES in, BYTES back out. MEASURED 2026-09-07 (agent R): a UTF-8 BOM on
+    # config.json made a plain json.load fail and every one of 48 checks report
+    # "aowl.basement is disabled" -- 20 minutes lost to 3 bytes. And restoring
+    # via json.dumps re-indented and re-ordered the tracked file under
+    # concurrent agents. So: decode with utf-8-sig, and hand the caller the
+    # exact original bytes to put back.
+    with open(path, "rb") as fh:
+        original = fh.read()
+    doc = json.loads(original.decode("utf-8-sig"))
     doc["enabled"] = True
     for k, v in (overrides or {}).items():
         doc[k] = v
-    open(path, "w", encoding="utf-8").write(json.dumps(doc, indent=2))
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(json.dumps(doc, indent=2))
     return path, original
 
 
@@ -1780,7 +1788,8 @@ def main():
         check_groq(rep, store)
     finally:
         if cfg_path and original is not None:
-            open(cfg_path, "w", encoding="utf-8").write(original)
+            with open(cfg_path, "wb") as fh:   # the exact original bytes, BOM and line endings included
+                fh.write(original)
         if not a.keep and not a.store:
             shutil.rmtree(store, ignore_errors=True)
 
