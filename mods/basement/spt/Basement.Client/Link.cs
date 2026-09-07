@@ -176,7 +176,10 @@ namespace Basement.Client
             // all, so every directive was silently "passive" here and dropped after
             // ttl on the other side. Until the backend writes it, a directive kind
             // (anything not in the passive set below) wants an ack.
-            bool? ackField = data.Value<bool?>("ack");
+            // The flag is a SIBLING of `data` at the event level (backend commit
+            // a00de63 writes {seq, atMs, kind, ack, ttlMs, data}); the data-level
+            // read is kept for any older backend.
+            bool? ackField = e.Value<bool?>("ack") ?? data.Value<bool?>("ack");
             bool wantsAck = ackField ?? !(kind == "say" || kind.StartsWith("heard.") || kind == "hud.note" ||
                                           kind == "world.saved" || kind.StartsWith("directive.") || kind.StartsWith("quest."));
             if (wantsAck) Directives++;
