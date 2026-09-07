@@ -49,8 +49,8 @@
   "cacheDir": "",
   "cacheMaxEntries": 512,
 
-  "_ontologyMinConfidence": "How sure the intent classifier has to be before its template answer is used instead of falling through to the LLM. Every ontology reply is marked tier:'ontology' so nobody mistakes it for a model.",
-  "ontologyMinConfidence": 0.6,
+  "_ontologyMinConfidence": "How sure the intent classifier has to be before its template answer is used instead of falling through to the LLM. 0 means AUTOMATIC and depends on the engine: 0.6 with llmEngine=builtin|none (the table is the only responder there is), 0.9 otherwise, where the table answers only dead-certain greet/insult repeats and everything else goes to the model. Any non-zero value here is taken as deliberate and used as-is. Every ontology reply is marked tier:'ontology' so nobody mistakes it for a model.",
+  "ontologyMinConfidence": 0,
 
   "_pushToTalk": "POST /aowlspt/basement/speech/ptt {session,state:down|up} moves speech CAPTURE to the backend, because on aowlspt the client cannot capture at all -- EFT holds the microphone exclusively, which is why EscapeFromMyBasement ships a standalone winmm recorder.exe (aowl.voice reuses it for the same reason). recorderExe: empty = <toolsDir>/recorder/recorder.exe. pttMaxSeconds: the recorder is spawned with this bound and CANNOT be interrupted from here -- its stop protocol is a line on stdin and a detached spawn has no stdin, and the alternative (an inherited pipe) is a hang aowl.voice measured twice -- so key-up finalises over whatever is on disk at that moment and says so in its reply. While it records, the tick feeds the GROWING file (taking the data chunk's OFFSET, never its size field: the recorder writes the RIFF sizes only when it exits) so heard.partial events appear progressively.",
   "recorderExe": "",
@@ -63,6 +63,9 @@
   "leashM": 25.0,
   "noticeM": 60.0,
   "threatM": 18.0,
+
+  "_barkCooldownMs": "How long a person stays barked-out after a threat line. MEASURED 2026-09-07: the client reports player_aimed_at every tick the crosshair rests on someone, so without this window every tick re-fired the threat transition -- one sentence repeated forever and ~40 un-acked npc.attack directives in two minutes. Inside the window the ticks are COUNTED (the journal row carries suppressedAimTicks) and nothing is emitted.",
+  "barkCooldownMs": 20000,
 
   "_stream": "streamMax: the size of the in-memory directive ring. directiveTtlSeconds: how long a directive that needs an ack waits before it is journaled as directive.dropped -- that is the failure path announcing itself, not a retry. maxWaitMs: the cap on GET /events?wait=. HONESTY: that wait is a BOUNDED POLL on the request thread, not a parked socket, because the mod SDK exposes no sleep or condition variable; every /events reply says which mechanism it used and how long it actually waited.",
   "streamMax": 2048,

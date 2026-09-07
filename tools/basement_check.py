@@ -40,6 +40,7 @@ this file exists to catch, and `ok` is therefore never the assertion.
 import argparse
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -515,6 +516,153 @@ def check_grounding(rep, store):
             "note=%r" % (status, rumour, outcome, took[:170]))
 
 # ---------------------------------------------------------------------------
+# 3b. the dialogue defects measured in the first SPT 4.1.5 raid
+# ---------------------------------------------------------------------------
+#
+# Two of them, both reported by the player and both visible on the wire:
+#   (a) every person aimed at barked the same one sentence, over and over,
+#       because `player_aimed_at` arrives EVERY CLIENT TICK and re-fired the
+#       whole threat transition each time (~40 un-acked npc.attack in two
+#       minutes, and 14 TTS cache hits on two sentences);
+#   (b) talking to a threatened person answered from the threat row, so the
+#       conversation could not move.
+#
+# Both are asserted THROUGH THE ROUTES, on the served stream and the served
+# reply -- not on a return value -- and both carry a negative control that can
+# actually fail.
+
+
+def _says(events_doc, source=None):
+    out = []
+    for e in (events_doc or {}).get("events", []):
+        if not isinstance(e, dict) or e.get("kind") != "say":
+            continue
+        d = e.get("data") or {}
+        if source and d.get("source") != source:
+            continue
+        out.append(d.get("text", ""))
+    return out
+
+
+def check_dialogue(rep, store):
+    docs, raw, err = run_sim(store, [
+        (BASE + "/world/new", '{"preset":"warlords","seed":7}'),
+        (BASE + "/world/people", ""),
+    ])
+    if err:
+        rep.add(INCONCLUSIVE, "dialogue: world/new", err)
+        return
+    people = [p for p in (docs[1] or {}).get("people", []) if p.get("alive", True)]
+    if len(people) < 2:
+        rep.add(INCONCLUSIVE, "dialogue: two people to talk to",
+                "the generated world has %d living person(s)" % len(people))
+        return
+    a, b = people[0]["id"], people[1]["id"]
+
+    aim = lambda pid: (BASE + "/observe",
+                       json.dumps({"kind": "player_aimed_at", "personId": pid}))
+    # A NONCE in the utterance, because the brain's line cache is PERSISTED in
+    # mods/basement/data/cache/brain.json and outlives the run: without it the
+    # second run of this script answers every greeting from the cache, the
+    # reply stops saying which row produced it, and the bucket assertion below
+    # can only ever report INCONCLUSIVE.
+    nonce = "%08x" % random.getrandbits(32)
+    line = "hey there, how are you doing " + nonce
+    greet = lambda pid: (BASE + "/say",
+                         json.dumps({"person": pid, "text": line}))
+    routes = [
+        (BASE + "/world/new", '{"preset":"warlords","seed":7}'),
+        aim(a), aim(a), aim(a), aim(a), aim(a),          # 1..5, within ~2 s
+        (BASE + "/events?since=0&wait=0", ""),           # 6
+        greet(a),                                        # 7
+        greet(b),                                        # 8  (b is not aimed at)
+        greet(a),                                        # 9  negative control
+        aim(b),                                          # 10
+        greet(b),                                        # 11 threatened + greet
+    ]
+    docs, raw, err = run_sim(store, routes)
+    if err:
+        rep.add(INCONCLUSIVE, "dialogue: the run", err)
+        return
+
+    ev = docs[6]
+    kinds = kinds_on_stream(ev)
+    barks = _says(ev, "encounter")
+    n_attack = kinds.count("npc.attack")
+    n_stance = kinds.count("npc.stance")
+    ok = len(barks) == 1 and n_attack <= 1 and n_stance == 1
+    rep.add(PASS if ok else FAIL,
+            "dialogue: 5 x player_aimed_at within 2 s is ONE bark and at most "
+            "one npc.attack",
+            "served %d encounter say(s) %r, %d npc.attack, %d npc.stance"
+            % (len(barks), barks[:2], n_attack, n_stance))
+
+    g_a, g_b, g_a2 = docs[7], docs[8], docs[9]
+    for name, d in (("first greet", g_a), ("second person", g_b)):
+        if not isinstance(d, dict) or "__unparsed__" in d:
+            rep.add(FAIL, "dialogue: %s answered" % name,
+                    "route answered %s" % json.dumps(d)[:300])
+            return
+    t_a = g_a.get("text", "")
+    t_b = g_b.get("text", "")
+    t_a2 = g_a2.get("text", "") if isinstance(g_a2, dict) else ""
+    bark = barks[0] if barks else ""
+    tags = [str(t) for t in (g_a.get("tags") or [])]
+    attacked = any(t.upper().startswith("ATTACK") for t in tags)
+    ok = (g_a.get("tier") in ("ontology", "cache") and t_a and t_a != bark
+          and not attacked)
+    rep.add(PASS if ok else FAIL,
+            "dialogue: a greeting to a THREATENED person is answered from the "
+            "table, not with the bark",
+            "tier=%s text=%r ; the bark was %r ; tags=%s"
+            % (g_a.get("tier"), t_a[:90], bark[:60], tags))
+
+    rep.add(PASS if (t_a and t_b and t_a != t_b) else FAIL,
+            "dialogue: two different people greeted give two different lines",
+            "%r vs %r" % (t_a[:70], t_b[:70]))
+    rep.add(PASS if (t_a2 == t_a and t_a) else FAIL,
+            "dialogue: NEGATIVE CONTROL -- the same person greeted twice gives "
+            "the IDENTICAL line (a cache hit, not a dice roll)",
+            "first=%r again=%r tier=%s"
+            % (t_a[:70], t_a2[:70],
+               g_a2.get("tier") if isinstance(g_a2, dict) else None))
+
+    # Which ROW answered, from the reply's own account of itself. The text
+    # alone cannot settle this: a person whose attitude is already wary answers
+    # a greeting from the wary row whether or not a rifle is on them, and
+    # comparing texts would call that a regression.
+    def _bucket(d):
+        for n in (d or {}).get("notes", []) or []:
+            m = re.search(r"ontology row \S+ x (\w+)", str(n))
+            if m:
+                return m.group(1)
+        return None
+
+    g_b2 = docs[11]
+    aim_b = docs[10]
+    st = ""
+    for row in (aim_b or {}).get("encounters", []):
+        if row.get("personId") == b:
+            st = row.get("state", "")
+    calm_bucket = _bucket(g_b)
+    threat_bucket = _bucket(g_b2)
+    if threat_bucket is None:
+        rep.add(INCONCLUSIVE,
+                "dialogue: a greeting while threatened is served from the "
+                "wary/hostile bucket",
+                "the reply did not say which row answered (tier=%s notes=%s)"
+                % ((g_b2 or {}).get("tier"), (g_b2 or {}).get("notes")))
+    else:
+        rep.add(PASS if (st == "threatened" and
+                         threat_bucket in ("wary", "hostile")) else FAIL,
+                "dialogue: a greeting while threatened is served from the "
+                "wary/hostile bucket, not the calm one",
+                "state=%r ; calm bucket=%r %r ; threatened bucket=%r %r"
+                % (st, calm_bucket, t_b[:50], threat_bucket,
+                   (g_b2 or {}).get("text", "")[:50]))
+
+
+# ---------------------------------------------------------------------------
 # 4. push to talk -- the backend holds the microphone
 # ---------------------------------------------------------------------------
 
@@ -763,6 +911,8 @@ def main():
         check_story(rep, store)
         print("")
         check_grounding(rep, store)
+        print("")
+        check_dialogue(rep, store)
         print("")
         check_ptt(rep, store)
         print("")

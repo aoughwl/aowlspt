@@ -309,12 +309,29 @@ proc decide*(worldPrompt, rules: string; c: PersonCard; s: Situation;
   let intent = classifyIntent(utterance, conf)
   notes.add "intent=" & intent & " confidence=" & $conf &
             " (threshold " & $cMinConfidence & ")"
+  let templatesOnly = engine == "builtin" or engine == "none"
+  var tableIntent = ""
   if intent != "unknown" and conf >= cMinConfidence:
+    # With a real model configured the table answers only the trivial repeats.
+    # Everything else is exactly the material a model is for, and a table that
+    # intercepts it makes the model look broken rather than absent.
+    if templatesOnly or intent == "greet" or intent == "insult":
+      tableIntent = intent
+    else:
+      notes.add "intent=" & intent & " passes to the " & engine &
+                " tier: with a model configured the table answers only " &
+                "greet/insult, and only at confidence >= " & $cMinConfidence
+  elif templatesOnly:
+    # No model is going to answer this one, so the honest in-character move is
+    # to ask them to say it again -- from the SAME table, in this person's
+    # stance bucket -- rather than serve the generic fallback row. With a real
+    # engine configured the LLM tier below gets the turn instead.
+    tableIntent = "unknown"
+  if tableIntent.len > 0:
     var reply = ""
     var rowTags: seq[string] = @[]
-    if ontologyReply(intent, c, s, reply, rowTags):
-      notes.add "ontology row " & intent & " x " &
-                stanceBucket(c.attitude, c.factionRep) &
+    if ontologyReply(tableIntent, c, s, utterance, reply, rowTags):
+      notes.add "ontology row " & tableIntent & " x " & bucketFor(c, s) &
                 " -- a table lookup in data/ontology.json, not a model"
       var d = decideFromRaw(reply, "ontology", engine, rowTags, sink, notes)
       gNOntology = gNOntology + 1
@@ -325,8 +342,8 @@ proc decide*(worldPrompt, rules: string; c: PersonCard; s: Situation;
       d.ms = wallMs() - t0
       result = d
       return
-    notes.add "no ontology row for " & intent & " x " &
-              stanceBucket(c.attitude, c.factionRep) & "; falling through"
+    notes.add "no ontology row for " & tableIntent & " x " & bucketFor(c, s) &
+              "; falling through"
 
   # ---- tier 2: the LLM
   if engine != "builtin" and engine != "none":
@@ -378,7 +395,7 @@ proc decide*(worldPrompt, rules: string; c: PersonCard; s: Situation;
   # ---- tier 3: builtin (the ontology's fallback row)
   var reply = ""
   var fbTags: seq[string] = @[]
-  if not ontologyFallback(c, reply, fbTags):
+  if not ontologyFallback(c, s, utterance, reply, fbTags):
     reply = "..."
     notes.add "no fallback row loaded (" & ontologyNote() &
               ") -- serving an ellipsis rather than silence"

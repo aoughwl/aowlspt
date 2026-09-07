@@ -107,6 +107,8 @@ var gLootComposeN: int = 0
 var gBotsComposeN: int = 0
 
 proc presetDir(): string = joinPath(dataDir(), "presets")
+proc defaultedPath(v, fallback: string): string =
+  if v.len > 0: v else: fallback
 
 proc joinWith(items: seq[string]; sep: string): string =
   ## nimony's strutils has no `join`.
@@ -116,6 +118,16 @@ proc joinWith(items: seq[string]; sep: string): string =
     if result.len > 0: result.add sep
     result.add items[i]
     i = i + 1
+
+proc minConfidenceFor(engine: string; configured: float): float =
+  ## 0 in the config means AUTOMATIC, and automatic depends on the engine: the
+  ## table is the only responder there is on `builtin`, so it must answer
+  ## readily (0.6); with a real model behind it the table should only catch a
+  ## dead-certain greeting (0.9) and hand everything else over. A value the
+  ## player actually set is never overridden.
+  if configured > 0.0: return configured
+  if engine == "builtin" or engine == "none": return 0.6
+  result = 0.9
 
 proc loadConfig() =
   gEnabled = setting("enabled").asBool(false)
@@ -131,6 +143,7 @@ proc loadConfig() =
   encounterConfigure(leashM = setting("leashM").asFloat(25.0),
                      noticeM = setting("noticeM").asFloat(60.0),
                      threatM = setting("threatM").asFloat(18.0))
+  encounterConfigureBarks(setting("barkCooldownMs").asInt(20000))
   streamConfigure(maxEvents = setting("streamMax").asInt(2048),
                   defaultTtlMs = int64(setting("directiveTtlSeconds").asInt(30)) * 1000)
   setSimConfig(maxCatchUpMs = int64(setting("simMaxCatchUpHours").asInt(24)) * 3600000,
@@ -166,13 +179,24 @@ proc loadConfig() =
                   workDir = work,
                   cacheDir = cache,
                   whisperPort = setting("whisperPort").asInt(9000),
-                  sttPartialMs = setting("sttPartialMs").asInt(1200))
+                  sttPartialMs = setting("sttPartialMs").asInt(1200),
+                  kokoroUrl = setting("kokoroUrl").asText(""),
+                  kokoroRoot = setting("kokoroRoot").asText(""),
+                  kokoroExe = setting("kokoroExe").asText(""),
+                  chatterboxUrl = setting("chatterboxUrl").asText(""),
+                  chatterboxRoot = setting("chatterboxRoot").asText(""),
+                  chatterboxExe = setting("chatterboxExe").asText(""),
+                  voicesDir = defaultedPath(setting("voicesDir").asText(""),
+                                            joinPath(dataDir(), "voices")),
+                  localAppData = getEnv("LOCALAPPDATA", ""))
   pttConfigure(recorderExe = setting("recorderExe").asText(""),
                maxSeconds = setting("pttMaxSeconds").asInt(20))
   brainConfigure(cacheDir = cache,
                  cacheMax = setting("cacheMaxEntries").asInt(512),
                  memoryTurns = setting("maxTurns").asInt(8),
-                 ontologyMinConfidence = setting("ontologyMinConfidence").asFloat(0.6))
+                 ontologyMinConfidence = minConfidenceFor(
+                   setting("llmEngine").asText("builtin"),
+                   setting("ontologyMinConfidence").asFloat(0.0)))
 
 proc disabledJson(): string =
   var o = obj()
@@ -1850,6 +1874,186 @@ proc chk16BarkCarriesWav() =
         verdictOf(sayText.len > 0 and sayWav.len > 0 and exists(sayWav)),
         evidence)
 
+proc countKind(fromSeq: int; kind: string; sayText: var string): int =
+  ## How many directives of `kind` reached the stream since `fromSeq`, and the
+  ## text of the last encounter-sourced `say` among them. Reading the SERVED
+  ## events, not a return value: what the client got is the only fact here.
+  result = 0
+  let served = done(objOf("events", eventsSince(fromSeq, 200))).text
+  for e in jr.each(jr.field(served, "events")):
+    if jr.asText(jr.child(e, "kind"), "") == kind:
+      result = result + 1
+      if kind == "say":
+        let d = jr.child(e, "data")
+        if jr.asText(jr.child(d, "source"), "") == "encounter":
+          sayText = jr.asText(jr.child(d, "text"), "")
+
+proc chk17AimHysteresis() =
+  ## FIVE aim reports on one person inside two seconds are ONE threat.
+  ##
+  ## MEASURED 2026-09-07 in the first SPT 4.1.5 raid: the client reports
+  ## `player_aimed_at` every tick the crosshair rests on someone, so the threat
+  ## transition re-fired dozens of times -- every person barked the same
+  ## sentence over and over and the backend logged ~40 "directive N
+  ## (npc.attack) was never acked".
+  ##
+  ## The assertion is on the SERVED stream, and it has a NEGATIVE CONTROL that
+  ## can fail: with the cooldown set to zero a sixth aim MUST bark again. A
+  ## check that only asserted "1 say" would also pass if barking were broken
+  ## entirely.
+  if personCount() == 0:
+    check(17, "aim hysteresis", "INCONCLUSIVE", "no people in the world to aim at")
+    return
+  let pid = personId(0)
+  resetEncounters()
+  let base = latestSeq()
+  var note = ""
+  var i = 0
+  while i < 5:
+    discard observe("player_aimed_at", pid, "", "{}", note)
+    i = i + 1
+  var barkText = ""
+  let says = countKind(base, "say", barkText)
+  var ignore = ""
+  let attacks = countKind(base, "npc.attack", ignore)
+  let stances = countKind(base, "npc.stance", ignore)
+
+  # negative control: no cooldown, a fresh aim must speak again.
+  let keep = barkCooldownMs()
+  encounterConfigureBarks(0)
+  let base2 = latestSeq()
+  discard observe("player_aimed_at", pid, "", "{}", note)
+  var again = ""
+  let says2 = countKind(base2, "say", again)
+  encounterConfigureBarks(int(keep))
+
+  let ok = says == 1 and attacks <= 1 and stances == 1 and says2 >= 1
+  check(17, "aim hysteresis: five aim reports are one threat", verdictOf(ok),
+        "5 x player_aimed_at at " & pid & " within the " &
+        $(keep div 1000) & " s cooldown served " & $says & " say (expected 1), " &
+        $attacks & " npc.attack (expected at most 1), " & $stances &
+        " npc.stance (expected 1); bark=" & barkText &
+        " -- NEGATIVE CONTROL with the cooldown at 0: a further aim served " &
+        $says2 & " say (expected at least 1), " & again)
+
+proc chk18TalkWhileThreatened() =
+  ## A GREETING to a person you are aiming at is a conversation, not a bark.
+  ##
+  ## MEASURED 2026-09-07: "Hey, how are you doing?" to a threatened person came
+  ## back as the threat bark, so the conversation could not move at all. The
+  ## assertions are: the greeting is answered from the TABLE (tier ontology),
+  ## its text is not the bark this same person just shouted, and it carries no
+  ## [ATTACK]. The negative control is the last clause: the same person asked
+  ## twice must give the SAME text (the line cache), so "they differ" cannot be
+  ## passing merely because something is random.
+  if personCount() < 2:
+    check(18, "talking to a threatened person", "INCONCLUSIVE",
+          "fewer than two people in the world")
+    return
+  let a = personId(0)
+  let b = personId(1)
+  resetEncounters()
+  var note = ""
+  let base = latestSeq()
+  discard observe("player_aimed_at", a, "", "{}", note)
+  discard observe("player_aimed_at", b, "", "{}", note)
+  var barkA = ""
+  discard countKind(base, "say", barkA)
+
+  var dirs = 0
+  var tagNote = ""
+  let d1 = speakTurn(a, "hey there, how are you doing", dirs, tagNote)
+  var dirs2 = 0
+  var tagNote2 = ""
+  let d2 = speakTurn(b, "hey there, how are you doing", dirs2, tagNote2)
+  var dirs3 = 0
+  var tagNote3 = ""
+  let d3 = speakTurn(a, "hey there, how are you doing", dirs3, tagNote3)
+
+  var attacked = false
+  for t in d1.tags:
+    if t == "ATTACK" or startsWith(t, "ATTACK"): attacked = true
+  let notABark = d1.text != barkA and d1.text.len > 0
+  let differ = d1.text != d2.text
+  let stable = d1.text == d3.text
+  let fromTable = d1.tier == "ontology" or d1.tier == "cache"
+  let ok = fromTable and notABark and not attacked and differ and stable and
+           encounterState(a) == "threatened"
+  check(18, "talking to a threatened person answers from the table",
+        verdictOf(ok),
+        "state=" & encounterState(a) & "; the bark was " & barkA &
+        "; the greeting came back tier=" & d1.tier & " text=" & d1.text &
+        " tags=" & $d1.tags.len & " attack=" & $attacked &
+        "; a SECOND person answered " & d2.text & " (different=" & $differ &
+        "); NEGATIVE CONTROL, the same person asked again answered " & d3.text &
+        " (identical=" & $stable & ")")
+
+proc chk19DistinctVoices() =
+  ## Two people with DIFFERENT voice tags must not sound the same: the same
+  ## sentence through two tags yields two wavs whose BYTES differ. Negative
+  ## control: the same tag twice is one cache entry, byte-identical. Every
+  ## outcome that could not look (engine missing, server absent, only one
+  ## piper model on disk) is INCONCLUSIVE with the reason.
+  let tp = ttsProbe()
+  if voiceTagCount() < 2:
+    check(19, "distinct voices", "INCONCLUSIVE",
+          "voices.json holds " & $voiceTagCount() & " tags (" & voicesNote() &
+          "), so there is no second tag to compare")
+    return
+  if tp.engine == "none" or tp.engine == "client":
+    check(19, "distinct voices", "INCONCLUSIVE",
+          "tts=" & tp.engine & " produces no wav here, so bytes cannot be compared")
+    return
+  if not tp.ok:
+    check(19, "distinct voices", "INCONCLUSIVE",
+          "tts engine " & tp.engine & " is missing (" & tp.note & ")")
+    return
+  # Two tags whose resolved model keys differ under THIS engine. With piper
+  # and a single .onnx on disk every tag resolves to the same path, and that
+  # is reported rather than passed.
+  let tagA = voiceTagAt(0)
+  var tagB = ""
+  var i = 1
+  let keyA = voiceModelKey(resolveVoice(tagA, "p-a"), tagA)
+  while i < voiceTagCount():
+    let t = voiceTagAt(i)
+    if voiceModelKey(resolveVoice(t, "p-b"), t) != keyA:
+      tagB = t
+      break
+    i = i + 1
+  if tagB.len == 0:
+    check(19, "distinct voices", "INCONCLUSIVE",
+          "every tag resolves to the same " & tp.engine & " model key '" &
+          keyA & "' (one voice on disk?), so no two tags CAN differ")
+    return
+  let line = "Nobody leaves this basement until I say so."
+  var nA = ""
+  var cA = false
+  let wA = ttsSegment(tagA, line, nA, cA, "p-a")
+  var nB = ""
+  var cB = false
+  let wB = ttsSegment(tagB, line, nB, cB, "p-b")
+  var nA2 = ""
+  var cA2 = false
+  let wA2 = ttsSegment(tagA, line, nA2, cA2, "p-a")
+  if wA.len == 0 or wB.len == 0:
+    # A server that is not up is "could not look", not a failure of the
+    # mapping; the note names the url and the setup command.
+    check(19, "distinct voices", "INCONCLUSIVE",
+          "no wav for " & (if wA.len == 0: tagA & " (" & nA & ")" else: "") &
+          (if wB.len == 0: " " & tagB & " (" & nB & ")" else: ""))
+    return
+  let bytesA = readAll(wA)
+  let bytesB = readAll(wB)
+  let bytesA2 = readAll(wA2)
+  let differ = bytesA != bytesB and bytesA.len > 44 and bytesB.len > 44
+  let same = wA2 == wA and cA2 and bytesA2 == bytesA
+  check(19, "distinct voices", verdictOf(differ and same),
+        tp.engine & ": " & tagA & " -> " & baseName(wA) & " (" & $bytesA.len &
+        " B) vs " & tagB & " -> " & baseName(wB) & " (" & $bytesB.len &
+        " B) bytes differ " & $differ & "; " & tagA & " again cache-hit " &
+        $cA2 & " identical " & $same & "; " & nA)
+
 proc onSelfcheck(url, body, session: string): string =
   gCheckLines = @[]
   gPassN = 0
@@ -1872,6 +2076,9 @@ proc onSelfcheck(url, body, session: string): string =
     chk14PushToTalk()
     chk15AckFlagAndEmptyTurn()
     chk16BarkCarriesWav()
+    chk17AimHysteresis()
+    chk18TalkWhileThreatened()
+    chk19DistinctVoices()
     # Put back whatever was on disk: the checks above generated and advanced a
     # world in memory, and leaving that in place would quietly replace the
     # player's.
@@ -1934,7 +2141,11 @@ proc basementSchema(): seq[Setting] =
     enumSetting("sttEngine", "Speech to text", "whisper-server",
                 @["whisper-server", "none"], category = "Engines"),
     enumSetting("ttsEngine", "Text to speech", "piper",
-                @["piper", "sapi", "none"], category = "Engines"),
+                @["piper", "kokoro", "chatterbox", "client", "sapi", "none"],
+                category = "Engines",
+                description = "kokoro = local CPU (onnx), chatterbox = local " &
+                  "CUDA voice cloning from data/voices/*.wav, client = the " &
+                  "game-side plugin synthesises (no wav from here)"),
     stringSetting("toolsDir", "Tools directory", "", category = "Paths",
                   description = "Holds whisper/ and piper/"),
     floatSetting("leashM", "Captivity leash (m)", 25.0, lo = 5.0, hi = 200.0,
@@ -1945,6 +2156,12 @@ proc basementSchema(): seq[Setting] =
                  category = "Encounters"),
     floatSetting("threatM", "Threat range (m)", 18.0, lo = 1.0, hi = 200.0,
                  category = "Encounters"),
+    intSetting("barkCooldownMs", "Threat bark cooldown (ms)", 20000, lo = 0,
+               hi = 600000, step = 1000, category = "Encounters",
+               description = "How long a person stays barked-out. The client " &
+                 "reports player_aimed_at every tick the crosshair rests on " &
+                 "someone; within this window that is counted, not re-barked, " &
+                 "and no second npc.attack or npc.stance is emitted"),
     intSetting("pttMaxSeconds", "Push-to-talk max (s)", 20, lo = 1, hi = 600,
                step = 1, category = "Engines",
                description = "The recorder is spawned with this bound and " &
@@ -2050,6 +2267,11 @@ proc onLoad(): Status =
   # a zero count is reported rather than left to look like an empty world.
   let namesN = loadNames(readAll(joinPath(dataDir(), "names.json")))
   let archN = loadArchetypes(readAll(joinPath(dataDir(), "archetypes.json")))
+  let voicesN = voicesLoad(readAll(joinPath(dataDir(), "voices.json")))
+  if voicesN == 0:
+    warn ModName & ": data/voices.json did not load from " & dataDir() &
+         " (" & voicesNote() & ") -- every person's voice will be a hash " &
+         "pick from an EMPTY pool, i.e. the engine default"
   parts.add $namesN & " names"
   parts.add $archN & " archetypes"
   if namesN == 0 or archN == 0:

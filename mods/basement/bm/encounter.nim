@@ -70,6 +70,28 @@ var gEncEscortTo: seq[string] = @[]    # place id the escort is walking to
 var gEncSinceMs: seq[int64] = @[]
 var gEncWhy: seq[string] = @[]
 var gEncEscapes: seq[int] = @[]        # escape attempts made against this row
+var gEncBarkMs: seq[int64] = @[]       # when this person last barked at the player
+var gEncAimTicks: seq[int] = @[]       # aim reports SUPPRESSED since that bark
+var gEncStanceSent: seq[string] = @[]  # last npc.stance word actually emitted
+var gEncAttackFor: seq[string] = @[]   # the transition an npc.attack was sent for
+
+# How long a person stays barked-out. MEASURED 2026-09-07 in the first SPT
+# 4.1.5 raid: `player_aimed_at` arrives every client tick while the crosshair
+# rests on someone, so the threat transition re-fired dozens of times -- ~40
+# `npc.attack` directives in two minutes, and every person in the world saying
+# the one sentence "Weapon down. Now." over and over. The state machine was
+# right; it simply had no hysteresis.
+var gBarkCooldownMs: int64 = 20000
+
+# The per-turn bound on what a single reply may do to a relationship. See the
+# MOOD/ATTITUDE cases in `applyTags` for the measurement that produced them.
+const MaxAttitudeStep = 15
+const MaxMoodStep = 0.4
+
+proc encounterConfigureBarks*(cooldownMs: int) =
+  if cooldownMs >= 0: gBarkCooldownMs = int64(cooldownMs)
+
+proc barkCooldownMs*(): int64 = gBarkCooldownMs
 
 # Player-side facts the client reports, remembered so `situationFor` can answer
 # without the caller having to pass them in.
@@ -158,6 +180,10 @@ proc ensureEnc(personId: string): int =
   gEncSinceMs.add worldClockMs()
   gEncWhy.add "created"
   gEncEscapes.add 0
+  gEncBarkMs.add -1
+  gEncAimTicks.add 0
+  gEncStanceSent.add ""
+  gEncAttackFor.add ""
   result = gEncPerson.len - 1
 
 proc encounterState*(personId: string): string =
@@ -191,6 +217,10 @@ proc resetEncounters*() =
   gEncSinceMs = @[]
   gEncWhy = @[]
   gEncEscapes = @[]
+  gEncBarkMs = @[]
+  gEncAimTicks = @[]
+  gEncStanceSent = @[]
+  gEncAttackFor = @[]
 
 # ---------------------------------------------------------------------------
 # Directives + journal. Both go through one place so a transition cannot emit
@@ -237,6 +267,52 @@ proc stanceWord(pi: int): string =
 proc emitStance(personId: string; word: string): int =
   result = directive("npc.stance", jsonOf2("personId", personId,
                                            "stance", word), false)
+
+proc transitionToken(i: int): string =
+  if i < 0 or i >= gEncState.len: return ""
+  result = gEncState[i] & "@" & $gEncSinceMs[i]
+
+proc emitStanceOnce(i: int; personId, word: string): int =
+  ## `npc.stance` is a LEVEL, not an edge: re-sending "hostile" every tick the
+  ## player keeps aiming tells the client nothing it does not already know, and
+  ## that is most of what filled the ring. Emitted only when the word changes.
+  if i >= 0 and i < gEncStanceSent.len:
+    if gEncStanceSent[i] == word: return 0
+    gEncStanceSent[i] = word
+  result = emitStance(personId, word)
+
+proc emitAttackOnce(i: int; personId: string): int =
+  ## One `npc.attack` per STATE TRANSITION. It needs an ack, so a repeat is not
+  ## merely noise: every un-acked copy is journaled `directive.dropped` at ttl,
+  ## which is where the "directive N (npc.attack) was never acked" flood in the
+  ## first SPT 4.1.5 raid came from.
+  let tok = transitionToken(i)
+  if i >= 0 and i < gEncAttackFor.len:
+    if gEncAttackFor[i] == tok and tok.len > 0: return 0
+    gEncAttackFor[i] = tok
+  result = directive("npc.attack",
+    jsonOf2("personId", personId, "target", "player"), true, 15000)
+
+# The bark pools. Seven threats and five stand-downs, picked by a hash of the
+# person's id, so ten people covered by one rifle do not speak in chorus. They
+# are deliberately plain and short: a bark is shouted across a yard.
+proc threatLineFor(personId: string): string =
+  let lines = ["Weapon down. Now.",
+               "Point that somewhere else. I will not ask twice.",
+               "Muzzle down, or this ends badly for one of us.",
+               "You want to do this? Because I am ready to.",
+               "Barrel down. Slow. I am watching your hands.",
+               "Hey. Off me with that thing.",
+               "Lower it. Whatever you came for, it is not worth this."]
+  result = lines[int(fnv1a64("threat\x1f" & personId) mod uint64(lines.len))]
+
+proc standDownLineFor(personId: string): string =
+  let lines = ["Better. Keep it down and we can talk.",
+               "Good. Now say what you want, and say it quick.",
+               "That is smarter than you looked. Talk.",
+               "Alright. Hands where I can see them, and speak.",
+               "Fine. You get one conversation out of me."]
+  result = lines[int(fnv1a64("standdown\x1f" & personId) mod uint64(lines.len))]
 
 proc emitBark(personId, text: string): int =
   ## A canned line from the machine itself, NOT from the brain. It is tagged
@@ -1096,12 +1172,38 @@ proc applyTags*(personId: string; tags: seq[string]; note: var string): int =
     let val = tagValue(tag)
     case name
     of "MOOD":
-      setPersonMood(pi, fclamp(parseFloatOr(val, personMood(pi)), -1.0, 1.0))
-      notes.add "mood set"
+      # ONE TURN IS NOT A LIFETIME. MEASURED 2026-09-07, first turn on the
+      # OpenAI engine: a mildly unwelcome question came back [MOOD: -1] and
+      # [ATTITUDE: -100], which floors a relationship in a single exchange and
+      # leaves nowhere for the story to go. The tag still decides the
+      # DIRECTION; the machine bounds the STEP, and says so when it bit.
+      let wantM = fclamp(parseFloatOr(val, personMood(pi)), -1.0, 1.0)
+      let haveM = personMood(pi)
+      let stepM = fclamp(wantM - haveM, -MaxMoodStep, MaxMoodStep)
+      setPersonMood(pi, fclamp(haveM + stepM, -1.0, 1.0))
+      if wantM - haveM > MaxMoodStep or haveM - wantM > MaxMoodStep:
+        notes.add "mood CLAMPED: [MOOD: " & val & "] asked for " &
+                  fmtF(wantM) & " from " & fmtF(haveM) & "; a single turn may " &
+                  "move mood by at most " & fmtF(MaxMoodStep) & ", so it is now " &
+                  fmtF(personMood(pi))
+        discard journal("tag.clamped", personId, "player",
+                        jsonOf2("tag", "MOOD", "asked", val))
+      else:
+        notes.add "mood set"
     of "ATTITUDE":
-      bump(pi, parseIntOr(val, 0))
-      result = result + emitStance(personId, stanceWord(pi))
-      notes.add "attitude " & val
+      let wantA = parseIntOr(val, 0)
+      let stepA = clampI(wantA, -MaxAttitudeStep, MaxAttitudeStep)
+      bump(pi, stepA)
+      result = result + emitStanceOnce(ei, personId, stanceWord(pi))
+      if stepA != wantA:
+        notes.add "attitude CLAMPED: [ATTITUDE: " & val & "] asked for " &
+                  $wantA & " in one turn; the bound is " & $MaxAttitudeStep &
+                  ", so " & $stepA & " was applied and attitude is now " &
+                  $personAttitude(pi)
+        discard journal("tag.clamped", personId, "player",
+                        jsonOf2("tag", "ATTITUDE", "asked", val))
+      else:
+        notes.add "attitude " & val
     of "OFFER":
       let cid = "offer." & personId & "." & $contractCount()
       discard addContract(cid, "deal", personId, "player", val, "",
@@ -1190,9 +1292,8 @@ proc applyTags*(personId: string; tags: seq[string]; note: var string): int =
     of "ATTACK":
       setState(ei, "fighting", "attack tag")
       setPersonAttitude(pi, clampAtt(personAttitude(pi) - 30))
-      result = result + emitStance(personId, "hostile")
-      result = result + directive("npc.attack",
-        jsonOf2("personId", personId, "target", "player"), true, 15000)
+      result = result + emitStanceOnce(ei, personId, "hostile")
+      result = result + emitAttackOnce(ei, personId)
       notes.add "attacks"
     of "STAND_DOWN":
       if gEncState[ei] == "fighting" or gEncState[ei] == "threatened":
@@ -1436,13 +1537,36 @@ proc observe*(kind, actorId, targetId, dataJson: string; note: var string): int 
       return 0
     gPlayerAiming = 1
     gPlayerArmed = 1
-    bump(pi, -15)
-    setState(ei, "threatened", "the player aimed a weapon")
-    result = result + emitStance(who, "hostile")
-    result = result + emitBark(who, "Weapon down. Now.")
-    remember(pi, "The player pointed a gun at me.")
-    discard journal("threatened", who, "player", jsonOf2("by", "player", "how", "aimed"))
-    notes.add personName(pi) & " is threatened and hostile"
+    # WALL milliseconds, and -1 for "never barked". The world clock starts at
+    # 0 and advances in sim steps, so `worldClockMs()` made a fresh row's last
+    # bark indistinguishable from a bark that happened this instant -- measured
+    # by tools/basement_check.py, which served five barks for five aim reports.
+    let nowMs = wallMs()
+    let barked = gEncBarkMs[ei] >= 0 and nowMs - gEncBarkMs[ei] < gBarkCooldownMs
+    if barked and gEncState[ei] == "threatened":
+      # HYSTERESIS. The crosshair resting on someone is ONE fact, not sixty:
+      # count the ticks and say so, and emit nothing at all. The count is
+      # carried into the journal at the NEXT transition, so the record is a
+      # number rather than a row per frame.
+      gEncAimTicks[ei] = gEncAimTicks[ei] + 1
+      notes.add personName(pi) & " is already threatened; this is aim report " &
+                $gEncAimTicks[ei] & " within the " & $(gBarkCooldownMs div 1000) &
+                " s bark cooldown, so no bark, no stance and no attack was " &
+                "emitted and their attitude was not dropped again"
+    else:
+      bump(pi, -15)
+      setState(ei, "threatened", "the player aimed a weapon")
+      result = result + emitStanceOnce(ei, who, "hostile")
+      result = result + emitBark(who, threatLineFor(who))
+      remember(pi, "The player pointed a gun at me.")
+      var jo = obj()
+      jo.put("by", "player")
+      jo.put("how", "aimed")
+      jo.put("suppressedAimTicks", gEncAimTicks[ei])
+      discard journal("threatened", who, "player", done(jo).text)
+      gEncBarkMs[ei] = nowMs
+      gEncAimTicks[ei] = 0
+      notes.add personName(pi) & " is threatened and hostile"
 
   of "player_lowered_weapon":
     gPlayerAiming = 0
@@ -1458,12 +1582,30 @@ proc observe*(kind, actorId, targetId, dataJson: string; note: var string): int 
         result = result + beginCaptivity(ci, captor, "surrendered to a captor", n)
         notes.add n
       else:
+        let wasThreat = gEncState[ci] == "threatened"
         setState(ci, "talking", "weapon lowered")
+        if wasThreat:
+          result = result + emitBark(personId(captor),
+                                     standDownLineFor(personId(captor)))
         notes.add personName(captor) & " lets it go for now"
     elif pi >= 0:
+      let wasThreat = gEncState[ei] == "threatened"
+      # De-escalate to TALKING, never to `none`: a person who just had a rifle
+      # in their face remembers it, and dropping them back to `none` would let
+      # the whole threat cycle start over from scratch.
       setState(ei, "talking", "weapon lowered")
-      result = result + emitStance(who, stanceWord(pi))
-      notes.add "weapon lowered; talking"
+      result = result + emitStanceOnce(ei, who, stanceWord(pi))
+      if wasThreat:
+        result = result + emitBark(who, standDownLineFor(who))
+        var lo = obj()
+        lo.put("by", "player")
+        lo.put("how", "lowered")
+        lo.put("suppressedAimTicks", gEncAimTicks[ei])
+        discard journal("stand_down", who, "player", done(lo).text)
+        gEncAimTicks[ei] = 0
+        notes.add "weapon lowered; " & personName(pi) & " stands down and talks"
+      else:
+        notes.add "weapon lowered; talking"
     else:
       notes.add "weapon lowered, but no capture-capable person is within " &
                 $int(gNoticeM) & " m and none was named"
@@ -1485,16 +1627,14 @@ proc observe*(kind, actorId, targetId, dataJson: string; note: var string): int 
       gEncCaptor[hi] = ""
       gEncEscortTo[hi] = ""
       setState(hi, "fighting", "the player fired on their captor")
-      result = result + emitStance(held, "hostile")
-      result = result + directive("npc.attack",
-        jsonOf2("personId", held, "target", "player"), true, 15000)
+      result = result + emitStanceOnce(hi, held, "hostile")
+      result = result + emitAttackOnce(hi, held)
       notes.add "the captivity is broken by force; " & held & " is fighting"
     elif pi >= 0:
       bump(pi, -35)
       setState(ei, "fighting", "the player fired")
-      result = result + emitStance(who, "hostile")
-      result = result + directive("npc.attack",
-        jsonOf2("personId", who, "target", "player"), true, 15000)
+      result = result + emitStanceOnce(ei, who, "hostile")
+      result = result + emitAttackOnce(ei, who)
       notes.add personName(pi) & " is fighting"
     else:
       notes.add "player_fired at nobody we know ('" & who & "')"

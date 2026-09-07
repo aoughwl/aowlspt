@@ -71,7 +71,9 @@ proc tagGrammar*(): string =
   result =
     "You may end your reply with tags, each on its own line. They are not " &
     "spoken; they are how you act on the world. Use only these:\n" &
-    "[MOOD: -1..1]\n[ATTITUDE: +N | -N]\n[OFFER: <terms>]\n[ACCEPT]\n[REFUSE]\n" &
+    "[MOOD: -1..1, and move it by at most 0.4 in one reply]\n" &
+    "[ATTITUDE: a small change, -15..+15 -- one conversation does not decide " &
+    "how you feel about someone forever]\n[OFFER: <terms>]\n[ACCEPT]\n[REFUSE]\n" &
     "[DEMAND: <item or act> | <or else>]\n[GIVE: <item>]\n[TAKE: <item>]\n" &
     "[CAPTURE]\n[RELEASE]\n[FOLLOW_ME]\n[FOLLOW_YOU]\n[STAY]\n[LEAVE]\n" &
     "[ATTACK]\n[STAND_DOWN]\n" &

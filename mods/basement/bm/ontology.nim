@@ -93,9 +93,12 @@ proc ontologyLoad*(text: string; note: var string): bool =
     let b = jr.asText(jr.child(r, "bucket"), "")
     let t = jr.asText(jr.child(r, "text"), "")
     if i.len == 0 or b.len == 0 or t.len == 0: continue
+    var variants = @[t]
+    for a in textsOf(jr.child(r, "alts")):
+      if a.len > 0: variants.add a
     gRowIntent.add i
     gRowBucket.add b
-    gRowText.add t
+    gRowText.add joinSep(variants)
     gRowTags.add joinSep(textsOf(jr.child(r, "tags")))
 
   let fbItems = jr.each(jr.field(text, "fallback"))
@@ -103,8 +106,11 @@ proc ontologyLoad*(text: string; note: var string): bool =
     let b = jr.asText(jr.child(f, "bucket"), "")
     let t = jr.asText(jr.child(f, "text"), "")
     if b.len == 0 or t.len == 0: continue
+    var fvariants = @[t]
+    for a in textsOf(jr.child(f, "alts")):
+      if a.len > 0: fvariants.add a
     gFbBucket.add b
-    gFbText.add t
+    gFbText.add joinSep(fvariants)
     gFbTags.add joinSep(textsOf(jr.child(f, "tags")))
 
   if gIntentId.len == 0 or gRowIntent.len == 0:
@@ -114,7 +120,14 @@ proc ontologyLoad*(text: string; note: var string): bool =
     gLoadNote = note
     return false
   gLoaded = true
+  var variantN = 0
+  var thinRows = 0
+  for rt in gRowText:
+    let n = splitSep(rt).len
+    variantN = variantN + n
+    if n < 4: thinRows = thinRows + 1
   note = $gIntentId.len & " intents, " & $gRowIntent.len & " rows, " &
+         $variantN & " lines, " & $thinRows & " row(s) with fewer than 4, " &
          $gFbBucket.len & " fallback rows"
   gLoadNote = note
   result = true
@@ -200,6 +213,28 @@ proc fillSlots(tpl: string; c: PersonCard): string =
   s = s.replace("{place}", place)
   result = s
 
+proc pickVariant(joined, personId, utterance: string): string =
+  ## Deterministic per (person, thing said): the same person answers the same
+  ## way twice, and two different people standing in the same doorway do not
+  ## say one identical sentence. It is a hash, NOT randomness -- a reply that
+  ## changed between two identical turns would make the line cache a liar.
+  let vs = splitSep(joined)
+  if vs.len == 0: return ""
+  if vs.len == 1: return vs[0]
+  let h = fnv1a64(personId & "" & normalizeText(utterance))
+  result = vs[int(h mod uint64(vs.len))]
+
+proc bucketFor*(c: PersonCard; s: Situation): string =
+  ## The stance bucket a REPLY is served from, which is not always the stance
+  ## bucket of the relationship: a person with a rifle pointed at them does not
+  ## answer a greeting warmly, whatever they think of you. MEASURED 2026-09-07:
+  ## without this floor a greeting to a threatened person came back through the
+  ## warm/neutral row and read as if nothing was happening.
+  var b = stanceBucket(c.attitude, c.factionRep)
+  if s.state == "threatened" or s.state == "fighting" or s.playerAiming:
+    if b == "neutral" or b == "warm" or b == "loyal": b = "wary"
+  result = b
+
 proc findRow(intent, bucket: string): int =
   result = -1
   var i = 0
@@ -215,36 +250,37 @@ proc findFallback(bucket: string): int =
     i = i + 1
 
 proc ontologyReply*(intent: string; c: PersonCard; s: Situation;
-                    reply: var string; tags: var seq[string]): bool =
+                    utterance: string; reply: var string;
+                    tags: var seq[string]): bool =
   ## false when there is no row for this (intent, bucket) -- the caller must
   ## then fall through to the next tier rather than inventing something.
   reply = ""
   if not gLoaded: return false
-  let bucket = stanceBucket(c.attitude, c.factionRep)
+  let bucket = bucketFor(c, s)
   let idx = findRow(intent, bucket)
   if idx < 0: return false
-  reply = fillSlots(gRowText[idx], c)
+  reply = fillSlots(pickVariant(gRowText[idx], c.id, utterance), c)
   let rowTags = splitSep(gRowTags[idx])
   for t in rowTags:
     tags.add fillSlots(t, c)
   # One situational rider, not a second table: someone aiming a gun at you
   # colours every line, whatever was said.
-  if s.playerAiming and bucket == "hostile":
+  if s.playerAiming and bucket == "hostile" and intent != "unknown":
     reply.add " Lower it or do not, it is the same to me."
   result = true
 
-proc ontologyFallback*(c: PersonCard; reply: var string;
-                       tags: var seq[string]): bool =
+proc ontologyFallback*(c: PersonCard; s: Situation; utterance: string;
+                       reply: var string; tags: var seq[string]): bool =
   ## The `builtin` tier's row. It is a TEMPLATE, not a language model, and the
   ## data says so (`notALanguageModel: true`); the caller must put that in the
   ## Decision's notes.
   reply = ""
   if not gLoaded: return false
-  let bucket = stanceBucket(c.attitude, c.factionRep)
+  let bucket = bucketFor(c, s)
   var idx = findFallback(bucket)
   if idx < 0: idx = findFallback("neutral")
   if idx < 0: return false
-  reply = fillSlots(gFbText[idx], c)
+  reply = fillSlots(pickVariant(gFbText[idx], c.id, utterance), c)
   let fbT = splitSep(gFbTags[idx])
   for t in fbT:
     tags.add fillSlots(t, c)

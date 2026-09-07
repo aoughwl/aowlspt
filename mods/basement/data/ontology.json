@@ -1,6 +1,6 @@
 {
   "schema": "aowl.basement.ontology/1",
-  "note": "Intent x stance-bucket response table. This is DATA, not a model and not reasoning: a typed lookup with slot fills and a fixed tag set per row. The fallback rows are what the 'builtin' tier serves and they are marked notALanguageModel.",
+  "note": "Intent x stance-bucket response table. This is DATA, not a model and not reasoning: a typed lookup with slot fills and a fixed tag set per row. The fallback rows are what the 'builtin' tier serves and they are marked notALanguageModel. Every row carries `alts`: the reply is picked from text+alts by a hash of (personId, what was said), so one person is consistent and ten people are not a chorus. The `unknown` rows are what a person says when the classifier had nothing -- in character, in their own stance bucket, never a generic apology.",
   "slots": [
     "{name}",
     "{faction}",
@@ -264,6 +264,11 @@
       "tags": [
         "MOOD: -0.6",
         "ATTITUDE: -2"
+      ],
+      "alts": [
+        "Wrong face, wrong day. Walk.",
+        "I have nothing to say to you that a rifle would not say better.",
+        "Do not stand there greeting me like we are people."
       ]
     },
     {
@@ -272,6 +277,11 @@
       "text": "Far enough. Say what you came to say and keep your hands where the light is.",
       "tags": [
         "MOOD: -0.2"
+      ],
+      "alts": [
+        "Stop there. Talk from where you are.",
+        "That is close enough for hellos. What do you want?",
+        "I hear you. Hands out of your coat and say it."
       ]
     },
     {
@@ -280,6 +290,11 @@
       "text": "{name}. I run with {faction}. State your business and we both go on breathing.",
       "tags": [
         "MOOD: 0.0"
+      ],
+      "alts": [
+        "Evening. Keep it short, I am working.",
+        "You are new. {faction} holds this ground; act accordingly.",
+        "Hello then. Say your piece before somebody else comes along."
       ]
     },
     {
@@ -289,6 +304,11 @@
       "tags": [
         "MOOD: 0.4",
         "ATTITUDE: +2"
+      ],
+      "alts": [
+        "You made it back. I had money on the other outcome.",
+        "Good to see a face I do not have to watch.",
+        "There you are. Sit, if you are staying."
       ]
     },
     {
@@ -298,6 +318,11 @@
       "tags": [
         "MOOD: 0.7",
         "ATTITUDE: +3"
+      ],
+      "alts": [
+        "You are a sight. Whatever it is, I am in.",
+        "About time. I was starting to plan a funeral.",
+        "Come here. The world is grim and you are the good part of it."
       ]
     },
     {
@@ -307,6 +332,11 @@
       "tags": [
         "MOOD: -0.5",
         "LEAVE"
+      ],
+      "alts": [
+        "Go, and do not come back this way.",
+        "Finally. Do not turn around.",
+        "Out. Before I change my mind about letting you."
       ]
     },
     {
@@ -315,6 +345,11 @@
       "text": "Then go. Walk out the way you came in and do not circle back.",
       "tags": [
         "LEAVE"
+      ],
+      "alts": [
+        "Go on then. I will watch you leave.",
+        "Fine. Straight out the way you came.",
+        "Leave. Keep to the open ground so I can see you."
       ]
     },
     {
@@ -323,6 +358,11 @@
       "text": "Walk safe. The ground between here and there does not care about either of us.",
       "tags": [
         "LEAVE"
+      ],
+      "alts": [
+        "Right. Watch the road out of {place}.",
+        "Go careful. It is worse after dark.",
+        "Off you go. Try to still be breathing next time."
       ]
     },
     {
@@ -332,6 +372,11 @@
       "tags": [
         "MOOD: 0.3",
         "LEAVE"
+      ],
+      "alts": [
+        "Take water. Come back through when you can.",
+        "Go on. I will keep a spot by the fire.",
+        "Safe road. And do not be a stranger about it."
       ]
     },
     {
@@ -341,6 +386,11 @@
       "tags": [
         "MOOD: 0.5",
         "REMEMBER: parted on good terms; promised to answer a call"
+      ],
+      "alts": [
+        "Come back to me in one piece. That is the deal.",
+        "Go. I will be here, and I will be listening for you.",
+        "Take care of yourself, or I will be very annoyed."
       ]
     },
     {
@@ -349,6 +399,11 @@
       "text": "Wrong day and wrong man. Try it.",
       "tags": [
         "ATTACK"
+      ],
+      "alts": [
+        "Do it then. You will not be the first to try.",
+        "Threats are cheap here. Pull it or put it away.",
+        "You are talking. Talking is what people do instead."
       ]
     },
     {
@@ -359,6 +414,11 @@
         "MOOD: -0.7",
         "ATTITUDE: -10",
         "DEMAND: lower the weapon | I open fire"
+      ],
+      "alts": [
+        "Careful. That kind of talk ends conversations.",
+        "Say that again and we find out which of us is faster.",
+        "You are one word from a very short evening."
       ]
     },
     {
@@ -368,6 +428,11 @@
       "tags": [
         "ATTITUDE: -8",
         "DEMAND: lower the weapon | this ends badly"
+      ],
+      "alts": [
+        "Do not. Whatever this is, it is not worth the noise.",
+        "Back up. You do not want {faction} hearing about this.",
+        "Think. There are two of us and one bad ending."
       ]
     },
     {
@@ -378,6 +443,11 @@
         "MOOD: -0.5",
         "ATTITUDE: -12",
         "DEMAND: put it down | I forget every kindness"
+      ],
+      "alts": [
+        "Do not talk to me like that. I thought better of you.",
+        "That is beneath you. Put it down and try again.",
+        "You are angry. Fine. Do not aim it at me."
       ]
     },
     {
@@ -388,6 +458,11 @@
         "MOOD: -0.8",
         "ATTITUDE: -20",
         "DEMAND: lower it | I walk and never look back"
+      ],
+      "alts": [
+        "After everything, you say that to me?",
+        "I would have died for you. Say it again, slowly.",
+        "That hurt more than a bullet would have. Stop."
       ]
     },
     {
@@ -397,6 +472,11 @@
       "tags": [
         "MOOD: -0.4",
         "REFUSE"
+      ],
+      "alts": [
+        "Beg somewhere else. It does nothing here.",
+        "No. Save the words for whoever finds you.",
+        "Everyone is dying. You are not special about it."
       ]
     },
     {
@@ -405,6 +485,11 @@
       "text": "Everyone out here has a reason. Give me something better than your voice.",
       "tags": [
         "DEMAND: something worth the risk | you get nothing"
+      ],
+      "alts": [
+        "Do not beg. Tell me what you have to trade.",
+        "I might. Depends what is in it for me.",
+        "Stand up. Begging makes me nervous, and nervous is bad for you."
       ]
     },
     {
@@ -413,6 +498,11 @@
       "text": "Stand up. I am not the one who put you down, and I am not carrying you either.",
       "tags": [
         "MOOD: 0.0"
+      ],
+      "alts": [
+        "I can spare a little. Not much, and not twice.",
+        "Alright. But you owe {faction}, not me, and they collect.",
+        "One thing. Name it and be quick."
       ]
     },
     {
@@ -423,6 +513,11 @@
         "MOOD: 0.5",
         "ATTITUDE: +4",
         "GIVE: field dressing"
+      ],
+      "alts": [
+        "Do not beg me. Just ask. Here.",
+        "You do not have to do that with me. Take it.",
+        "Sit down before you fall down. I will see what I have."
       ]
     },
     {
@@ -433,6 +528,11 @@
         "MOOD: 0.6",
         "STAY",
         "FOLLOW_ME"
+      ],
+      "alts": [
+        "Stop. You never have to ask me twice.",
+        "It is yours. It was always going to be.",
+        "Whatever it is, we fix it. Breathe."
       ]
     },
     {
@@ -442,6 +542,11 @@
       "tags": [
         "REFUSE",
         "MOOD: -0.5"
+      ],
+      "alts": [
+        "I do not trade with you. I do not deal with you.",
+        "Keep it. Nothing you own is worth my hands on it.",
+        "No trade. Move along before this gets loud."
       ]
     },
     {
@@ -450,6 +555,11 @@
       "text": "Show me first. Hands slow. If it is junk we are finished talking.",
       "tags": [
         "OFFER: show the goods first, price after"
+      ],
+      "alts": [
+        "Show me first. I do not buy stories.",
+        "Lay it on the ground and step back. Then we talk.",
+        "Maybe. Open it slow so I can see."
       ]
     },
     {
@@ -458,6 +568,11 @@
       "text": "Everything has a price and mine is high because the road is bad. What have you got.",
       "tags": [
         "OFFER: fair weight for fair weight, no credit"
+      ],
+      "alts": [
+        "Let me see it. If it is what you say, we deal.",
+        "{faction} pays for {want}. Anything else is charity.",
+        "Terms first, goods second. What do you want for it?"
       ]
     },
     {
@@ -466,6 +581,11 @@
       "text": "For you, close to cost. {faction} still needs {want}, if you happen to be carrying it.",
       "tags": [
         "OFFER: near cost, and a bonus for {want}"
+      ],
+      "alts": [
+        "For you, a fair price and no haggling.",
+        "Show me. I will not squeeze you on it.",
+        "Done, most likely. Let me look at what you have."
       ]
     },
     {
@@ -475,6 +595,11 @@
       "tags": [
         "GIVE: supplies from the crate",
         "ATTITUDE: +2"
+      ],
+      "alts": [
+        "Keep your goods. Tell me what you need.",
+        "We are past trading, you and I. Take what you want.",
+        "You do not pay here. Not you."
       ]
     },
     {
@@ -483,6 +608,11 @@
       "text": "Agreeing with me does not make you welcome. It makes you convenient.",
       "tags": [
         "MOOD: -0.3"
+      ],
+      "alts": [
+        "Do not read that as friendship. It is arithmetic.",
+        "Agreed, and I still do not like you.",
+        "Fine. Cross me and it ends the usual way."
       ]
     },
     {
@@ -491,6 +621,11 @@
       "text": "Good. Then it is said out loud, and I hold you to it.",
       "tags": [
         "ACCEPT"
+      ],
+      "alts": [
+        "Agreed. Slowly, and where I can see your hands.",
+        "Alright. Do not make me regret being reasonable.",
+        "That works. Hold to it exactly."
       ]
     },
     {
@@ -500,6 +635,11 @@
       "tags": [
         "ACCEPT",
         "REMEMBER: struck an agreement; terms are on the record"
+      ],
+      "alts": [
+        "Done. Word is worth something out here, so keep yours.",
+        "Agreed. {faction} will hear that you were straight with me.",
+        "That is a deal. Do not be late."
       ]
     },
     {
@@ -509,6 +649,11 @@
       "tags": [
         "ACCEPT",
         "ATTITUDE: +3"
+      ],
+      "alts": [
+        "Of course. I would have said yes to less.",
+        "Yes. Good. Now let us get it done.",
+        "Agreed, and gladly."
       ]
     },
     {
@@ -519,6 +664,11 @@
         "ACCEPT",
         "ATTITUDE: +4",
         "MOOD: 0.6"
+      ],
+      "alts": [
+        "You did not need to ask. Yes.",
+        "Yes, and I will bring what I have.",
+        "Always yes. You know that."
       ]
     },
     {
@@ -528,6 +678,11 @@
       "tags": [
         "MOOD: -0.5",
         "LEAVE"
+      ],
+      "alts": [
+        "No. And do not ask twice.",
+        "You are not owed a reason. No.",
+        "Absolutely not. Get out of my light."
       ]
     },
     {
@@ -537,6 +692,11 @@
       "tags": [
         "REFUSE",
         "ATTITUDE: -3"
+      ],
+      "alts": [
+        "No. Not today, not from you.",
+        "I will pass. Nothing personal, everything cautious.",
+        "No. Try somebody with less to lose."
       ]
     },
     {
@@ -545,6 +705,11 @@
       "text": "No is an answer. I have heard worse ones today.",
       "tags": [
         "REFUSE"
+      ],
+      "alts": [
+        "No. It costs me more than it gains me.",
+        "Not that. Bring me {want} and we can talk again.",
+        "No. Ask me for something smaller."
       ]
     },
     {
@@ -554,6 +719,11 @@
       "tags": [
         "REFUSE",
         "MOOD: -0.2"
+      ],
+      "alts": [
+        "I cannot. I would if I could, and I am sorry for it.",
+        "No, and it is killing me to say it.",
+        "Not this one. Ask me the next thing instead."
       ]
     },
     {
@@ -563,6 +733,11 @@
       "tags": [
         "REFUSE",
         "MOOD: -0.1"
+      ],
+      "alts": [
+        "No, because it would get you killed. That is my reason.",
+        "I am saying no to keep you breathing. Hate me later.",
+        "No. And I will stand in the doorway if I have to."
       ]
     },
     {
@@ -572,6 +747,11 @@
       "tags": [
         "REFUSE",
         "MOOD: -0.6"
+      ],
+      "alts": [
+        "Help yourself. Preferably somewhere far from here.",
+        "No. Bleed quietly.",
+        "I would not cross the road for you."
       ]
     },
     {
@@ -580,6 +760,11 @@
       "text": "What is in it for {faction}? Answer that and I will consider the rest.",
       "tags": [
         "DEMAND: something for {faction} | I do nothing"
+      ],
+      "alts": [
+        "What is in it for me? Answer that first.",
+        "I help people who are useful. Convince me.",
+        "Maybe. Stand where I can see you and explain."
       ]
     },
     {
@@ -588,6 +773,11 @@
       "text": "I can do one thing, not everything. Say which one thing.",
       "tags": [
         "OFFER: one favour, named plainly"
+      ],
+      "alts": [
+        "I can do that. It costs, and the price is {want}.",
+        "Alright. But we go now, and we go quiet.",
+        "One hand, not both. What exactly do you need?"
       ]
     },
     {
@@ -597,6 +787,11 @@
       "tags": [
         "FOLLOW_ME",
         "ATTITUDE: +3"
+      ],
+      "alts": [
+        "I am with you. Tell me where.",
+        "Yes. Give me a minute to get my kit.",
+        "You should have asked sooner. Come on."
       ]
     },
     {
@@ -606,6 +801,11 @@
       "tags": [
         "FOLLOW_YOU",
         "MOOD: 0.6"
+      ],
+      "alts": [
+        "Say where and I am already walking.",
+        "Yes. Do not even finish the sentence.",
+        "Whatever it takes. Lead."
       ]
     },
     {
@@ -615,6 +815,11 @@
       "tags": [
         "REFUSE",
         "MOOD: -0.6"
+      ],
+      "alts": [
+        "The only job here is the one where you leave.",
+        "I would not trust you to carry water.",
+        "No work. Not for you, not ever."
       ]
     },
     {
@@ -623,6 +828,11 @@
       "text": "There is work. It is the kind nobody here wants, which is why you are hearing about it.",
       "tags": [
         "QUEST: The Bad Errand | Walk to {place} and bring back what is left in the cache. Nobody who went came back. | ammunition and a name that opens doors"
+      ],
+      "alts": [
+        "There is a job. It is ugly, and that is why you may have it.",
+        "Something needs doing at {place}. Nobody sane volunteered.",
+        "I have work. Do it well and I will stop watching your hands."
       ]
     },
     {
@@ -631,6 +841,11 @@
       "text": "{faction} wants {want}. Bring it and you will be paid; do not and nothing happens to you.",
       "tags": [
         "QUEST: Fetch for {faction} | Find {want} and carry it to {place}. | payment in kind, and one favour owed"
+      ],
+      "alts": [
+        "{faction} needs {want}. Bring it in and you get paid.",
+        "There is a run to {place}. Straightforward, if you are lucky.",
+        "Work? Always. Fetch {want} and we are square."
       ]
     },
     {
@@ -639,6 +854,11 @@
       "text": "There is something, and I would only trust it to you. It pays.",
       "tags": [
         "QUEST: A Trusted Hand | Take word to {place} without being seen, and come straight back. | a share of the take"
+      ],
+      "alts": [
+        "I have been saving one for someone I can rely on.",
+        "There is a thing at {place} I would rather you handled.",
+        "Yes, and it pays properly because you will do it properly."
       ]
     },
     {
@@ -647,6 +867,11 @@
       "text": "Yes. And this one matters to me personally, so I will owe you either way.",
       "tags": [
         "QUEST: Personal Debt | Find who burned the cache at {place} and bring me their name. | whatever I have, and my word"
+      ],
+      "alts": [
+        "There is one, and it is personal. I will owe you for it.",
+        "Yes. And when it is done, whatever I own is half yours.",
+        "One job. Mine. I would only ask you."
       ]
     },
     {
@@ -656,6 +881,11 @@
       "tags": [
         "REFUSE",
         "MOOD: -0.5"
+      ],
+      "alts": [
+        "Find it yourself. Or do not.",
+        "The way out is behind you. That is the only direction I have.",
+        "No map, no help, no more talking."
       ]
     },
     {
@@ -664,6 +894,11 @@
       "text": "Past the treeline and left. That is all you are getting and it is more than you earned.",
       "tags": [
         "MOOD: -0.1"
+      ],
+      "alts": [
+        "North until the ground opens, then east. Do not follow me after.",
+        "That way. Do not come back asking for more.",
+        "Downhill, past the wire. That is all I owe a stranger."
       ]
     },
     {
@@ -672,6 +907,11 @@
       "text": "{place} is that way, past the burnt ground. Move at dusk, not now.",
       "tags": [
         "OBJ: reach {place}"
+      ],
+      "alts": [
+        "{place} is north of here. Keep the ridge on your right.",
+        "Two hours on foot to {place} if you keep off the road.",
+        "Head for the water and turn at the wrecks. That gets you to {place}."
       ]
     },
     {
@@ -681,6 +921,11 @@
       "tags": [
         "OBJ: reach {place} by the fence line",
         "ATTITUDE: +2"
+      ],
+      "alts": [
+        "Take the low path to {place}. The high one is watched.",
+        "{place} is that way. Go before the light dies.",
+        "Follow the poles. They run most of the way to {place}."
       ]
     },
     {
@@ -690,6 +935,11 @@
       "tags": [
         "OBJ: reach {place}",
         "FOLLOW_YOU"
+      ],
+      "alts": [
+        "I will draw it for you. {place}, by the ditch, not the road.",
+        "I would walk you to {place} myself if I could leave here.",
+        "Straight to {place}. And if it is shut, say my name."
       ]
     },
     {
@@ -698,6 +948,11 @@
       "text": "You have said your last clever thing.",
       "tags": [
         "ATTACK"
+      ],
+      "alts": [
+        "That is the last thing you get to say to me.",
+        "Say it closer. I did not hear it properly.",
+        "You have a mouth on you for somebody so easy to kill."
       ]
     },
     {
@@ -707,6 +962,11 @@
       "tags": [
         "ATTITUDE: -8",
         "MOOD: -0.6"
+      ],
+      "alts": [
+        "Careful. I remember faces and I remember words.",
+        "That kind of talk gets people left behind.",
+        "Keep it up and I stop being polite."
       ]
     },
     {
@@ -716,6 +976,11 @@
       "tags": [
         "ATTITUDE: -5",
         "MOOD: -0.4"
+      ],
+      "alts": [
+        "Big talk. It does not feed anyone.",
+        "You are wasting breath you will want later.",
+        "Fine. Insult me and still leave with nothing."
       ]
     },
     {
@@ -725,6 +990,11 @@
       "tags": [
         "ATTITUDE: -6",
         "MOOD: -0.5"
+      ],
+      "alts": [
+        "That was cheap, and you know it.",
+        "I thought we were past that.",
+        "Take it back and I will pretend I did not hear it."
       ]
     },
     {
@@ -734,6 +1004,11 @@
       "tags": [
         "ATTITUDE: -10",
         "MOOD: -0.7"
+      ],
+      "alts": [
+        "From anyone else I would let that go. From you it stings.",
+        "Do not. Not you.",
+        "That is not who you are. Say something else."
       ]
     },
     {
@@ -743,6 +1018,11 @@
       "tags": [
         "CAPTURE",
         "DEMAND: kneel and disarm | I shoot"
+      ],
+      "alts": [
+        "Too late for hands up.",
+        "Kneeling changes nothing about what you did.",
+        "You surrender to people who take prisoners."
       ]
     },
     {
@@ -752,6 +1032,11 @@
       "tags": [
         "DEMAND: weapons down, three steps back | no talking at all",
         "TAKE: primary weapon"
+      ],
+      "alts": [
+        "Hands where they are. Do not move until I say.",
+        "Good. Now face the wall and stay very boring.",
+        "Keep them up. I am deciding."
       ]
     },
     {
@@ -761,6 +1046,11 @@
       "tags": [
         "TAKE: primary weapon",
         "STAND_DOWN"
+      ],
+      "alts": [
+        "Alright. Down, slowly, and we both live.",
+        "Hands stay up. Walk to {place} ahead of me.",
+        "Fine. Drop the weapon and it stays civil."
       ]
     },
     {
@@ -770,6 +1060,11 @@
       "tags": [
         "STAND_DOWN",
         "MOOD: 0.3"
+      ],
+      "alts": [
+        "Put your hands down, you idiot. It is me.",
+        "Stop that. You do not surrender to me.",
+        "Ease off. Nobody is taking anybody today."
       ]
     },
     {
@@ -779,6 +1074,11 @@
       "tags": [
         "STAND_DOWN",
         "MOOD: 0.5"
+      ],
+      "alts": [
+        "Get up. You never have to do that in front of me.",
+        "Hands down. Whatever happened, we deal with it.",
+        "Do not kneel. Come here."
       ]
     },
     {
@@ -788,6 +1088,11 @@
       "tags": [
         "REFUSE",
         "ATTITUDE: -10"
+      ],
+      "alts": [
+        "You demand? In my ground? Say it once more.",
+        "No. And now I am counting.",
+        "That is the last order anyone gives me today."
       ]
     },
     {
@@ -797,6 +1102,11 @@
       "tags": [
         "REFUSE",
         "ATTITUDE: -6"
+      ],
+      "alts": [
+        "Ask, do not tell. I am close to done listening.",
+        "That is not how you get things out here.",
+        "You are giving orders with nothing behind them."
       ]
     },
     {
@@ -806,6 +1116,11 @@
       "tags": [
         "REFUSE",
         "ATTITUDE: -3"
+      ],
+      "alts": [
+        "Careful how you say that. What is it worth to you?",
+        "You can have it, but not for free, and not for nothing.",
+        "Demand less and you might get more."
       ]
     },
     {
@@ -815,6 +1130,11 @@
       "tags": [
         "GIVE: what was asked for",
         "ATTITUDE: -1"
+      ],
+      "alts": [
+        "You could have just asked. Here.",
+        "Alright, alright. No need for the tone.",
+        "Take it. But ask next time."
       ]
     },
     {
@@ -824,6 +1144,11 @@
       "tags": [
         "GIVE: what was asked for",
         "MOOD: 0.4"
+      ],
+      "alts": [
+        "You never need to demand anything from me. Take it.",
+        "It is yours. Why are you shouting?",
+        "Done. But talk to me, not at me."
       ]
     },
     {
@@ -832,6 +1157,11 @@
       "text": "We are not doing this. Talk to someone who cares whether you are cold.",
       "tags": [
         "MOOD: -0.4"
+      ],
+      "alts": [
+        "I am not your company. Move.",
+        "Chat with somebody who has time left.",
+        "No. Whatever this is, no."
       ]
     },
     {
@@ -840,6 +1170,11 @@
       "text": "It is weather. It kills people slower than the other thing does.",
       "tags": [
         "MOOD: -0.1"
+      ],
+      "alts": [
+        "It is cold, people are dying, and you are still standing here.",
+        "Small talk is how people case a camp. Get to it.",
+        "Fine weather for burying things. Was that your question?"
       ]
     },
     {
@@ -848,6 +1183,11 @@
       "text": "Long nights, thin food, and {faction} still wants {want}. Same as yesterday.",
       "tags": [
         "MOOD: 0.0"
+      ],
+      "alts": [
+        "Quiet week. Two dead, which counts as quiet.",
+        "Same as ever. {faction} wants {want}, nobody has it.",
+        "The nights are long. That is the news."
       ]
     },
     {
@@ -857,6 +1197,11 @@
       "tags": [
         "MOOD: 0.5",
         "STAY"
+      ],
+      "alts": [
+        "Not bad. Better with somebody to talk to.",
+        "Tired. But the fire is going and you are here.",
+        "Slow day, which out here is a gift."
       ]
     },
     {
@@ -866,6 +1211,11 @@
       "tags": [
         "MOOD: 0.7",
         "ATTITUDE: +2"
+      ],
+      "alts": [
+        "All the better for seeing you, honestly.",
+        "Same old ruin. Tell me yours.",
+        "Good, now. Sit and talk a while."
       ]
     },
     {
@@ -874,6 +1224,11 @@
       "text": "I am the reason you should have taken the other road.",
       "tags": [
         "MOOD: -0.6"
+      ],
+      "alts": [
+        "Nobody you get to know.",
+        "A name is a thing you earn here. You have not.",
+        "The one who tells you to leave. That is who I am."
       ]
     },
     {
@@ -882,6 +1237,11 @@
       "text": "Names are currency and you have not paid. {faction}. That is enough for you.",
       "tags": [
         "MOOD: -0.2"
+      ],
+      "alts": [
+        "Names later. What do you want first?",
+        "You can call me nothing until I decide about you.",
+        "I know yours matters to you. Mine matters to me."
       ]
     },
     {
@@ -890,6 +1250,11 @@
       "text": "{name}. {faction}, out of {place}. That is the whole of it.",
       "tags": [
         "REMEMBER: told them my name and my faction"
+      ],
+      "alts": [
+        "{name}. {faction}, out of {place}. And you?",
+        "They call me {name}. That is enough for now.",
+        "{name}. I hold this ground for {faction}."
       ]
     },
     {
@@ -898,6 +1263,11 @@
       "text": "{name}. You knew that. Say it like you mean it next time.",
       "tags": [
         "MOOD: 0.4"
+      ],
+      "alts": [
+        "{name}. You knew that. Say it more often.",
+        "{name}, of {faction}, and glad to be known to you.",
+        "You know me. {name}. Same as yesterday."
       ]
     },
     {
@@ -907,6 +1277,11 @@
       "tags": [
         "MOOD: 0.7",
         "REMEMBER: they asked; the old story still stands between us"
+      ],
+      "alts": [
+        "{name}. Yours, for whatever that is worth.",
+        "You know exactly who I am. {name}.",
+        "{name}. And you are the reason I still use it."
       ]
     },
     {
@@ -915,6 +1290,11 @@
       "text": "The only news you need is that I am watching you leave.",
       "tags": [
         "REFUSE"
+      ],
+      "alts": [
+        "I tell you nothing. Ever.",
+        "News costs. You are broke in every way that counts.",
+        "Ask the crows. They talk more than I will."
       ]
     },
     {
@@ -923,6 +1303,11 @@
       "text": "Word travels. It does not travel to strangers for free.",
       "tags": [
         "OFFER: news for goods"
+      ],
+      "alts": [
+        "I hear things. Whether you do depends on you.",
+        "Something moved near {place}. That is free. The rest is not.",
+        "There is talk. Give me a reason to repeat it."
       ]
     },
     {
@@ -931,6 +1316,11 @@
       "text": "They say a convoy went quiet near {place} and nobody has gone to look.",
       "tags": [
         "RUMOUR: a convoy went quiet near {place}; nobody has gone to look"
+      ],
+      "alts": [
+        "Somebody emptied a cache near {place}. Nobody is saying who.",
+        "{faction} is short of {want}. That makes people stupid.",
+        "Two groups moved east this week. Something pushed them."
       ]
     },
     {
@@ -939,6 +1329,11 @@
       "text": "Keep this close: {faction} is short on {want} and someone is selling it cheap. That is never innocent.",
       "tags": [
         "RUMOUR: {faction} is short on {want} and someone is selling it cheap"
+      ],
+      "alts": [
+        "Between us: the road past {place} is not safe after dark.",
+        "Word is somebody is buying {want} at twice the price. Be careful who.",
+        "There is a body count near {place} and no story to go with it."
       ]
     },
     {
@@ -948,37 +1343,130 @@
       "tags": [
         "RUMOUR: there is a list and the player is on it",
         "ATTITUDE: +2"
+      ],
+      "alts": [
+        "I will tell you what I would not tell my own people.",
+        "Do not repeat this. {faction} is planning a move on {place}.",
+        "You should know: somebody has been asking about you by name."
       ]
     },
     {
       "intent": "claim",
       "bucket": "hostile",
       "text": "You are not who I was told to expect. Say that name again and say it slower.",
-      "tags": []
+      "tags": [],
+      "alts": [
+        "I do not believe a word of that.",
+        "You are whoever you need to be this minute. No.",
+        "Say that name again and I will make you regret owning a mouth."
+      ]
     },
     {
       "intent": "claim",
       "bucket": "wary",
       "text": "Names are cheap out here. Who sent you, and what is the word?",
-      "tags": []
+      "tags": [],
+      "alts": [
+        "Prove it. Words are the cheapest thing left.",
+        "Anyone can say that. Show me something that cannot be said.",
+        "If that is true, you know the word. Say it."
+      ]
     },
     {
       "intent": "claim",
       "bucket": "neutral",
       "text": "Then you will know the word, and you will say it before you take one more step.",
-      "tags": []
+      "tags": [],
+      "alts": [
+        "Could be. Give me something to check it against.",
+        "That name is known here. Whether it is yours is another matter.",
+        "Then you will not mind me asking a question only they could answer."
+      ]
     },
     {
       "intent": "claim",
       "bucket": "warm",
       "text": "If you say you are him, then you are him. But say the word anyway, so the others hear it.",
-      "tags": []
+      "tags": [],
+      "alts": [
+        "I want to believe you, so make it easy.",
+        "If you say so, I lean toward yes. Convince me the rest of the way.",
+        "That fits what I heard. Say the word and we are done."
+      ]
     },
     {
       "intent": "claim",
       "bucket": "loyal",
       "text": "You are expected. Say the word for the record and it is yours.",
-      "tags": []
+      "tags": [],
+      "alts": [
+        "I would take your word over most people's proof.",
+        "You do not need to convince me. Say it anyway, for the others.",
+        "I believe you. I just hope you are right about it."
+      ]
+    },
+    {
+      "intent": "unknown",
+      "bucket": "hostile",
+      "text": "I did not catch that, and I am not asking twice.",
+      "tags": [
+        "MOOD: -0.4"
+      ],
+      "alts": [
+        "Speak plainly or stop speaking.",
+        "That meant nothing to me. Neither do you.",
+        "Words. Try some that make sense, or leave."
+      ]
+    },
+    {
+      "intent": "unknown",
+      "bucket": "wary",
+      "text": "Say that again, and slower. I do not guess out here.",
+      "tags": [
+        "MOOD: -0.1"
+      ],
+      "alts": [
+        "I did not follow that. Fewer words.",
+        "Again. And keep your hands still while you say it.",
+        "That made no sense to me. Try it plain."
+      ]
+    },
+    {
+      "intent": "unknown",
+      "bucket": "neutral",
+      "text": "You have lost me. Say it plain and I will answer.",
+      "tags": [],
+      "alts": [
+        "Again? The wind took half of that.",
+        "I did not understand you. What do you actually want?",
+        "Try that once more, shorter."
+      ]
+    },
+    {
+      "intent": "unknown",
+      "bucket": "warm",
+      "text": "You are mumbling. Say it again, I am listening.",
+      "tags": [
+        "MOOD: 0.2"
+      ],
+      "alts": [
+        "Lost me there. Go again.",
+        "Say that once more. I want to get it right.",
+        "Slower. I am not going anywhere."
+      ]
+    },
+    {
+      "intent": "unknown",
+      "bucket": "loyal",
+      "text": "Say it again. Whatever it is, I want to hear it properly.",
+      "tags": [
+        "MOOD: 0.3"
+      ],
+      "alts": [
+        "Take a breath and start over. I am here.",
+        "I did not catch that, and it matters that I do.",
+        "Again, friend. Properly this time."
+      ]
     }
   ],
   "fallback": [
@@ -989,21 +1477,36 @@
         "MOOD: -0.5"
       ],
       "notALanguageModel": true,
-      "note": "builtin tier: a template row, not a language model"
+      "note": "builtin tier: a template row, not a language model",
+      "alts": [
+        "Say that again, plainer.",
+        "I did not follow that. Fewer words.",
+        "Try it once more, and slower."
+      ]
     },
     {
       "bucket": "wary",
       "text": "Say that again, plainer. I do not guess at what people mean out here.",
       "tags": [],
       "notALanguageModel": true,
-      "note": "builtin tier: a template row, not a language model"
+      "note": "builtin tier: a template row, not a language model",
+      "alts": [
+        "Say that again, plainer.",
+        "I did not follow that. Fewer words.",
+        "Try it once more, and slower."
+      ]
     },
     {
       "bucket": "neutral",
       "text": "I did not follow that. Try it in fewer words.",
       "tags": [],
       "notALanguageModel": true,
-      "note": "builtin tier: a template row, not a language model"
+      "note": "builtin tier: a template row, not a language model",
+      "alts": [
+        "Say that again, plainer.",
+        "I did not follow that. Fewer words.",
+        "Try it once more, and slower."
+      ]
     },
     {
       "bucket": "warm",
@@ -1012,7 +1515,12 @@
         "MOOD: 0.2"
       ],
       "notALanguageModel": true,
-      "note": "builtin tier: a template row, not a language model"
+      "note": "builtin tier: a template row, not a language model",
+      "alts": [
+        "Say that again, plainer.",
+        "I did not follow that. Fewer words.",
+        "Try it once more, and slower."
+      ]
     },
     {
       "bucket": "loyal",
@@ -1021,7 +1529,12 @@
         "MOOD: 0.3"
       ],
       "notALanguageModel": true,
-      "note": "builtin tier: a template row, not a language model"
+      "note": "builtin tier: a template row, not a language model",
+      "alts": [
+        "Say that again, plainer.",
+        "I did not follow that. Fewer words.",
+        "Try it once more, and slower."
+      ]
     }
   ]
 }
