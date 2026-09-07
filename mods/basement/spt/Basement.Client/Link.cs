@@ -133,6 +133,22 @@ namespace Basement.Client
             }
             _latest = o.Value<long?>("latestSeq") ?? 0;
             _first = o.Value<long?>("firstSeq") ?? 0;
+            if (_since > _latest)
+            {
+                // The backend RESTARTED (its stream begins again at 1) while our
+                // cursor still points past its new end: every poll answers an
+                // empty page for ever. MEASURED 2026-09-07: cursor ~300 against a
+                // fresh sidecar at 17 -- transcripts and replies flowed on the
+                // backend and the game showed nothing. Rewind to the start of the
+                // new ring so the few events since the restart are replayed.
+                Plugin.Log.LogWarning("basement link: the backend restarted -- cursor " + _since + " is past its latestSeq " +
+                    _latest + ". Rewinding to " + Math.Max(0, _first - 1) + " and replaying the new ring.");
+                _since = Math.Max(0, _first - 1);
+                SaveCursor();
+                State = "rewound after a backend restart";
+                People.RefreshSync(null);
+                return true;
+            }
             if (_since > 0 && _first > 0 && _since < _first - 1)
             {
                 Holes++;
