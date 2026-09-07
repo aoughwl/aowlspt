@@ -39,6 +39,7 @@ namespace Basement.Client
         internal static ConfigEntry<string> Preset;
         internal static ConfigEntry<float> NoticeM;
         internal static ConfigEntry<bool> MatchPeopleByName;
+        internal static ConfigEntry<bool> MuteVanillaVoice;
         internal static ConfigEntry<bool> BindUnmatchedBots;
         internal static ConfigEntry<bool> TalkNeedsAddressee;
 
@@ -77,6 +78,8 @@ namespace Basement.Client
                 "CLIENT-CONTRACT section 6.5: with nobody alive inside the view cone and notice range, do not open a speech session. Off = post anyway with an empty personId.");
             MatchPeopleByName = Config.Bind("Voice", "MatchPeopleByName", true,
                 "HEURISTIC: map a backend person to a live bot whose profile nickname equals the person name. Without group.spawn (no actuator in 0.1.0) it is the only way any bot becomes addressable.");
+            MuteVanillaVoice = Config.Bind("Voice", "MuteVanillaVoice", true,
+                "Drop every vanilla bot voice line (BotTalk.Say prefix) so the only voices are the world's people. Player VOIP is untouched.");
             BindUnmatchedBots = Config.Bind("Voice", "BindUnmatchedBots", true,
                 "FALLBACK binding: a live bot with no nickname match becomes the nearest unbound world person on this map (else any unbound person, logged as relocated). Without it, ordinary SPT bots (random nicknames) are never addressable and nobody talks.");
 
@@ -103,6 +106,7 @@ namespace Basement.Client
             }
 
             Spawn.Install();
+            Mute.Install();
             var t = new Thread(StartupThread) { IsBackground = true, Name = "basement-startup" };
             t.Start();
         }

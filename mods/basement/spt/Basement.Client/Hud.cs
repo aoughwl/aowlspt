@@ -22,6 +22,11 @@ namespace Basement.Client
         {
             lock (Lines)
             {
+                // The same text again REFRESHES the existing line instead of
+                // stacking a duplicate (MEASURED 2026-09-07: repeated warnings
+                // piled up and overlapped into an unreadable block).
+                for (int i = 0; i < Lines.Count; i++)
+                    if (Lines[i].Text == text) { var l = Lines[i]; l.Until = Time.unscaledTime + seconds; Lines[i] = l; return; }
                 Lines.Add(new Line { Text = text, Until = Time.unscaledTime + seconds, Color = c });
                 while (Lines.Count > 6) Lines.RemoveAt(0);
             }
@@ -35,11 +40,15 @@ namespace Basement.Client
             lock (Lines)
             {
                 Lines.RemoveAll(l => l.Until < Time.unscaledTime);
+                float w = Screen.width * 0.5f;
                 foreach (var l in Lines)
                 {
                     _style.normal.textColor = l.Color;
-                    GUI.Label(new Rect(20, y, Screen.width * 0.5f, 48), l.Text, _style);
-                    y += 24f;
+                    // Advance by the line's REAL wrapped height, not a fixed 24 px:
+                    // a wrapped warning used to draw over the next line.
+                    float h = _style.CalcHeight(new GUIContent(l.Text), w);
+                    GUI.Label(new Rect(20, y, w, h), l.Text, _style);
+                    y += h + 4f;
                 }
             }
             if (Hear.Holding)
