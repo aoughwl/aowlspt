@@ -211,12 +211,13 @@ namespace Basement.Client
                         data.Value<bool?>("final") ?? false, wantsAck);
                     return;
                 case "heard.partial":
-                    Hud.Note("(hearing) " + (data.Value<string>("text") ?? ""), 3f);
+                    Hear.ShowPartial(data.Value<string>("text") ?? "");
                     return;
                 case "heard.final":
                 {
                     var text = data.Value<string>("text") ?? "";
                     var note = data.Value<string>("note") ?? "";
+                    Hear.OnHeardFinalEvent(text);
                     // An empty final is "not transcribed", never "the player said nothing".
                     if (text.Length == 0) Hud.Warn("heard nothing transcribable" + (note.Length > 0 ? " -- " + note : ""));
                     else Hud.Note("you: " + text);

@@ -41,6 +41,8 @@ namespace Basement.Client
         private static AudioSource _flat;   // the 2-D fallback source, on the plugin object
         public static int Segments, Subtitles, Flushes, Gaps, Played, Failed;
         public static string LastLine = "";
+        public static long SayStartedMs = -1;   // transcript landed (Hear.HeardFinalAtMs) -> first audio of the reply started
+        public static long LastLoadMs;          // wav on disk -> AudioClip, last segment
 
         public static void Enqueue(string personId, long seq, int idx, string wav, string text, bool final, bool ackWanted)
         {
@@ -104,7 +106,9 @@ namespace Basement.Client
                 return;
             }
             string why;
+            long t0 = Plugin.NowMs;
             var clip = LoadClip(s.Wav, out why);
+            LastLoadMs = Plugin.NowMs - t0;
             if (clip == null)
             {
                 Failed++;
@@ -137,6 +141,14 @@ namespace Basement.Client
             ch.Source = src;
             ch.Playing = s;
             Played++;
+            // The reply's FIRST audible segment after a transcript: that gap is
+            // what the player feels as "how long until they answer".
+            if (Hear.HeardFinalAtMs > 0)
+            {
+                SayStartedMs = Plugin.NowMs - Hear.HeardFinalAtMs;
+                Hear.HeardFinalAtMs = 0;
+                Plugin.Log.LogInfo("basement say: first audio " + SayStartedMs + " ms after the transcript (seg " + s.Idx + " of " + who + ", clip " + clip.length.ToString("0.00") + " s, wav->clip " + LastLoadMs + " ms).");
+            }
             if (s.AckWanted) Plugin.Link.Ack(s.Seq, true, "playing " + s.Wav + (bot != null ? " at bot " + bot.ProfileId : " (2-D)"));
         }
 

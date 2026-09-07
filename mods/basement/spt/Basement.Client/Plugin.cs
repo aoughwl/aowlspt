@@ -42,10 +42,19 @@ namespace Basement.Client
         internal static ConfigEntry<bool> MuteVanillaVoice;
         internal static ConfigEntry<bool> BindUnmatchedBots;
         internal static ConfigEntry<bool> TalkNeedsAddressee;
+        internal static ConfigEntry<bool> CaptureInProcess;
+        internal static ConfigEntry<string> MicDevice;
+        internal static ConfigEntry<int> ChunkMs;
+        internal static ConfigEntry<int> StatusEveryS;
 
         // ---- the main-thread queue: background threads enqueue, Update() drains ----
         private static readonly ConcurrentQueue<Action> MainQueue = new ConcurrentQueue<Action>();
         internal static void OnMain(Action a) { if (a != null) MainQueue.Enqueue(a); }
+
+        /// <summary>Milliseconds since the plugin loaded; any thread (Time.* is main-thread only).</summary>
+        private static readonly System.Diagnostics.Stopwatch Clock = System.Diagnostics.Stopwatch.StartNew();
+        internal static long NowMs => Clock.ElapsedMilliseconds;
+        private float _nextStatusAt;
 
         internal static readonly Link Link = new Link();
         internal static bool Started;            // the section-8 startup sequence finished
@@ -80,6 +89,14 @@ namespace Basement.Client
                 "HEURISTIC: map a backend person to a live bot whose profile nickname equals the person name. Without group.spawn (no actuator in 0.1.0) it is the only way any bot becomes addressable.");
             MuteVanillaVoice = Config.Bind("Voice", "MuteVanillaVoice", true,
                 "Drop every vanilla bot voice line (BotTalk.Say prefix) so the only voices are the world's people. Player VOIP is untouched.");
+            CaptureInProcess = Config.Bind("Voice", "CaptureInProcess", true,
+                "Capture the microphone IN-PROCESS (UnityEngine.Microphone) while the talk key is held and stream 16 kHz PCM chunks to /speech/chunk, so partial transcripts appear while you speak. Falls back to the backend recorder (/speech/ptt) when no device is available, said once. Off = always the backend recorder.");
+            MicDevice = Config.Bind("Voice", "MicDevice", "",
+                "Capture device name for in-process capture (one of Microphone.devices, logged at first use). Empty = the default device.");
+            ChunkMs = Config.Bind("Voice", "ChunkMs", 250,
+                "How often captured audio is read off the microphone ring and posted (CLIENT-CONTRACT section 3 recommends 200-400 ms). Chunks queued behind a slow request are merged, so a partial's whisper pass never drops audio.");
+            StatusEveryS = Config.Bind("Debug", "StatusEveryS", 60,
+                "Log the bridge status line (link, people, hear/say counters) every N seconds once started. 0 = never.");
             BindUnmatchedBots = Config.Bind("Voice", "BindUnmatchedBots", true,
                 "FALLBACK binding: a live bot with no nickname match becomes the nearest unbound world person on this map (else any unbound person, logged as relocated). Without it, ordinary SPT bots (random nicknames) are never addressable and nobody talks.");
 
@@ -178,6 +195,26 @@ namespace Basement.Client
             try { Hear.Tick(); } catch (Exception ex) { if (Once("hear-throw:" + ex.Message)) Log.LogError("basement hear: " + ex); }
             try { Say.Tick(); } catch (Exception ex) { if (Once("say-throw:" + ex.Message)) Log.LogError("basement say: " + ex); }
             try { Spawn.Tick(); } catch (Exception ex) { if (Once("spawn-throw:" + ex.Message)) Log.LogError("basement spawn: " + ex); }
+            if (Started && StatusEveryS.Value > 0 && Time.unscaledTime >= _nextStatusAt)
+            {
+                _nextStatusAt = Time.unscaledTime + StatusEveryS.Value;
+                Log.LogInfo(StatusLine());
+            }
+        }
+
+        /// <summary>The bridge status, one line -- the counters every subsystem keeps. Any thread.</summary>
+        internal static string StatusLine()
+        {
+            return "basement status: startup=" + StartupNote +
+                " | link=" + Link.State + " cursor=" + Link.Cursor + " polls=" + Link.Polls + " events=" + Link.Events + " directives=" + Link.Directives +
+                " acks=" + Link.Acks + " holes=" + Link.Holes + " observed=" + Link.Observed +
+                " | people known=" + People.KnownCount + " mapped=" + People.MappedCount + " binds=" + People.Binds +
+                " | hear mode=" + Hear.Mode + " sessions=" + Hear.Sessions + " refused=" + Hear.Refused + " sttChunksSent=" + Hear.SttChunksSent +
+                " sttBytesSent=" + Hear.SttBytesSent + " sttChunkFails=" + Hear.SttChunkFails + " partialsShown=" + Hear.PartialsShown +
+                " brainAsks=" + Hear.BrainAsks + " micFails=" + Hear.MicFails + " micRate=" + Hear.MicRate + " micWarmupMs=" + Hear.MicWarmupMs +
+                " lastFinalMs=" + Hear.LastFinalMs + " mic=" + Hear.MicNote +
+                " | say segments=" + Say.Segments + " played=" + Say.Played + " subtitles=" + Say.Subtitles + " failed=" + Say.Failed +
+                " flushes=" + Say.Flushes + " gaps=" + Say.Gaps + " sayStartedMs=" + Say.SayStartedMs + " lastLoadMs=" + Say.LastLoadMs;
         }
 
         private void OnGUI()
