@@ -32,6 +32,7 @@ namespace Basement.Client
         private Thread _thread;
         private volatile bool _running;
         private long _since;
+        private int _transportFails;
         private long _latest;
         private long _first;
         private bool _haveCursor;
@@ -97,9 +98,23 @@ namespace Basement.Client
                             (r.Error != null ? ", transport: " + r.Error : "") + ". Cursor unchanged (" + _since +
                             "), retrying every " + RetryMs + " ms. Said once per status.");
                     immediate = false;
+                    // A TRANSPORT failure (HTTP 0) three polls running means the
+                    // sidecar is gone, not busy. MEASURED 2026-09-07: the backend
+                    // died on an AssertionDefect mid-raid and every request failed
+                    // for the rest of the raid. Sidecar.Ensure() is idempotent: it
+                    // returns at once when /status answers or another backend
+                    // process exists, so this cannot start a second one.
+                    if (r.Error != null && r.Status == 0) _transportFails++; else _transportFails = 0;
+                    if (_transportFails == 3 && Plugin.SidecarAutoStart.Value)
+                    {
+                        Plugin.Log.LogWarning("basement link: 3 transport failures in a row -- asking Sidecar.Ensure() to restart the backend.");
+                        try { Sidecar.Ensure(); } catch (Exception ex) { Plugin.Log.LogWarning("basement link: Sidecar.Ensure threw " + ex.Message); }
+                        _transportFails = 0;
+                    }
                     Thread.Sleep(RetryMs);
                     continue;
                 }
+                _transportFails = 0;
                 immediate = Consume(r.Json);
             }
             State = "stopped";
@@ -157,7 +172,13 @@ namespace Basement.Client
 
         private void Dispatch(long seq, string kind, JObject data)
         {
-            bool wantsAck = data.Value<bool?>("ack") ?? false;
+            // MEASURED 2026-09-07: the backend's event JSON carried no `ack` field at
+            // all, so every directive was silently "passive" here and dropped after
+            // ttl on the other side. Until the backend writes it, a directive kind
+            // (anything not in the passive set below) wants an ack.
+            bool? ackField = data.Value<bool?>("ack");
+            bool wantsAck = ackField ?? !(kind == "say" || kind.StartsWith("heard.") || kind == "hud.note" ||
+                                          kind == "world.saved" || kind.StartsWith("directive.") || kind.StartsWith("quest."));
             if (wantsAck) Directives++;
             switch (kind)
             {
