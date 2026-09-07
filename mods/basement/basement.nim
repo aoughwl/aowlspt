@@ -72,6 +72,8 @@ const
   EventsRoute    = Base & "/events"
   AckRoute       = Base & "/ack"
   SpawnRoute     = Base & "/spawn"
+  SptBotsRoute   = Base & "/spt/bots"     ## POST {map, raidId, wave, requested[]} -> the emulator's plant shape + limits
+  SptWavesRoute  = Base & "/spt/waves"    ## GET ?map=&raidId= -> {ok, clear, waves[], bossWaves[]} (EFT-native rows)
   SceneRoute     = Base & "/world/scene"
   LootRoute      = Base & "/world/loot"
   CachesRoute    = Base & "/world/caches"
@@ -3230,6 +3232,81 @@ proc onDebugTick(url, body, session: string): string =
   o.put("turnsFinished", gTurnsFinished)
   result = done(o).text
 
+# --- spt begin (docs/SPT415-BOT-CONTROL.md section 4: Basement.Server's two routes) ---
+proc onSptBots(url, body, session: string): string =
+  ## Basement.Server (SPT 4.1.5) asks once per /client/game/bot/generate.
+  ## Same brain, same rows as tarkov.bots.compose; `requested` is the client's
+  ## own {role, limit, difficulty} list and every group is re-keyed onto one
+  ## of those roles (a "guard" is an "assault" to SPT). `limits` is left out:
+  ## SPT keeps the client's counts unless the world decides otherwise.
+  if not gEnabled: return disabledJson()
+  var map = jr.asText(jr.field(body, "map"), "")
+  if map.len == 0: map = queryValue(url, "map")
+  let raidId = jr.asText(jr.field(body, "raidId"), "")
+  if map.len == 0:
+    return errJson("no `map`: POST " & SptBotsRoute & " {map, raidId, wave, requested:[{role,limit,difficulty}]}")
+  var firstRole = "assault"
+  var requestedRoles: seq[string] = @[]
+  let reqJ = jr.field(body, "requested")
+  for i in 0 ..< jr.count(reqJ):
+    let role = jr.asText(jr.field(jr.at(reqJ, i), "role"), "")
+    if role.len > 0:
+      requestedRoles.add role
+      if requestedRoles.len == 1: firstRole = role
+  var text = ""
+  withModLock:
+    text = composeBotsPlant(raidId, map)
+  # Re-key: a group whose role is not one the client asked for is served under
+  # the first requested role, and its basement role survives as `factionRole`.
+  var groups = arr()
+  let groupsJ = jr.field(text, "groups")
+  for gi in 0 ..< jr.count(groupsJ):
+    let g = jr.at(groupsJ, gi)
+    var go = obj()
+    let role = jr.asText(jr.field(g, "role"), "")
+    var known = false
+    for r in requestedRoles:
+      if r == role: known = true
+    go.put("groupId", jr.asText(jr.field(g, "groupId"), ""))
+    go.put("factionId", jr.asText(jr.field(g, "factionId"), ""))
+    go.put("factionRole", role)
+    go.put("role", if known: role else: firstRole)
+    go.put("count", jr.asInt(jr.field(g, "count"), 0))
+    var names = arr()
+    let namesJ = jr.field(g, "names")
+    for ni in 0 ..< jr.count(namesJ):
+      names.add jr.asText(jr.at(namesJ, ni), "")
+    go.put("names", names)
+    go.put("x", jr.asFloat(jr.field(g, "x"), 0.0))
+    go.put("y", jr.asFloat(jr.field(g, "y"), 0.0))
+    go.put("z", jr.asFloat(jr.field(g, "z"), 0.0))
+    groups.add go
+  var o = obj()
+  o.put("ok", true)
+  o.put("raidId", raidId)
+  o.put("map", map)
+  o.put("wave", jr.asInt(jr.field(body, "wave"), 0))
+  o.put("groups", groups)
+  gBotsComposeN = gBotsComposeN + 1
+  result = done(o).text
+
+proc onSptWaves(url, body, session: string): string =
+  ## Stub until the world model owns waves: `ok:false` tells Basement.Server
+  ## to keep SPT's stock waves for this raid, and says why on the SPT log.
+  ## When it is real, `waves`/`bossWaves` carry EFT-native rows exactly as in
+  ## locations/<map>/base.json (Wave: BotPreset, BotSide, SpawnPoints=zone,
+  ## WildSpawnType, slots_min/max, time_min/max; BossLocationSpawn: BossName,
+  ## BossZone, BossChance, Time, Delay, ...).
+  if not gEnabled: return disabledJson()
+  let map = queryValue(url, "map")
+  var o = obj()
+  o.put("ok", false)
+  o.put("map", map)
+  o.put("clear", false)
+  o.put("note", "no wave plan for `" & map & "`: the basement world does not decide waves yet; SPT's own waves stand")
+  result = done(o).text
+# --- spt end ---
+
 proc onLoad(): Status =
   declareSettings(basementSchema())
   if side() == sideClient:
@@ -3323,6 +3400,8 @@ proc onLoad(): Status =
   discard servePrefix(EventsRoute, onEvents)
   discard serve(AckRoute, onAck)
   discard serve(SpawnRoute, onSpawn)
+  discard serve(SptBotsRoute, onSptBots)
+  discard servePrefix(SptWavesRoute, onSptWaves)
   discard serve(SelfcheckRoute, onSelfcheck)
   if gDebugTickRoute: discard serve(TickRoute, onDebugTick)
 
