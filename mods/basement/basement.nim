@@ -715,7 +715,18 @@ proc onPtt(url, body, session: string): string =
       eo.put("source", "ptt")
       eo.put("note", note)
       discard emitEvent("heard.final", done(eo).text, false)
-      let addressee = captiveOf()
+      # The addressee is whoever the CLIENT says the player is talking to
+      # (`personId` in the ptt body -- the SPT plugin latches the bot in the
+      # view cone; bridge/see.nim will do the same), falling back to the
+      # captor when the client names nobody. MEASURED 2026-09-07 (first live
+      # transcripts "Hey, how are you doing?"): the brain was never asked
+      # because only captiveOf() was consulted, so nobody ever answered.
+      var addressee = jr.asText(jr.field(body, "personId"), "")
+      if addressee.len > 0 and findPerson(addressee) < 0:
+        o.put("addresseeNote", "the client named person '" & addressee &
+              "' but no such person exists in this world; falling back")
+        addressee = ""
+      if addressee.len == 0: addressee = captiveOf()
       if addressee.len == 0:
         o.put("spokeTo", "")
         o.put("sayNote", "nobody was addressed: the encounter machine holds " &
