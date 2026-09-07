@@ -14,39 +14,53 @@ says MEASURED.
 
 ## Layout
 
+Since 2026-09-07 this is TWO plugins plus an example (see `API.md`):
+
 ```
 spt/
   NuGet.Config                   nuget.org + https://nuget.bepinex.dev (BepInEx.* are NOT on nuget.org -- MEASURED NU1101)
-  Basement.Client/
-    Basement.Client.csproj       netstandard2.1, BepInEx.Core 5.*, refs from D:\SPT415 (shape of SPT-FOV-Fix\FOVFix.csproj)
-    Plugin.cs                    [BepInPlugin("aowl.basement", "Escape From My Basement", "0.1.0")], config, startup (contract section 8), main-thread queue
-    Http.cs                      one HttpClient; three outcomes (transport error / status / JSON)
-    Link.cs                      long poll GET /events?since=&wait=&limit=64, persisted cursor, firstSeq hole detection, dispatch, POST /ack, POST /observe
-    People.cs                    GET /world/people cache + personId -> live bot map (+ the nickname HEURISTIC)
+  Aowl.sln                       Aowl.Api + Basement.Client + Examples/HelloAowl
+  API.md                         the public surface of aowl.api, one example per class, route map, compatibility rule
+  Aowl.Api/                      [BepInPlugin("aowl.api", "Aowl API", "0.1.0")] -- the library every consumer depends on
+    AowlApi.cs                   config ([Backend] Url/Enabled/PollWaitMs, [Sidecar]), startup, main-thread queue, status line
+    AowlHttp.cs                  one HttpClient; three outcomes (transport error / status / JSON)      (was Basement.Client/Http.cs)
+    AowlBackend.cs               sidecar start, GET /status, version check, WaitReady, EnsureWorld    (was Sidecar.cs)
+    Link.cs + AowlEvents.cs      long poll, persisted cursor, hole/restart detection, directive REGISTRY, typed events (was Link.cs)
+    AowlBrain.cs                 Ask (POST /say -> streamed sentences), Observe, Ack
+    AowlSpeech.cs                Say (wav at a transform/position/2-D, clip cache), Listen (push-to-talk -> /speech/chunk), PushToTalk (/speech/ptt)
+    AowlWorld.cs                 typed people / person / scene / loot / caches / spawn queries
+    Pcm.cs                       the 16 kHz resampler (ChunkCheck links this file)                     (was Basement.Client/Pcm.cs)
+  Basement.Client/               [BepInPlugin("aowl.basement", ...)] [BepInDependency("aowl.api")] -- the game-facing consumer
+    Plugin.cs                    config ([Backend] Enabled/Preset/NoticeM, [Voice], [Raid], [Debug]), handler registration, startup on top of the API
+    People.cs                    personId -> live bot map (nickname HEURISTIC + proximity FALLBACK) over AowlWorld.People
     Say.cs                       say segments: per-person queue, seq order, no wait for final, wav -> AudioClip, spatial at the bot or 2-D
     See.cs                       facts: raid_started/ended, tick, player_moved, player_seen/lost, player_aimed_at, player_lowered_weapon, player_fired, player_hit, player_died, npc_died
-    Hear.cs                      push-to-talk key -> POST /speech/ptt {session, state, personId}
-    Sidecar.cs                   starts aowlspt-backend.exe when /status does not answer in 2 s; never a second one
-    Spawn.cs                     MenuScreen.Show postfix -> GET /spawn -> log the map; AutoRaidStart=true actually starts the offline raid
+    Hear.cs                      talk key + in-process microphone -> AowlSpeech.Listen; backend-recorder fallback via AowlSpeech.PushToTalk
+    Spawn.cs                     MenuScreen.Show postfix -> AowlWorld.Spawn -> log the map; AutoRaidStart=true actually starts the offline raid
+    Mute.cs                      BotTalk.Say prefix: vanilla bot voice lines dropped
     Hud.cs                       IMGUI subtitles / notes
+  Examples/HelloAowl/            a 60-line third-party-style consumer: F9 asks the nearest person its name and plays the reply
+  ChunkCheck/                    offline proof of the speech-in path (resampler self-check + a real stream to /speech/chunk)
   MemberCheck/                   the offline verifier (dotnet, Mono.Cecil from BepInEx\core)
 ```
 
 ## Build
 
 ```
-dotnet build mods/basement/spt/Basement.Client/Basement.Client.csproj -c Release
-    -> D:\SPT415\BepInEx\plugins\Basement.Client.dll       (the csproj default OutDir, like FOVFix)
-dotnet build ... -c Release -p:OutDir=<somewhere else>\    (never touches D:\SPT415)
+dotnet build mods/basement/spt/Aowl.sln -c Release -p:OutDir=<somewhere>\
+    -> Aowl.Api.dll + Aowl.Api.xml + Basement.Client.dll + HelloAowl.dll     (never touches D:\SPT415)
+dotnet build mods/basement/spt/Aowl.sln -c Release
+    -> D:\SPT415\BepInEx\plugins\                                            (the csproj default OutDir, like FOVFix)
 ```
 
 `SPT_INSTALL_DIR` or `-p:SptInstallDir=` overrides `D:\SPT415`. Needs `dotnet`
 (10.0.400 at `C:\Program Files\dotnet`) and the BepInEx feed in `NuGet.Config`.
+Both `Aowl.Api.dll` and `Basement.Client.dll` go in `BepInEx\plugins`; the
+basement plugin refuses to load without `aowl.api` (hard dependency).
 
-MEASURED 2026-09-06 (`-p:OutDir=<scratchpad>\sptbuild\`):
+MEASURED 2026-09-07 (`Aowl.sln`, `-p:OutDir=<scratchpad>\sptbuild\`):
 
 ```
-  Basement.Client -> ...\scratchpad\sptbuild\Basement.Client.dll
 Build succeeded.
     0 Warning(s)
     0 Error(s)
@@ -54,7 +68,8 @@ Build succeeded.
 
 Two compile facts worth keeping: Assembly-CSharp declares a **global `Paths`
 type** that shadows `BepInEx.Paths` (write `BepInEx.Paths.ConfigPath`), and
-`FontStyle` needs `UnityEngine.TextRenderingModule.dll`.
+`FontStyle` needs `UnityEngine.TextRenderingModule.dll`. A third from the
+split: `EFT.SpawnInfo` exists, so the API's record is `SpawnPlace`.
 
 ## The sidecar root
 
@@ -92,21 +107,31 @@ engine probes report their own paths on `/status`.)
 that starts it** (the game, when the plugin auto-starts the sidecar). There is
 no key in this plugin, its config, or this repo.
 
-## Config (`BepInEx\config\aowl.basement.cfg`)
+## Config
+
+`BepInEx\config\aowl.api.cfg` (the library; see API.md):
 
 | key | default | meaning |
 |---|---|---|
-| Backend.BackendUrl | `http://127.0.0.1:6970` | sidecar base URL |
+| Backend.Url | `http://127.0.0.1:6970` | sidecar base URL |
 | Backend.Enabled | `false` | master switch; off = one log line, nothing else |
 | Backend.PollWaitMs | `20000` | `/events` hold time (backend clamps at 25000) |
+| Sidecar.AutoStart / SidecarExe / SidecarRoot / SidecarPort | see above | |
+
+`BepInEx\config\aowl.basement.cfg` (this plugin):
+
+| key | default | meaning |
+|---|---|---|
+| Backend.Enabled | `false` | master switch for the basement client |
 | Backend.Preset | `` | `POST /world/new {preset}` when there is no world |
 | Backend.NoticeM | `25` | fallback; `/status encounters.noticeM` wins |
 | Voice.PushToTalkKey | `V` | hold to talk |
 | Voice.TalkNeedsAddressee | `true` | contract 6.5: no addressee = no session |
-| Voice.MatchPeopleByName | `true` | HEURISTIC person->bot mapping by profile nickname |
+| Voice.MatchPeopleByName / BindUnmatchedBots | `true` | HEURISTIC nickname mapping / proximity FALLBACK |
+| Voice.CaptureInProcess / MicDevice / ChunkMs | `true` / `` / `250` | in-process microphone -> /speech/chunk |
+| Voice.MuteVanillaVoice | `true` | drop vanilla bot voice lines |
 | Raid.SpawnOnMenu | `true` | `GET /spawn` on the menu and log the map |
 | Raid.AutoRaidStart | `false` | actually start that raid from code |
-| Sidecar.AutoStart / SidecarExe / SidecarRoot / SidecarPort | see above | |
 
 ## Verified vs stubbed
 

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Threading.Tasks;
+using Aowl.Api;
 using EFT;
 using EFT.UI;
 using EFT.UI.Matchmaker;
@@ -88,34 +89,33 @@ namespace Basement.Client
             Requests++;
             Task.Run(async () =>
             {
-                var r = await Http.GetAsync(Http.Route("/spawn"), 10000).ConfigureAwait(false);
+                var r = await AowlWorld.SpawnAsync().ConfigureAwait(false);
                 Plugin.OnMain(() => OnSpawnReply(r));
             });
         }
 
         private static int _armedAtEnds;
 
-        private static void OnSpawnReply(Http.Reply r)
+        private static void OnSpawnReply(Result<SpawnPlace> r)
         {
             _requestPending = false;
-            if (r.Error != null || r.Status != 200 || r.Json == null)
+            if (!r.Ok)
             {
-                Refusals++; LastWhy = "GET /spawn answered " + r.Err;
-                if (Plugin.Once("spawn-http:" + r.Status)) Plugin.Log.LogWarning("basement spawn: " + LastWhy);
+                Refusals++; LastWhy = r.Error;
+                if (Plugin.Once("spawn-http:" + r.Error)) Plugin.Log.LogWarning("basement spawn: " + LastWhy);
                 return;
             }
-            // The map sits under `spawn` (MEASURED: basement.nim onSpawn puts {map,x,y,z,reason} in `spawn`).
-            var sp = r.Json["spawn"] as JObject ?? r.Json;
-            var map = sp.Value<string>("map") ?? "";
-            if (!(r.Json.Value<bool?>("ok") ?? false) || map.Length == 0)
+            var sp = r.Value;
+            var map = sp.Map;
+            if (map.Length == 0)
             {
-                Refusals++; LastWhy = r.Json.Value<string>("err") ?? "the backend answered ok:false with no map";
+                Refusals++; LastWhy = sp.Err ?? "the backend answered ok:false with no map";
                 if (Plugin.Once("spawn-notok:" + LastWhy)) Plugin.Log.LogWarning("basement spawn: the backend declined to place the player -- " + LastWhy);
                 return;
             }
             LastMap = map;
-            LastReason = sp.Value<string>("reason") ?? "";
-            Plugin.Log.LogInfo("basement spawn: the world wants the player on map \"" + map + "\" at " + sp.Value<float?>("x") + "," + sp.Value<float?>("y") + "," + sp.Value<float?>("z") + " (" + LastReason + ")");
+            LastReason = sp.Reason;
+            Plugin.Log.LogInfo("basement spawn: the world wants the player on map \"" + map + "\" at " + sp.X + "," + sp.Y + "," + sp.Z + " (" + LastReason + ")");
             Hud.Note("basement: next raid -> " + map + " (" + LastReason + ")", 8f);
             if (!Plugin.AutoRaidStart.Value)
             {

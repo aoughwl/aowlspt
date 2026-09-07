@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
-using System.Threading;
-using Newtonsoft.Json.Linq;
+using Aowl.Api;
 using UnityEngine;
 
 namespace Basement.Client
@@ -12,9 +11,9 @@ namespace Basement.Client
     /// MIC MODE (default, Voice.CaptureInProcess=true): while the key is held
     /// the microphone is captured IN-PROCESS with UnityEngine.Microphone into a
     /// 30 s looping clip; every Voice.ChunkMs the new samples are read off the
-    /// ring on the main thread, converted to 16 kHz mono PCM16 (Pcm.cs) and
-    /// handed to ONE sender thread that POSTs them in order to /speech/chunk
-    /// {session, seq, wavBase64, final, personId@seq0}. The backend runs
+    /// ring on the main thread and pushed into an Aowl.Api ListenSession,
+    /// which resamples to 16 kHz mono PCM16 and POSTs the chunks in order to
+    /// /speech/chunk {session, seq, wavBase64, final, personId@seq0}. The backend runs
     /// whisper on the growing buffer and answers partials; key-up sends
     /// final:true (with the last samples) and the reply carries the transcript.
     ///
@@ -23,12 +22,10 @@ namespace Basement.Client
     /// the backend records on this machine, as before. The fallback is said
     /// ONCE with the reason; the mode is in the status line.
     ///
-    /// THE BRAIN: /speech/chunk's final reply carries the transcript but the
-    /// backend's chunk route does not hand it to the brain (basement.nim
-    /// onChunk emits heard.final only; only the /speech/ptt `up` route calls
-    /// speakTurn, MEASURED 2026-09-07). So in mic mode this client POSTs
-    /// /say {person, text} itself -- unless the final reply carries `spokeTo`,
-    /// which is the ptt-up shape and means the backend already asked.
+    /// THE BRAIN: the final reply's `spokeTo` says whether the backend handed
+    /// the transcript to the brain itself (ListenResult.SpokeTo != null). An
+    /// older backend's chunk route did not (MEASURED 2026-09-07), so when it
+    /// is absent this client asks through AowlBrain.Ask (POST /say) itself.
     ///
     /// The addressee is latched at key down (CLIENT-CONTRACT section 6.6) and
     /// named in the first chunk / the down post; `final` / `up` is always sent,
@@ -44,8 +41,10 @@ namespace Basement.Client
 
         // ---- the status counters ----
         public static volatile string Mode = "none";      // mic | backend | none
-        public static int SttChunksSent, SttChunkFails, PartialsShown, MicFails, BrainAsks;
-        public static long SttBytesSent;                   // raw PCM bytes (before base64)
+        public static int PartialsShown, MicFails, BrainAsks;
+        public static int SttChunksSent => AowlSpeech.SttChunksSent;
+        public static int SttChunkFails => AowlSpeech.SttChunkFails;
+        public static long SttBytesSent => AowlSpeech.SttBytesSent;   // raw PCM bytes (before base64)
         public static volatile string MicNote = "not tried";
         public static int MicRate;                          // the frequency Unity actually granted
         public static int MicWarmupMs = -1;                 // Start() -> first sample, measured once per session
@@ -60,16 +59,9 @@ namespace Basement.Client
         private static int _readPos;
         private static bool _prewarmFailed;
         private static float _lastChunkAt, _downAt, _startedAt;
-        private static int _seq;
-        private static Resampler _rs;
         private static string _lastPartial = "";
         private static long _upAtMs;
-
-        // ---- the sender (one thread, in order) ----
-        private sealed class Chunk { public string Session, Person; public int Seq; public byte[] Pcm; public bool Final; public long UpAtMs; }
-        private static readonly Queue<Chunk> Outbox = new Queue<Chunk>();
-        private static readonly AutoResetEvent Wake = new AutoResetEvent(false);
-        private static Thread _sender;
+        private static ListenSession _listen;              // the API session for the current mic-mode utterance
 
         public static void Tick()
         {
@@ -108,7 +100,6 @@ namespace Basement.Client
             Sessions++;
             Downs++;
             Holding = true;
-            Session = "spt-" + Guid.NewGuid().ToString("N");
             LatchedPerson = who;
             LatchedName = who != null ? People.NameOf(who) : null;
             _lastPartial = "";
@@ -117,8 +108,10 @@ namespace Basement.Client
             if (Plugin.CaptureInProcess.Value && StartMic(out why))
             {
                 Mode = "mic";
+                OpenSession();
                 return;
             }
+            Session = "spt-" + Guid.NewGuid().ToString("N");
             if (Plugin.CaptureInProcess.Value)
             {
                 MicFails++;
@@ -151,9 +144,8 @@ namespace Basement.Client
         {
             PumpMic(true);
             Plugin.Log.LogInfo("basement hear: the key has been held " + MaxUtteranceSeconds + " s -- session " + Session + " finalised and a new one opened for " + (LatchedName ?? "nobody") + " (whisper's cost is superlinear in buffer length).");
-            Session = "spt-" + Guid.NewGuid().ToString("N");
+            OpenSession();
             Sessions++;
-            _seq = 0;
             _downAt = Time.unscaledTime;
             _lastPartial = "";
             _upAtMs = 0;
@@ -194,12 +186,9 @@ namespace Basement.Client
             if (running)
             {
                 try { _readPos = Microphone.GetPosition(_dev); } catch { _readPos = 0; }
-                _rs = new Resampler(MicRate, 16000);
-                _seq = 0;
                 _startedAt = Time.unscaledTime;
                 _lastChunkAt = _startedAt;
                 MicWarmupMs = 0;
-                EnsureSender();
                 return true;
             }
             try
@@ -210,9 +199,7 @@ namespace Basement.Client
             catch (Exception ex) { why = "Microphone.Start threw " + ex.GetType().Name + ": " + ex.Message; _clip = null; return false; }
             if (_clip == null) { why = "Microphone.Start(" + (_dev ?? "default") + ", loop, 30 s, " + freq + " Hz) returned null"; return false; }
             MicRate = _clip.frequency;
-            _rs = new Resampler(MicRate, 16000);
             _readPos = 0;
-            _seq = 0;
             _startedAt = Time.unscaledTime;
             _lastChunkAt = _startedAt;
             MicWarmupMs = -1;
@@ -220,7 +207,6 @@ namespace Basement.Client
             if (Plugin.Once("mic-ok"))
                 Plugin.Log.LogInfo("basement hear: in-process capture works -- devices [" + string.Join(" | ", devs) + "]; " + MicNote +
                     ". The game did NOT hold the microphone exclusively. Said once.");
-            EnsureSender();
             return true;
         }
 
@@ -282,112 +268,57 @@ namespace Basement.Client
                 for (int i = 0; i < mono.Length; i++) mono[i] = samples[i * ch];
                 samples = mono;
             }
-            Enqueue(_rs.Push(samples, samples.Length), final);
+            if (_listen != null) _listen.Push(samples, samples.Length, MicRate, final);
         }
 
         private static void Enqueue(byte[] pcm, bool final)
         {
-            var c = new Chunk { Session = Session, Person = LatchedPerson ?? "", Seq = _seq++, Pcm = pcm, Final = final, UpAtMs = final ? _upAtMs : 0 };
-            lock (Outbox) Outbox.Enqueue(c);
-            Wake.Set();
+            if (_listen == null) return;
+            _listen.Push(pcm, final);
         }
 
-        // ------------------------------------------------------------ the sender thread
+        // ------------------------------------------------------------ the API session (chunks go through Aowl.Api's sender thread)
 
-        private static void EnsureSender()
+        /// <summary>Main thread. One ListenSession per utterance; its events land on the main thread.</summary>
+        private static void OpenSession()
         {
-            if (_sender != null && _sender.IsAlive) return;
-            _sender = new Thread(SenderLoop) { IsBackground = true, Name = "basement-stt" };
-            _sender.Start();
-        }
-
-        private static void SenderLoop()
-        {
-            while (true)
+            var person = LatchedPerson ?? "";
+            var sess = AowlSpeech.Listen(person);
+            _listen = sess;
+            Session = sess.Id;
+            sess.Partial += ShowPartial;
+            sess.Failed += (why, final) =>
             {
-                Chunk c = null;
-                lock (Outbox)
-                {
-                    if (Outbox.Count > 0)
-                    {
-                        c = Outbox.Dequeue();
-                        // Coalesce: a partial's whisper pass runs INSIDE the chunk
-                        // request (backend, under the mod lock), so chunks pile up
-                        // behind it; merging them keeps seq dense and the audio whole.
-                        while (Outbox.Count > 0 && !c.Final && Outbox.Peek().Session == c.Session)
-                        {
-                            var n = Outbox.Dequeue();
-                            var merged = new byte[c.Pcm.Length + n.Pcm.Length];
-                            Array.Copy(c.Pcm, merged, c.Pcm.Length);
-                            Array.Copy(n.Pcm, 0, merged, c.Pcm.Length, n.Pcm.Length);
-                            c.Pcm = merged; c.Final = n.Final; c.UpAtMs = n.UpAtMs;
-                        }
-                    }
-                }
-                if (c == null) { Wake.WaitOne(500); continue; }
-                try { Send(c); }
-                catch (Exception ex) { if (Plugin.Once("stt-send-throw:" + ex.GetType().Name)) Plugin.Log.LogError("basement hear: sender threw " + ex); }
-            }
-        }
-
-        private static void Send(Chunk c)
-        {
-            var body = new JObject { ["session"] = c.Session, ["seq"] = c.Seq, ["final"] = c.Final };
-            if (c.Pcm.Length > 0) body["wavBase64"] = Convert.ToBase64String(c.Pcm);
-            if (c.Seq == 0) body["personId"] = c.Person;   // section 6.7: the addressee travels in the first chunk
-            var text = body.ToString(Newtonsoft.Json.Formatting.None);
-            var r = Http.Post(Http.Route("/speech/chunk"), text, c.Final ? 120000 : 30000);
-            if (!r.Ok)
+                if (final) Hud.Warn("talk: " + why, 4f);
+            };
+            sess.Final += res =>
             {
-                SttChunkFails++;
-                if (Plugin.Once("chunk-fail:" + r.Status + ":" + r.Err))
-                    Plugin.Log.LogWarning("basement hear: POST /speech/chunk seq " + c.Seq + (c.Final ? " (final)" : "") + " answered " + r.Err + " (HTTP " + r.Status + "). Said once per status and note.");
-                if (c.Final) Plugin.OnMain(() => Hud.Warn("talk: " + r.Err, 4f));
-                return;
-            }
-            SttChunksSent++;
-            SttBytesSent += c.Pcm.Length;
-            var partial = r.Json.Value<string>("partial") ?? "";
-            var note = r.Json.Value<string>("note") ?? "";
-            if (partial.Length > 0) Plugin.OnMain(() => ShowPartial(partial));
-            if (!c.Final) return;
-            var fin = r.Json.Value<string>("final") ?? "";
-            if (c.UpAtMs > 0) LastFinalMs = Plugin.NowMs - c.UpAtMs;
-            Plugin.Log.LogInfo("basement hear: final for " + c.Session + " after " + LastFinalMs + " ms: \"" + fin + "\" -- " + note);
-            bool backendAsked = r.Json["spokeTo"] != null;
-            Plugin.OnMain(() =>
-            {
+                if (res.ElapsedMs > 0) LastFinalMs = res.ElapsedMs;
+                var fin = res.Text ?? "";
+                var note = res.Note ?? "";
                 if (fin.Length == 0) { Hud.Warn("not transcribed" + (note.Length > 0 ? ": " + note : "")); return; }
                 Hud.Note("you: " + fin);
                 if (HeardFinalAtMs == 0) HeardFinalAtMs = Plugin.NowMs;
-            });
-            if (fin.Length == 0 || backendAsked) return;
-            AskBrain(c.Person, fin);
+                if (res.SpokeTo != null) return;   // the backend already asked the brain (or explained why not in SayNote)
+                AskBrain(person, fin);
+            };
         }
 
-        /// <summary>Sender thread. POST /say {person, text}; the reply's segments arrive on the event stream as `say`.</summary>
+        /// <summary>Main thread. AowlBrain.Ask (POST /say {person, text}); the reply's segments arrive on the event stream as `say`.</summary>
         private static void AskBrain(string person, string text)
         {
             if (string.IsNullOrEmpty(person))
             {
                 if (Plugin.Once("brain-nobody")) Plugin.Log.LogInfo("basement hear: transcript with no addressee -- nobody is asked (TalkNeedsAddressee=false). Said once.");
-                Plugin.OnMain(() => Hud.Warn("nobody was addressed; the line went to no one", 3f));
+                Hud.Warn("nobody was addressed; the line went to no one", 3f);
                 return;
             }
             if (Plugin.Once("brain-via-say"))
-                Plugin.Log.LogInfo("basement hear: /speech/chunk's final reply carried no `spokeTo`, so this client hands the transcript to the brain itself via POST /say. Said once.");
+                Plugin.Log.LogInfo("basement hear: /speech/chunk's final reply carried no `spokeTo`, so this client hands the transcript to the brain itself via AowlBrain.Ask. Said once.");
             BrainAsks++;
-            var body = new JObject { ["person"] = person, ["text"] = text };
-            var r = Http.Post(Http.Route("/say"), body.ToString(Newtonsoft.Json.Formatting.None), 180000);
-            if (!r.Ok)
-            {
-                if (Plugin.Once("say-fail:" + r.Status + ":" + r.Err)) Plugin.Log.LogWarning("basement hear: POST /say answered " + r.Err + " (HTTP " + r.Status + "). Said once per status and note.");
-                Plugin.OnMain(() => Hud.Warn("no answer: " + r.Err, 4f));
-                return;
-            }
-            var segs = r.Json["segments"] as JArray;
-            Plugin.Log.LogInfo("basement hear: /say answered for " + People.NameOf(person) + " -- tier=" + (r.Json.Value<string>("tier") ?? "") +
-                " engine=" + (r.Json.Value<string>("engine") ?? "") + " ms=" + (r.Json.Value<int?>("ms") ?? 0) + " segments=" + (segs?.Count ?? 0) +
+            var ask = AowlBrain.Ask(person, text);
+            ask.Failed += why => Hud.Warn("no answer: " + why, 4f);
+            ask.Answered += r => Plugin.Log.LogInfo("basement hear: /say answered for " + People.NameOf(person) + " -- tier=" + r.Tier + " engine=" + r.Engine + " ms=" + r.Ms +
                 " (the segments play from the event stream, not from this reply)");
         }
 
@@ -411,23 +342,20 @@ namespace Basement.Client
 
         private static void Post(string state)
         {
-            var body = new JObject { ["session"] = Session, ["state"] = state, ["personId"] = LatchedPerson ?? "" };
-            var text = body.ToString(Newtonsoft.Json.Formatting.None);
-            System.Threading.Tasks.Task.Run(async () =>
+            AowlSpeech.PushToTalk(Session, state, LatchedPerson ?? "", r =>
             {
-                var r = await Http.PostAsync(Http.Route("/speech/ptt"), text, 15000).ConfigureAwait(false);
                 if (!r.Ok)
                 {
                     if (Plugin.Once("ptt-fail:" + state + ":" + r.Status))
                         Plugin.Log.LogWarning("basement hear: POST /speech/ptt " + state + " answered " + r.Err + " (HTTP " + r.Status + "). Said once per state and status.");
-                    Plugin.OnMain(() => Hud.Warn("talk: " + r.Err, 4f));
+                    Hud.Warn("talk: " + r.Err, 4f);
                     return;
                 }
                 var note = r.Json.Value<string>("note") ?? "";
                 if (state == "up")
                 {
                     var fin = r.Json.Value<string>("final") ?? "";
-                    Plugin.OnMain(() => { if (fin.Length == 0) Hud.Warn("not transcribed" + (note.Length > 0 ? ": " + note : "")); });
+                    if (fin.Length == 0) Hud.Warn("not transcribed" + (note.Length > 0 ? ": " + note : ""));
                 }
                 Plugin.Log.LogInfo("basement hear: ptt " + state + " ok " + note);
             });

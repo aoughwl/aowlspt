@@ -2,7 +2,7 @@ using System.Diagnostics;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
-using Basement.Client;
+using Aowl.Api;
 
 if (args.Length == 0) { Console.WriteLine("usage: resample | stream <wav> [url] [chunkMs] [srcRate]"); return 2; }
 // 48 kHz has an integer step (3) and never interpolates; 44.1 kHz (step 2.75625) exercises the fractional carry.

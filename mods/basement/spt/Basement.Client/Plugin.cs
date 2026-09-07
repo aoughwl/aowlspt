@@ -1,8 +1,7 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.IO;
 using System.Threading;
+using Aowl.Api;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
@@ -13,29 +12,29 @@ namespace Basement.Client
 {
     /// <summary>
     /// The client half of aowl.basement for SPT 4.1.5, per
-    /// mods/basement/CLIENT-CONTRACT.md. The brain lives in aowlspt-backend.exe
-    /// running as a SIDECAR on another port; this plugin reports facts,
-    /// executes directives, plays wavs and forwards push-to-talk. It holds no
-    /// game state the backend needs. NO API key lives here or in its config:
-    /// the backend reads ANTHROPIC_API_KEY from the sidecar process environment.
+    /// mods/basement/CLIENT-CONTRACT.md -- now a CONSUMER of the Aowl API
+    /// (aowl.api): the sidecar, the HTTP transport, the event stream, the
+    /// chunk sender and the world queries live there. This plugin keeps only
+    /// the game-facing behaviour: binding backend people to live bots
+    /// (People), the facts it can measure (See), playing `say` segments at
+    /// the bots (Say), the talk key and microphone (Hear), the raid gesture
+    /// (Spawn), the vanilla-voice mute (Mute) and the IMGUI lines (Hud).
+    ///
+    /// NO API key lives here, in aowl.api, or in either config: the backend
+    /// reads ANTHROPIC_API_KEY from the sidecar process environment.
     /// </summary>
     [BepInPlugin("aowl.basement", "Escape From My Basement", "0.1.0")]
+    [BepInDependency(AowlApi.Guid, BepInDependency.DependencyFlags.HardDependency)]
     public sealed class Plugin : BaseUnityPlugin
     {
         internal static ManualLogSource Log;
         internal static Plugin Instance;
 
-        // ---- config (BepInEx\config\aowl.basement.cfg) ----
-        internal static ConfigEntry<string> BackendUrl;
+        // ---- config (BepInEx\config\aowl.basement.cfg). [Backend] Url/Enabled/PollWaitMs and [Sidecar] moved to aowl.api.cfg. ----
         internal static ConfigEntry<bool> Enabled;
-        internal static ConfigEntry<int> PollWaitMs;
         internal static ConfigEntry<KeyCode> PushToTalkKey;
         internal static ConfigEntry<bool> SpawnOnMenu;
         internal static ConfigEntry<bool> AutoRaidStart;
-        internal static ConfigEntry<string> SidecarExe;
-        internal static ConfigEntry<string> SidecarRoot;
-        internal static ConfigEntry<int> SidecarPort;
-        internal static ConfigEntry<bool> SidecarAutoStart;
         internal static ConfigEntry<string> Preset;
         internal static ConfigEntry<float> NoticeM;
         internal static ConfigEntry<bool> MatchPeopleByName;
@@ -47,16 +46,15 @@ namespace Basement.Client
         internal static ConfigEntry<int> ChunkMs;
         internal static ConfigEntry<int> StatusEveryS;
 
-        // ---- the main-thread queue: background threads enqueue, Update() drains ----
-        private static readonly ConcurrentQueue<Action> MainQueue = new ConcurrentQueue<Action>();
-        internal static void OnMain(Action a) { if (a != null) MainQueue.Enqueue(a); }
+        /// <summary>Run on the Unity main thread during the next Update(). Any thread. Forwards to the API's queue.</summary>
+        internal static void OnMain(Action a) => AowlApi.OnMain(a);
 
-        /// <summary>Milliseconds since the plugin loaded; any thread (Time.* is main-thread only).</summary>
-        private static readonly System.Diagnostics.Stopwatch Clock = System.Diagnostics.Stopwatch.StartNew();
-        internal static long NowMs => Clock.ElapsedMilliseconds;
+        /// <summary>Milliseconds since the API loaded; any thread (Time.* is main-thread only).</summary>
+        internal static long NowMs => AowlApi.NowMs;
         private float _nextStatusAt;
 
-        internal static readonly Link Link = new Link();
+        /// <summary>The stream's Observe/Ack, in the shape Say/See/Spawn call (Plugin.Link.Ack / Plugin.Link.Observe).</summary>
+        internal static readonly LinkShim Link = new LinkShim();
         internal static bool Started;            // the section-8 startup sequence finished
         internal static string StartupNote = "not started";
 
@@ -68,14 +66,9 @@ namespace Basement.Client
         {
             Log = Logger;
             Instance = this;
-            var pluginDir = Path.GetDirectoryName(Info.Location) ?? BepInEx.Paths.PluginPath;
 
-            BackendUrl = Config.Bind("Backend", "BackendUrl", "http://127.0.0.1:6970",
-                "Base URL of the aowlspt-backend sidecar serving /aowlspt/basement/*.");
             Enabled = Config.Bind("Backend", "Enabled", false,
-                "Master switch. OFF by default: with it off the plugin loads, logs one line, and does nothing.");
-            PollWaitMs = Config.Bind("Backend", "PollWaitMs", 20000,
-                "Long-poll hold time for GET /events (the backend clamps to 25000).");
+                "Master switch for the basement client. OFF by default: with it off the plugin loads, logs one line, and does nothing. The backend URL, sidecar and poll settings are in aowl.api.cfg.");
             Preset = Config.Bind("Backend", "Preset", "",
                 "World preset for POST /world/new when the backend has no world yet (empty = the backend default).");
             NoticeM = Config.Bind("Backend", "NoticeM", 25f,
@@ -96,7 +89,7 @@ namespace Basement.Client
             ChunkMs = Config.Bind("Voice", "ChunkMs", 250,
                 "How often captured audio is read off the microphone ring and posted (CLIENT-CONTRACT section 3 recommends 200-400 ms). Chunks queued behind a slow request are merged, so a partial's whisper pass never drops audio.");
             StatusEveryS = Config.Bind("Debug", "StatusEveryS", 60,
-                "Log the bridge status line (link, people, hear/say counters) every N seconds once started. 0 = never.");
+                "Log the bridge status line (people, hear/say counters) every N seconds once started. 0 = never. The link's own line is aowl.api's.");
             BindUnmatchedBots = Config.Bind("Voice", "BindUnmatchedBots", true,
                 "FALLBACK binding: a live bot with no nickname match becomes the nearest unbound world person on this map (else any unbound person, logged as relocated). Without it, ordinary SPT bots (random nicknames) are never addressable and nobody talks.");
 
@@ -105,16 +98,6 @@ namespace Basement.Client
             AutoRaidStart = Config.Bind("Raid", "AutoRaidStart", false,
                 "ACTUALLY start the offline raid on that map from code (TarkovApplication._raidSettings + OnReadyToStartMatchingAsync). Members verified against Assembly-CSharp 4.1.5 offline; never yet executed in a live client -- default OFF.");
 
-            SidecarAutoStart = Config.Bind("Sidecar", "AutoStart", true,
-                "If GET /status does not answer within 2 s, start the sidecar backend.");
-            SidecarExe = Config.Bind("Sidecar", "SidecarExe", Path.Combine(pluginDir, "aowlspt-sidecar", "aowlspt-backend.exe"),
-                "Path to aowlspt-backend.exe.");
-            SidecarRoot = Config.Bind("Sidecar", "SidecarRoot", Path.Combine(pluginDir, "aowlspt-sidecar"),
-                "Root passed as --root: must hold mods\\basement\\basement.dll, mods\\aowlspt-selection.json and registry\\mods.json (see README).");
-            SidecarPort = Config.Bind("Sidecar", "SidecarPort", 6970, "Port passed as --port.");
-
-            Http.BaseUrl = BackendUrl.Value;
-
             if (!Enabled.Value)
             {
                 Log.LogWarning("aowl.basement is loaded but Enabled=false in BepInEx/config/aowl.basement.cfg -- doing nothing.");
@@ -122,59 +105,101 @@ namespace Basement.Client
                 return;
             }
 
+            RegisterHandlers();
             Spawn.Install();
             Mute.Install();
             var t = new Thread(StartupThread) { IsBackground = true, Name = "basement-startup" };
             t.Start();
         }
 
-        /// <summary>CLIENT-CONTRACT section 8, in order, off the main thread.</summary>
+        /// <summary>Every event kind this client handles, registered with the API's directive registry (main-thread callbacks).</summary>
+        private static void RegisterHandlers()
+        {
+            AowlEvents.Directives.Register("say", e =>
+            {
+                var s = SaySegment.From(e);
+                Say.Enqueue(s.PersonId, s.Seq, s.SegmentIdx, s.Wav, s.Text, s.Final, e.WantsAck);
+            });
+            AowlEvents.Directives.Register("heard.partial", e => Hear.ShowPartial(e.Str("text")));
+            AowlEvents.Directives.Register("heard.final", e =>
+            {
+                var text = e.Str("text");
+                var note = e.Str("note");
+                Hear.OnHeardFinalEvent(text);
+                // An empty final is "not transcribed", never "the player said nothing".
+                if (text.Length == 0) Hud.Warn("heard nothing transcribable" + (note.Length > 0 ? " -- " + note : ""));
+                else Hud.Note("you: " + text);
+                Log.LogInfo("basement heard.final: \"" + text + "\" " + note);
+            });
+            AowlEvents.Directives.Register("hud.note", e =>
+            {
+                var text = e.Str("text");
+                if (e.Str("severity", "info") == "warn") { Hud.Warn(text); Log.LogWarning("basement HUD: " + text); }
+                else { Hud.Note(text); Log.LogInfo("basement HUD: " + text); }
+            });
+            AowlEvents.Directives.Register("quest.offer", e =>
+            {
+                Hud.Note("QUEST: " + e.Str("title") + " -- " + e.Str("brief"), 10f);
+                Log.LogInfo("basement quest.offer: " + e.Data.ToString(Newtonsoft.Json.Formatting.None));
+            });
+            AowlEvents.Handler logOnly = e => Log.LogInfo("basement " + e.Kind + ": " + e.Data.ToString(Newtonsoft.Json.Formatting.None));
+            AowlEvents.Directives.Register("quest.update", logOnly);
+            AowlEvents.Directives.Register("world.saved", logOnly);
+            AowlEvents.Directives.Register("player.spawn", e => { if (e.WantsAck) Spawn.OnDirective(e.Seq, e.Data); });
+            // The kinds this client KNOWS it cannot run, acked ok:false with the exact reason (never "unsupported kind" alone).
+            Refuse("unsupported kind: Basement.Client 0.1.0 has NO bot actuator (BotOwner.Mover/Memory orders are not wired yet).",
+                "npc.stance", "npc.follow", "npc.hold", "npc.goto", "npc.attack");
+            Refuse("unsupported kind: inventory and captivity are not wired in Basement.Client 0.1.0.",
+                "npc.give", "npc.take", "player.captive", "player.release");
+            Refuse("unsupported kind: Basement.Client 0.1.0 does not drive SPT's BotSpawner; people are mapped to live bots by nickname instead (MatchPeopleByName).",
+                "group.spawn");
+            // Re-read the population after a hole or a backend restart (link thread; RefreshSync is a background call).
+            AowlEvents.OnResync += reason => People.RefreshSync(null);
+        }
+
+        private static void Refuse(string why, params string[] kinds)
+        {
+            foreach (var kind in kinds)
+                AowlEvents.Directives.Register(kind, e =>
+                {
+                    if (!e.WantsAck) return;
+                    if (Once("unsupported:" + e.Kind))
+                        Log.LogWarning("basement link: refusing directive kind `" + e.Kind + "` -- " + why + " ACKED ok:false, never ignored.");
+                    e.Ack(false, why);
+                });
+        }
+
+        /// <summary>CLIENT-CONTRACT section 8, in order, off the main thread, on top of the API's own startup.</summary>
         private static void StartupThread()
         {
             try
             {
-                if (SidecarAutoStart.Value) Sidecar.Ensure();
-
-                // 1. GET /status
-                var st = Http.Get(Http.Route("/status"), 5000);
-                if (!st.Ok)
+                // 1. the API's startup: sidecar, GET /status, version check, the long poll.
+                if (!AowlBackend.WaitReady(90000))
                 {
-                    StartupNote = "GET /status failed: " + st.Err;
-                    Log.LogError("basement: " + StartupNote + " -- the link is NOT started. Is the sidecar running on " + Http.BaseUrl + "?");
+                    StartupNote = "aowl.api is not ready: " + AowlBackend.State + " -- " + AowlBackend.Note;
+                    Log.LogError("basement: " + StartupNote + " -- doing nothing. Check BepInEx/config/aowl.api.cfg and the aowl.api lines above.");
                     return;
                 }
-                if (!(st.Json.Value<bool?>("enabled") ?? false))
-                {
-                    StartupNote = "backend answered enabled:false (mods/basement/config.json `enabled`)";
-                    Log.LogWarning("basement: " + StartupNote + " -- doing nothing, as the contract says.");
-                    return;
-                }
-                var enc = st.Json["encounters"] as JObject;
+                var enc = AowlBackend.LastStatus?["encounters"] as JObject;
                 var notice = enc?.Value<float?>("noticeM");
                 See.NoticeM = (notice.HasValue && notice.Value > 0) ? notice.Value : NoticeM.Value;
 
                 // 2. GET /world, else POST /world/new
-                var w = Http.Get(Http.Route("/world"), 5000);
-                if (!w.Ok)
+                string wnote;
+                if (!AowlBackend.EnsureWorld(Preset.Value, out wnote))
                 {
-                    var body = new JObject();
-                    if (!string.IsNullOrEmpty(Preset.Value)) body["preset"] = Preset.Value;
-                    var nw = Http.Post(Http.Route("/world/new"), body.ToString(), 60000);
-                    if (!nw.Ok)
-                    {
-                        StartupNote = "no world and POST /world/new refused: " + nw.Err;
-                        Log.LogError("basement: " + StartupNote);
-                        return;
-                    }
-                    Log.LogInfo("basement: created a new world -- " + (nw.Json.Value<string>("note") ?? ""));
+                    StartupNote = wnote;
+                    Log.LogError("basement: " + StartupNote);
+                    return;
                 }
+                Log.LogInfo("basement: " + wnote);
 
-                // 3. people; 4. cursor (inside Link.Start); 5./6. raid_started + tick are See's job.
+                // 3. people; 4. cursor (the API's link); 5./6. raid_started + tick are See's job.
                 People.RefreshSync(null);
-                Link.Start();
                 Started = true;
                 StartupNote = "ok";
-                Log.LogInfo("basement: startup complete; noticeM=" + See.NoticeM + ", polling " + Http.Route("/events"));
+                Log.LogInfo("basement: startup complete; noticeM=" + See.NoticeM + ", handling " + AowlEvents.Directives.Count + " event kinds through aowl.api " + AowlApi.Version);
             }
             catch (Exception ex)
             {
@@ -185,11 +210,6 @@ namespace Basement.Client
 
         private void Update()
         {
-            while (MainQueue.TryDequeue(out var a))
-            {
-                try { a(); }
-                catch (Exception ex) { Log.LogError("basement: main-thread action threw " + ex); }
-            }
             if (!Enabled.Value) return;
             try { See.Tick(); } catch (Exception ex) { if (Once("see-throw:" + ex.Message)) Log.LogError("basement see: " + ex); }
             try { Hear.Tick(); } catch (Exception ex) { if (Once("hear-throw:" + ex.Message)) Log.LogError("basement hear: " + ex); }
@@ -205,9 +225,10 @@ namespace Basement.Client
         /// <summary>The bridge status, one line -- the counters every subsystem keeps. Any thread.</summary>
         internal static string StatusLine()
         {
+            var l = AowlEvents.Link;
             return "basement status: startup=" + StartupNote +
-                " | link=" + Link.State + " cursor=" + Link.Cursor + " polls=" + Link.Polls + " events=" + Link.Events + " directives=" + Link.Directives +
-                " acks=" + Link.Acks + " holes=" + Link.Holes + " observed=" + Link.Observed +
+                " | link=" + l.State + " cursor=" + l.Cursor + " polls=" + l.Polls + " events=" + l.Events + " directives=" + l.Directives +
+                " acks=" + l.Acks + " holes=" + l.Holes + " observed=" + l.Observed +
                 " | people known=" + People.KnownCount + " mapped=" + People.MappedCount + " binds=" + People.Binds +
                 " | hear mode=" + Hear.Mode + " sessions=" + Hear.Sessions + " refused=" + Hear.Refused + " sttChunksSent=" + Hear.SttChunksSent +
                 " sttBytesSent=" + Hear.SttBytesSent + " sttChunkFails=" + Hear.SttChunkFails + " partialsShown=" + Hear.PartialsShown +
@@ -222,11 +243,21 @@ namespace Basement.Client
             if (!Enabled.Value) return;
             Hud.Draw();
         }
+    }
 
-        private void OnApplicationQuit()
-        {
-            Link.Stop();
-            Sidecar.StopIfOurs();
-        }
+    /// <summary>
+    /// The shape Say/See/Spawn already call (<c>Plugin.Link.Ack</c>,
+    /// <c>Plugin.Link.Observe</c>), forwarded to the API's stream. Observe
+    /// is gated on THIS plugin's startup as before, so no fact leaves before
+    /// the world exists.
+    /// </summary>
+    internal sealed class LinkShim
+    {
+        public string State => AowlEvents.Link.State;
+        public long Cursor => AowlEvents.Link.Cursor;
+        /// <summary>POST /observe, fire and forget. Any thread.</summary>
+        public void Observe(string kind, JObject fields) { if (Plugin.Started) AowlBrain.Observe(kind, fields); }
+        /// <summary>POST /ack for a seq held outside an AowlEvent (Say's queued segments, Spawn's directive).</summary>
+        public void Ack(long seq, bool ok, string note) => AowlBrain.Ack(seq, ok, note);
     }
 }

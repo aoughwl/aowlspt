@@ -1,17 +1,18 @@
 using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
+using Aowl.Api;
 using Comfort.Common;
 using EFT;
-using Newtonsoft.Json.Linq;
 using UnityEngine;
 
 namespace Basement.Client
 {
     /// <summary>
-    /// The backend population (GET /world/people) and the client-owned map
-    /// personId -> live bot (CLIENT-CONTRACT section 6.2). A person that is
-    /// not mapped is not addressable and is never named in a fact.
+    /// The backend population (AowlWorld.People -> GET /world/people) and the
+    /// client-owned map personId -> live bot (CLIENT-CONTRACT section 6.2). A
+    /// person that is not mapped is not addressable and is never named in a
+    /// fact.
     ///
     /// In 0.1.0 nothing spawns bots on request (group.spawn is acked ok:false),
     /// so the only mapping is the HEURISTIC in MatchByNickname: a live bot whose
@@ -20,6 +21,7 @@ namespace Basement.Client
     /// </summary>
     internal static class People
     {
+        /// <summary>The API's typed person record, as this client keeps it.</summary>
         public sealed class Person
         {
             public string Id, Name, FactionId, Role, Voice, Map, Activity, Attitude;
@@ -71,37 +73,24 @@ namespace Basement.Client
 
         public static void ClearBots() { lock (Gate) { Bots.Clear(); ByProfile.Clear(); } }
 
-        /// <summary>Background thread. Reads /world/people and replaces the known set.</summary>
+        /// <summary>Background thread. Reads /world/people through the API and replaces the known set.</summary>
         public static void RefreshSync(string map, Vector3? near = null, float radius = 0)
         {
-            var url = Http.Route("/world/people");
-            var q = new List<string>();
-            if (!string.IsNullOrEmpty(map)) q.Add("map=" + Uri.EscapeDataString(map));
-            if (near.HasValue) q.Add("near=" + F(near.Value.x) + "," + F(near.Value.y) + "," + F(near.Value.z));
-            if (radius > 0) q.Add("radius=" + ((int)radius));
-            if (q.Count > 0) url += "?" + string.Join("&", q);
-            var r = Http.Get(url, 10000);
+            var r = near.HasValue
+                ? AowlWorld.People(map, near.Value.x, near.Value.y, near.Value.z, radius)
+                : AowlWorld.People(map, null, null, null, radius);
             if (!r.Ok)
             {
-                if (Plugin.Once("people-fail:" + r.Status)) Plugin.Log.LogWarning("basement people: GET /world/people answered " + r.Err);
+                if (Plugin.Once("people-fail:" + r.Error)) Plugin.Log.LogWarning("basement people: " + r.Error);
                 return;
             }
-            var arr = r.Json["people"] as JArray;
             var next = new Dictionary<string, Person>(StringComparer.Ordinal);
-            if (arr != null)
-                foreach (var t in arr)
+            foreach (var p in r.Value)
+                next[p.Id] = new Person
                 {
-                    var o = t as JObject; if (o == null) continue;
-                    var id = o.Value<string>("id"); if (string.IsNullOrEmpty(id)) continue;
-                    next[id] = new Person
-                    {
-                        Id = id, Name = o.Value<string>("name") ?? id, FactionId = o.Value<string>("factionId") ?? "",
-                        Role = o.Value<string>("role") ?? "", Voice = o.Value<string>("voice") ?? "", Map = o.Value<string>("map") ?? "",
-                        Activity = o.Value<string>("activity") ?? "", Attitude = o.Value<string>("attitude") ?? "",
-                        X = o.Value<float?>("x") ?? 0, Y = o.Value<float?>("y") ?? 0, Z = o.Value<float?>("z") ?? 0,
-                        Alive = o.Value<bool?>("alive") ?? true,
-                    };
-                }
+                    Id = p.Id, Name = p.Name, FactionId = p.Faction, Role = p.Role, Voice = p.Voice, Map = p.Map,
+                    Activity = p.Activity, Attitude = p.Attitude, X = p.X, Y = p.Y, Z = p.Z, Alive = p.Alive,
+                };
             lock (Gate)
             {
                 Known.Clear();

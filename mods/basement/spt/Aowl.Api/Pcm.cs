@@ -1,6 +1,6 @@
 using System;
 
-namespace Basement.Client
+namespace Aowl.Api
 {
     /// <summary>
     /// Float samples in, 16 kHz mono 16-bit little-endian PCM out -- the ONE
@@ -17,13 +17,16 @@ namespace Basement.Client
     /// </summary>
     public sealed class Resampler
     {
+        /// <summary>Source and destination sample rates, Hz.</summary>
         public readonly int SrcRate, DstRate;
         private readonly double _step;      // source samples per output sample
         private double _pos;                // fractional position into the virtual [prev, chunk...] stream
         private float _prev;                // the last sample of the previous push
         private bool _havePrev;
+        /// <summary>Running totals over the life of this instance.</summary>
         public long SamplesIn, SamplesOut;
 
+        /// <summary>A resampler from <paramref name="srcRate"/> to <paramref name="dstRate"/>; equal rates pass straight through.</summary>
         public Resampler(int srcRate, int dstRate)
         {
             if (srcRate <= 0 || dstRate <= 0) throw new ArgumentOutOfRangeException("rate");
@@ -78,6 +81,7 @@ namespace Basement.Client
             return src[vi];
         }
 
+        /// <summary>Clamp a float sample to [-1,1] and write it as little-endian int16 at <paramref name="at"/>.</summary>
         public static void Pack(float v, byte[] dst, int at)
         {
             if (v > 1f) v = 1f; else if (v < -1f) v = -1f;

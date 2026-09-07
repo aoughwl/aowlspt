@@ -1,7 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
-  <!-- Escape From My Basement, SPT 4.1.5 client plugin (aowl.basement).
-       Shape copied from C:\Users\savant\Projects\SPT-FOV-Fix\FOVFix.csproj
+  <!-- Escape From My Basement, SPT 4.1.5 client plugin (aowl.basement), a
+       CONSUMER of Aowl.Api (aowl.api): the transport, sidecar, event stream,
+       speech and world queries live there; this plugin keeps the game-facing
+       behaviour. Both DLLs go in BepInEx\plugins. Shape copied from C:\Users\savant\Projects\SPT-FOV-Fix\FOVFix.csproj
        (MEASURED 2026-09-06: netstandard2.1, BepInEx.Core 5.*, references
        from D:\SPT415). Build with
          dotnet build -c Release                      -> D:\SPT415\BepInEx\plugins\Basement.Client.dll
@@ -70,6 +72,9 @@
       <HintPath>$(GameManagedDir)\UnityEngine.InputLegacyModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <ProjectReference Include="..\Aowl.Api\Aowl.Api.csproj">
+      <Private>false</Private>
+    </ProjectReference>
     <PackageReference Include="BepInEx.Analyzers" Version="1.*" PrivateAssets="all" />
     <PackageReference Include="BepInEx.Core" Version="5.*" />
     <PackageReference Include="BepInEx.PluginInfoProps" Version="1.*" />
