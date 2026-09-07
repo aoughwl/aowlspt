@@ -26,6 +26,23 @@
   "_maxTokens": "Cap on a single spoken reply. A 1-3 sentence line does not need more.",
   "maxTokens": 200,
 
+  "_llmStreaming": "true (default): the model's reply is spoken SENTENCE BY SENTENCE while it is still being written. curl is spawned DETACHED with the SSE going to a file, the backend tick parses the new bytes every tickMs, and each completed sentence goes straight to TTS and out as a `say` segment; POST /say and a push-to-talk/chunk final answer immediately with {ok, turnId, streaming:true} and the segments arrive on /events, the last carrying final:true. MEASURED 2026-09-07 before this existed: ~4 s of silence on gpt-4o-mini before the first spoken word. Set it to false for the old synchronous shape -- identical text, one reply, after the whole response has arrived -- which is what the deterministic offline checks assert against. Only the anthropic and openai engines have a streaming wire format here; llamacpp and builtin stay synchronous and say so.",
+  "llmStreaming": true,
+
+  "_maxTurnsInFlight": "How many streaming turns may be running at once. A turn beyond the bound is answered SYNCHRONOUSLY (with a note saying why) rather than queued behind another person's sentence.",
+  "maxTurnsInFlight": 4,
+
+  "_turnTimeoutMs": "A streaming turn whose SSE never ends is closed after this long: the ontology's fallback line is spoken and the note says TIMED OUT. Without it a dead connection is indistinguishable from a short reply.",
+  "turnTimeoutMs": 60000,
+
+  "_debugTickRoute": "Adds POST /aowlspt/basement/tick, which runs the backend tick N times. The simulator runs every route BEFORE it runs a tick, so this is the only way to drive the streaming parser offline. OFF by default; a game client should never call it.",
+  "debugTickRoute": false,
+
+  "_llmFakeStreamFile": "TEST ONLY. A fixture SSE file that stands in for curl entirely -- no key is read and no process is started; the poller reveals llmFakeChunkBytes of it per tick so 'a sentence was spoken BEFORE the stream ended' is observable offline. llmFakeStreamStall reveals the first chunk and then nothing, which is the input that makes the turnTimeoutMs path fire.",
+  "llmFakeStreamFile": "",
+  "llmFakeStreamStall": false,
+  "llmFakeChunkBytes": 240,
+
   "_maxTurns": "How many lines of the conversation go back into the prompt, on top of the bounded [REMEMBER:] lines a person chose to keep.",
   "maxTurns": 8,
 

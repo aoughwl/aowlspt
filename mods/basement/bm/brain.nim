@@ -36,6 +36,8 @@ type
     ms*: int64
     notes*: seq[string]
     segments*: seq[string]
+    turnId*: int             ## >0 only when tier == "streaming"
+    streaming*: bool         ## the reply is NOT finished; segments arrive later
 
 # ------------------------------------------------------------------ config
 var cCacheDir: string = ""
@@ -239,7 +241,8 @@ proc decideFromRaw*(raw: string; tier: string; engine: string;
   ## about (the ontology's row tags); tags written INSIDE `raw` are parsed out
   ## here. The returned `text` never contains a bracket.
   var d = Decision(text: "", tags: @[], tier: tier, cached: false,
-                   engine: engine, ms: 0, notes: @[], segments: @[])
+                   engine: engine, ms: 0, notes: @[], segments: @[],
+                   turnId: 0, streaming: false)
   var found: seq[string] = @[]
   let clean = stripTags(raw, found)
   var all: seq[string] = @[]
@@ -275,10 +278,222 @@ proc llmSinkWrapper(sentence: string; final: bool) =
   elif final and gStreamSegs.len == 0:
     if gOuterSink != nil: gOuterSink("", true)
 
+# ------------------------------------------------------------------ streaming
+#
+# An in-flight LLM turn. `decide` starts one and returns a Decision whose tier
+# is "streaming" and whose text is EMPTY -- the sentences arrive later, on the
+# mod's tick, through the same sink a synchronous turn uses. The caller pumps
+# with `brainStreamPump` and gets the finished Decision back on the poll that
+# completes the turn.
+#
+# The per-turn state is parallel seqs, as everywhere else in this mod: nimony
+# has no closures worth relying on in a DLL and a seq-of-object is a shape this
+# codebase has been burned by. `gSBuf` is the text that has arrived but does
+# not yet end a sentence; everything before the last boundary has already been
+# spoken.
+#
+# TAGS. The grammar puts them at the END of the reply, so they are stripped
+# per sentence on the way out (a tag must never be spoken even if the model
+# puts one mid-reply) and APPLIED only once, by the caller, when the turn
+# finishes. That is why `brainStreamPump` returns the tags on the completing
+# poll and never before.
+
+var gSId: seq[int] = @[]
+var gSKey: seq[string] = @[]
+var gSBuf: seq[string] = @[]        ## arrived, not yet a complete sentence
+var gSSegs: seq[string] = @[]       ## "\x1f"-joined spoken segments
+var gSTagsJ: seq[string] = @[]      ## "\x1f"-joined raw tags seen so far
+var gSNotesJ: seq[string] = @[]     ## "\x1f"-joined notes
+var gSFallback: seq[string] = @[]   ## the ontology line spoken on a timeout
+var gSStartMs: seq[int64] = @[]
+var gSEngine: seq[string] = @[]
+var gNStream: int = 0
+var gNTimeout: int = 0
+
+proc findStream(id: int): int =
+  result = -1
+  var i = 0
+  while i < gSId.len:
+    if gSId[i] == id: return i
+    i = i + 1
+
+proc dropStreamAt(idx: int) =
+  if idx < 0 or idx >= gSId.len: return
+  var a: seq[int] = @[]
+  var b: seq[string] = @[]
+  var c: seq[string] = @[]
+  var d: seq[string] = @[]
+  var e: seq[string] = @[]
+  var f: seq[string] = @[]
+  var g: seq[string] = @[]
+  var h: seq[int64] = @[]
+  var k: seq[string] = @[]
+  var i = 0
+  while i < gSId.len:
+    if i != idx:
+      a.add gSId[i]
+      b.add gSKey[i]
+      c.add gSBuf[i]
+      d.add gSSegs[i]
+      e.add gSTagsJ[i]
+      f.add gSNotesJ[i]
+      g.add gSFallback[i]
+      h.add gSStartMs[i]
+      k.add gSEngine[i]
+    i = i + 1
+  gSId = a
+  gSKey = b
+  gSBuf = c
+  gSSegs = d
+  gSTagsJ = e
+  gSNotesJ = f
+  gSFallback = g
+  gSStartMs = h
+  gSEngine = k
+
+proc appendJoined(cur: var string; item: string) =
+  if item.len == 0: return
+  if cur.len > 0: cur.add "\x1f"
+  cur.add item
+
+proc brainStreamCount*(): int = gSId.len
+proc brainStreamIdAt*(i: int): int =
+  if i < 0 or i >= gSId.len: return 0
+  result = gSId[i]
+
+proc emitStreamSentence(idx: int; sentence: string; final: bool;
+                        sink: SegmentSink) =
+  var found: seq[string] = @[]
+  let clean = stripTags(sentence, found)
+  var tags = gSTagsJ[idx]
+  for t in found: appendJoined(tags, t)
+  gSTagsJ[idx] = tags
+  if clean.len > 0:
+    var segs = gSSegs[idx]
+    appendJoined(segs, clean)
+    gSSegs[idx] = segs
+    if sink != nil: sink(clean, final)
+  elif final:
+    # The stream must be terminated exactly once even when the last fragment
+    # was nothing but a tag -- a client waiting for `final` would hang.
+    if sink != nil: sink("", true)
+
+proc buildStreamDecision(idx: int; tier: string): Decision =
+  var d = Decision(text: "", tags: @[], tier: tier, cached: false,
+                   engine: gSEngine[idx], ms: 0, notes: @[], segments: @[],
+                   turnId: gSId[idx], streaming: false)
+  var notes: seq[string] = splitTags(gSNotesJ[idx])
+  for t in splitTags(gSTagsJ[idx]):
+    let n = tagName(t)
+    if modelForbiddenTag(n):
+      notes.add "dropped [" & n & "] -- the encounter machine emits that " &
+                "tag, a model never does"
+    elif isKnownTag(n): d.tags.add t
+    else:
+      notes.add "dropped unknown tag [" & n & "] -- not in the tag grammar; " &
+                "it was stripped from the spoken line and not acted on"
+  d.segments = splitTags(gSSegs[idx])
+  var joined = ""
+  for sgm in d.segments:
+    if joined.len > 0: joined.add " "
+    joined.add sgm
+  d.text = joined
+  for n in notes: d.notes.add n
+  d.ms = wallMs() - gSStartMs[idx]
+  result = d
+
+proc brainStreamPump*(id: int; sink: SegmentSink; d: var Decision;
+                      note: var string): bool =
+  ## Consume whatever of turn `id` has arrived, speaking every sentence that
+  ## completed. Returns TRUE only on the poll that FINISHES the turn, and `d`
+  ## is meaningful only then. An unknown id returns false with a note saying
+  ## so, rather than looking like a turn that is merely still running.
+  note = ""
+  let idx = findStream(id)
+  if idx < 0:
+    note = "no in-flight turn " & $id
+    return false
+  var newText = ""
+  var finished = false
+  var pnote = ""
+  let alive = llmStreamPoll(id, newText, finished, pnote)
+  if not alive:
+    note = "the llm layer has no turn " & $id & ": " & pnote
+    dropStreamAt(idx)
+    return false
+  if newText.len > 0:
+    var buf = gSBuf[idx]
+    buf.add newText
+    let parts = splitSentences(buf)
+    if parts.len > 1:
+      var i = 0
+      while i < parts.len - 1:
+        emitStreamSentence(idx, parts[i], false, sink)
+        i = i + 1
+      buf = tailAfter(buf, parts[parts.len - 1])
+    gSBuf[idx] = buf
+  let timedOut = (not finished) and
+                 (wallMs() - gSStartMs[idx]) > int64(llmTurnTimeoutMs())
+  if not finished and not timedOut:
+    return false
+  var notes = gSNotesJ[idx]
+  if timedOut:
+    gNTimeout = gNTimeout + 1
+    gSBuf[idx] = ""
+    appendJoined(notes, "TIMED OUT after " & $llmTurnTimeoutMs() &
+      " ms with no end of stream; the ontology's fallback row was spoken " &
+      "instead. That row is a template, NOT a language model, and this is " &
+      "not a short reply -- the model never finished.")
+    gSNotesJ[idx] = notes
+    emitStreamSentence(idx, gSFallback[idx], true, sink)
+    d = buildStreamDecision(idx, "timeout")
+  else:
+    if pnote.len > 0: appendJoined(notes, pnote)
+    gSNotesJ[idx] = notes
+    emitStreamSentence(idx, gSBuf[idx].strip(), true, sink)
+    gSBuf[idx] = ""
+    d = buildStreamDecision(idx, "llm")
+    gNLlm = gNLlm + 1
+  # The cache stores the FINISHED text, exactly as the synchronous path does,
+  # so a repeat of the same line in the same kind of moment is answered from
+  # tier 0 with no stream at all.
+  if d.text.len > 0:
+    gTick = gTick + 1
+    gKey.add gSKey[idx]
+    gText.add d.text
+    gTags.add joinTags(d.tags)
+    gTier.add d.tier
+    gUsed.add gTick
+    evictLru()
+    persist()
+  llmStreamDrop(id)
+  dropStreamAt(idx)
+  note = "turn " & $id & " finished (" & d.tier & ")"
+  result = true
+
+proc brainStreamBegin(key, engine, fallback: string; id: int; note: string) =
+  gNStream = gNStream + 1
+  gSId.add id
+  gSKey.add key
+  gSBuf.add ""
+  gSSegs.add ""
+  gSTagsJ.add ""
+  gSNotesJ.add note
+  gSFallback.add fallback
+  gSStartMs.add wallMs()
+  gSEngine.add engine
+
 # ------------------------------------------------------------------ decide
 
 proc decide*(worldPrompt, rules: string; c: PersonCard; s: Situation;
-             memory, facts, utterance: string; sink: SegmentSink): Decision =
+             memory, facts, utterance: string; sink: SegmentSink;
+             streamed: var bool; turnId: var int): Decision =
+  ## `streamed` is the honest half of the answer: TRUE means the returned
+  ## Decision is a RECEIPT (tier "streaming", empty text) and the sentences
+  ## will arrive later through `sink` on `brainStreamPump`. FALSE means the
+  ## Decision is the whole reply, exactly as before.
+  streamed = false
+  turnId = 0
   let t0 = wallMs()
   let engine = llmEngine()
   let sig = situationSignature(s)
@@ -294,7 +509,7 @@ proc decide*(worldPrompt, rules: string; c: PersonCard; s: Situation;
     gNCache = gNCache + 1
     var d = Decision(text: gText[idx], tags: splitTags(gTags[idx]),
                      tier: "cache", cached: true, engine: engine, ms: 0,
-                     notes: @[], segments: @[])
+                     notes: @[], segments: @[], turnId: 0, streaming: false)
     d.notes.add "line cache HIT (originally tier " & gTier[idx] &
                 "); the key holds no conversation memory, so this matches a " &
                 "repeated line in the same kind of moment, not a stateful turn"
@@ -349,13 +564,47 @@ proc decide*(worldPrompt, rules: string; c: PersonCard; s: Situation;
   if engine != "builtin" and engine != "none":
     let sys = stablePrefix(worldPrompt, rules, c)
     let usr = volatileSuffix(c, s, memory, facts, utterance)
+    if llmCanStream():
+      var sid = 0
+      var snote = ""
+      if llmStreamStart(sys, usr, sid, snote):
+        # The fallback line is resolved NOW, while the card and situation are
+        # in hand, so a timeout 60 s from here has something in character to
+        # say instead of silence.
+        var fb = ""
+        var fbTags: seq[string] = @[]
+        if not ontologyFallback(c, s, utterance, fb, fbTags): fb = "..."
+        var nj = ""
+        for n in notes: appendJoined(nj, n)
+        appendJoined(nj, snote)
+        brainStreamBegin(key, engine, fb, sid, nj)
+        var ds = Decision(text: "", tags: @[], tier: "streaming",
+                          cached: false, engine: engine, ms: 0, notes: @[],
+                          segments: @[], turnId: sid, streaming: true)
+        for n in notes: ds.notes.add n
+        ds.notes.add snote
+        ds.notes.add "STREAMING: this answer is a receipt, not the reply. " &
+          "The sentences are spoken as they arrive and reach the client as " &
+          "`say` segments on the event stream; the last one carries " &
+          "final:true. Set llmStreaming:false for the synchronous shape."
+        ds.ms = wallMs() - t0
+        streamed = true
+        turnId = sid
+        result = ds
+        return
+      notes.add "streaming did not start (" & snote &
+                "); this turn was answered synchronously instead"
     gOuterSink = sink
     gStreamTags = @[]
     gStreamSegs = @[]
     var lnote = ""
     var cacheRead = -1
     var stopReason = ""
-    let full = llmComplete(sys, usr, llmSinkWrapper, lnote, cacheRead, stopReason)
+    var full = ""
+    if llmHasFake():
+      full = llmFakeSyncComplete(llmSinkWrapper, lnote)
+    else:
+      full = llmComplete(sys, usr, llmSinkWrapper, lnote, cacheRead, stopReason)
     gOuterSink = nil
     gLastCacheRead = cacheRead
     if lnote.len > 0: notes.add lnote
@@ -364,7 +613,8 @@ proc decide*(worldPrompt, rules: string; c: PersonCard; s: Situation;
                 "ontology fallback row instead, which is not a language model"
     elif full.len > 0:
       var d = Decision(text: "", tags: @[], tier: "llm", cached: false,
-                       engine: engine, ms: 0, notes: @[], segments: @[])
+                       engine: engine, ms: 0, notes: @[], segments: @[],
+                       turnId: 0, streaming: false)
       for t in gStreamTags:
         let n = tagName(t)
         if modelForbiddenTag(n):
@@ -427,6 +677,9 @@ proc brainStats*(): JsonObject =
   result.put("maxEntries", cCacheMax)
   result.put("tiers", done(tiers))
   result.put("lastCacheReadInputTokens", gLastCacheRead)
+  result.put("streamsStarted", gNStream)
+  result.put("streamsInFlight", gSId.len)
+  result.put("streamTimeouts", gNTimeout)
   result.put("engine", llmEngine())
   result.put("minConfidence", cMinConfidence)
   result.put("memoryTurns", cMemoryTurns)
@@ -450,3 +703,5 @@ proc decisionJson*(d: Decision): JsonObject =
   result.put("ms", int(d.ms))
   result.put("notes", done(notesA))
   result.put("segments", done(segsA))
+  result.put("turnId", d.turnId)
+  result.put("streaming", d.streaming)

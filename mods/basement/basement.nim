@@ -72,6 +72,7 @@ const
   LootRoute      = Base & "/world/loot"
   CachesRoute    = Base & "/world/caches"
   SelfcheckRoute = Base & "/selfcheck"
+  TickRoute      = Base & "/tick"
 
 # ---------------------------------------------------------------------------
 # Config. Literal initialisers only: nimony silently zeroes a DLL global whose
@@ -95,6 +96,7 @@ var gSayPerson: string = ""
 var gSayVoice: string = ""
 var gSayWavs: seq[string] = @[]
 var gSaySegments: seq[string] = @[]
+var gDebugTickRoute: bool = false
 
 # The last payloads this mod PUBLISHED on the bus. They are kept because the
 # simulator does not deliver an emit back to the mod that made it (MEASURED in
@@ -168,6 +170,17 @@ proc loadConfig() =
                curlExe = setting("curlExe").asText("curl.exe"),
                workDir = work,
                maxTokens = setting("maxTokens").asInt(200))
+  # Streaming is ON by default: a turn that answers 4 s after the player
+  # stopped talking reads as a broken mod. `llmStreaming: false` restores the
+  # synchronous shape byte for byte, which is what the deterministic checks
+  # assert against.
+  llmStreamingConfigure(streaming = setting("llmStreaming").asBool(true),
+                        maxInFlight = setting("maxTurnsInFlight").asInt(4),
+                        turnTimeoutMs = setting("turnTimeoutMs").asInt(60000),
+                        fakeFile = setting("llmFakeStreamFile").asText(""),
+                        fakeStall = setting("llmFakeStreamStall").asBool(false),
+                        fakeChunkBytes = setting("llmFakeChunkBytes").asInt(240))
+  gDebugTickRoute = setting("debugTickRoute").asBool(false)
   speechConfigure(sttEngine = setting("sttEngine").asText("whisper-server"),
                   ttsEngine = setting("ttsEngine").asText("piper"),
                   toolsDir = tools,
@@ -310,9 +323,164 @@ proc sayReplyJson(personId: string; d: Decision; tagNote: string;
   o.put("tags", tags)
   o.put("segments", segs)
   o.put("directives", directives)
+  o.put("streaming", d.streaming)
+  o.put("turnId", d.turnId)
   o.put("state", encounterState(personId))
   o.put("notes", notes)
   result = done(o).text
+
+# ---------------------------------------------------------------------------
+# In-flight streaming turns: the speaking CONTEXT the sink needs
+# ---------------------------------------------------------------------------
+#
+# `saySink` reads module globals rather than a closure (see its own comment),
+# so a turn that finishes on a later tick has to have those globals put back
+# the way they were when it started. That is all this table is: per turn, who
+# is speaking, in which voice, and how many segments have already gone out.
+# The tick restores one turn's context, pumps it, and saves it back -- so two
+# people can be answering at once without their segment indices interleaving.
+
+var gCtxId: seq[int] = @[]
+var gCtxPerson: seq[string] = @[]
+var gCtxVoice: seq[string] = @[]
+var gCtxSeg: seq[int] = @[]
+var gCtxSegs: seq[string] = @[]     ## "\x1f"-joined, empties KEPT
+var gCtxWavs: seq[string] = @[]     ## "\x1f"-joined, empties KEPT (index-paired)
+var gCtxUtt: seq[string] = @[]
+var gTurnsFinished: int = 0
+
+proc joinUs(items: seq[string]): string =
+  result = ""
+  var i = 0
+  while i < items.len:
+    if i > 0: result.add "\x1f"
+    result.add items[i]
+    i = i + 1
+
+proc splitUs(s: string): seq[string] =
+  ## Keeps empty fields, because `gSayWavs` is index-paired with the segments
+  ## and a dropped empty would shift every wav onto the wrong sentence.
+  result = @[]
+  if s.len == 0: return
+  var cur = ""
+  for ch in s:
+    if ch == '\x1f':
+      result.add cur
+      cur = ""
+    else: cur.add ch
+  result.add cur
+
+proc findCtx(id: int): int =
+  result = -1
+  var i = 0
+  while i < gCtxId.len:
+    if gCtxId[i] == id: return i
+    i = i + 1
+
+proc ctxSave(idx: int) =
+  gCtxSeg[idx] = gSegmentIdx
+  gCtxSegs[idx] = joinUs(gSaySegments)
+  gCtxWavs[idx] = joinUs(gSayWavs)
+
+proc ctxRestore(idx: int) =
+  gSayPerson = gCtxPerson[idx]
+  gSayVoice = gCtxVoice[idx]
+  gSegmentIdx = gCtxSeg[idx]
+  gSaySegments = splitUs(gCtxSegs[idx])
+  gSayWavs = splitUs(gCtxWavs[idx])
+
+proc ctxDrop(idx: int) =
+  if idx < 0 or idx >= gCtxId.len: return
+  var a: seq[int] = @[]
+  var b: seq[string] = @[]
+  var c: seq[string] = @[]
+  var d: seq[int] = @[]
+  var e: seq[string] = @[]
+  var f: seq[string] = @[]
+  var g: seq[string] = @[]
+  var i = 0
+  while i < gCtxId.len:
+    if i != idx:
+      a.add gCtxId[i]
+      b.add gCtxPerson[i]
+      c.add gCtxVoice[i]
+      d.add gCtxSeg[i]
+      e.add gCtxSegs[i]
+      f.add gCtxWavs[i]
+      g.add gCtxUtt[i]
+    i = i + 1
+  gCtxId = a
+  gCtxPerson = b
+  gCtxVoice = c
+  gCtxSeg = d
+  gCtxSegs = e
+  gCtxWavs = f
+  gCtxUtt = g
+
+proc finishStreamedTurn(idx: int; d: Decision) =
+  ## What the synchronous path does at the end of `speakTurn`, done once the
+  ## last sentence has actually been spoken: the reply goes into memory, the
+  ## tags are applied ONCE, and a `turn.done` event tells the client the turn
+  ## is over and what it cost.
+  let personId = gCtxPerson[idx]
+  let pi = findPerson(personId)
+  if pi >= 0 and d.text.len > 0:
+    remember(pi, personName(pi) & ": " & d.text)
+  var tagNote = ""
+  let directives = applyTags(personId, d.tags, tagNote)
+  discard journal("said", personId, "player",
+                  done(objOf("text", d.text)).text)
+  var tagsA = arr()
+  for t in d.tags: tagsA.add t
+  var notesA = arr()
+  for n in d.notes: notesA.add n
+  if tagNote.len > 0: notesA.add "tags: " & tagNote
+  var o = obj()
+  o.put("turnId", d.turnId)
+  o.put("personId", personId)
+  o.put("text", d.text)
+  o.put("tier", d.tier)
+  o.put("engine", d.engine)
+  o.put("ms", int(d.ms))
+  o.put("segments", gSegmentIdx)
+  o.put("tags", done(tagsA))
+  o.put("directives", directives)
+  o.put("notes", done(notesA))
+  discard emitEvent("turn.done", done(o).text, false)
+  gTurnsFinished = gTurnsFinished + 1
+
+proc pumpStreamingTurns() =
+  ## Every in-flight turn, once, on the caller's lock. The ids are snapshotted
+  ## FIRST because a turn that finishes removes itself, and walking a shrinking
+  ## list by index skips the turn that took its place.
+  var ids: seq[int] = @[]
+  var i = 0
+  while i < brainStreamCount():
+    ids.add brainStreamIdAt(i)
+    i = i + 1
+  for id in ids:
+    let ci = findCtx(id)
+    if ci < 0:
+      # No context means nobody can be spoken for. Drain the turn with a nil
+      # sink so it cannot sit in flight forever, and say so.
+      var dd = Decision(text: "", tags: @[], tier: "", cached: false,
+                        engine: "", ms: 0, notes: @[], segments: @[],
+                        turnId: 0, streaming: false)
+      var pn = ""
+      if brainStreamPump(id, nil, dd, pn):
+        warn ModName & ": streaming turn " & $id & " finished with no " &
+             "speaking context; nothing was spoken (" & pn & ")"
+      continue
+    ctxRestore(ci)
+    var d = Decision(text: "", tags: @[], tier: "", cached: false, engine: "",
+                     ms: 0, notes: @[], segments: @[], turnId: 0,
+                     streaming: false)
+    var pnote = ""
+    let finished = brainStreamPump(id, saySink, d, pnote)
+    ctxSave(ci)
+    if finished:
+      finishStreamedTurn(ci, d)
+      ctxDrop(ci)
 
 proc speakTurn(personId, utterance: string; directives: var int;
                tagNote: var string): Decision =
@@ -327,7 +495,8 @@ proc speakTurn(personId, utterance: string; directives: var int;
   ## refusal is the one route out; a silent empty Decision would be
   ## indistinguishable from "the brain had nothing to say".
   result = Decision(text: "", tags: @[], tier: "refused", cached: false,
-                    engine: llmEngine(), ms: 0, notes: @[], segments: @[])
+                    engine: llmEngine(), ms: 0, notes: @[], segments: @[],
+                    turnId: 0, streaming: false)
   directives = 0
   tagNote = ""
   if normalizeText(utterance).len == 0:
@@ -348,8 +517,25 @@ proc speakTurn(personId, utterance: string; directives: var int;
   var hits = ""
   let facts = retrieveFacts(utterance, card.traits, 4, hits)
   let memory = (if pi >= 0: memoryOf(pi, 8) else: "")
+  var streamed = false
+  var turnId = 0
   result = decide(worldPrompt(), worldName(), card, situation,
-                  memory, facts, utterance, saySink)
+                  memory, facts, utterance, saySink, streamed, turnId)
+  if streamed:
+    # The reply has not been generated yet. Everything the tail below does --
+    # remembering the answer, applying the tags, journalling -- happens when
+    # the LAST sentence has actually been spoken (`finishStreamedTurn`), NOT
+    # here: applying a tag for a reply that has not arrived would act on a
+    # sentence nobody said.
+    if pi >= 0: remember(pi, "Player: " & utterance)
+    gCtxId.add turnId
+    gCtxPerson.add personId
+    gCtxVoice.add gSayVoice
+    gCtxSeg.add gSegmentIdx
+    gCtxSegs.add joinUs(gSaySegments)
+    gCtxWavs.add joinUs(gSayWavs)
+    gCtxUtt.add utterance
+    return
   if pi >= 0:
     remember(pi, "Player: " & utterance)
     if result.text.len > 0: remember(pi, personName(pi) & ": " & result.text)
@@ -420,6 +606,7 @@ proc onStatus(url, body, session: string): string =
   withModLock:
     o.put("world", worldSummary())
     o.put("brain", brainStats())
+    o.put("stream", llmStreamStats())
     o.put("stream", streamStats())
     o.put("tts", ttsStats())
     o.put("sttSessions", sttSessionCount())
@@ -648,10 +835,50 @@ proc onSay(url, body, session: string): string =
   var directives = 0
   var tagNote = ""
   var d = Decision(text: "", tags: @[], tier: "", cached: false, engine: "",
-                   ms: 0, notes: @[], segments: @[])
+                   ms: 0, notes: @[], segments: @[], turnId: 0,
+                   streaming: false)
   withModLock:
     d = speakTurn(personId, text, directives, tagNote)
   result = sayReplyJson(personId, d, tagNote, directives)
+
+# The addressee of a CHUNK session. CLIENT-CONTRACT §6.7: the plugin sends
+# `personId` on seq 0 ONLY, so it has to be remembered here -- the `final`
+# chunk, which is the one that needs it, does not carry it. Before this, the
+# chunk path emitted `heard.final` and stopped, and the SPT plugin worked
+# around the gap by POSTing /say itself; the reply now carries `spokeTo`,
+# which is the flag that makes the plugin skip that second call.
+var gChunkSess: seq[string] = @[]
+var gChunkPerson: seq[string] = @[]
+
+proc chunkRemember(sess, personId: string) =
+  if sess.len == 0 or personId.len == 0: return
+  var i = 0
+  while i < gChunkSess.len:
+    if gChunkSess[i] == sess:
+      gChunkPerson[i] = personId
+      return
+    i = i + 1
+  gChunkSess.add sess
+  gChunkPerson.add personId
+
+proc chunkPersonOf(sess: string): string =
+  result = ""
+  var i = 0
+  while i < gChunkSess.len:
+    if gChunkSess[i] == sess: return gChunkPerson[i]
+    i = i + 1
+
+proc chunkForget(sess: string) =
+  var a: seq[string] = @[]
+  var b: seq[string] = @[]
+  var i = 0
+  while i < gChunkSess.len:
+    if gChunkSess[i] != sess:
+      a.add gChunkSess[i]
+      b.add gChunkPerson[i]
+    i = i + 1
+  gChunkSess = a
+  gChunkPerson = b
 
 proc onChunk(url, body, session: string): string =
   if not gEnabled: return disabledJson()
@@ -660,6 +887,15 @@ proc onChunk(url, body, session: string): string =
   let path = jr.asText(jr.field(body, "path"), "")
   let b64 = jr.asText(jr.field(body, "wavBase64"), "")
   let final = jr.asBool(jr.field(body, "final"), false)
+  let claimed = jr.asText(jr.field(body, "personId"), "")
+  var o = obj()
+  if claimed.len > 0:
+    if findPerson(claimed) < 0:
+      o.put("addresseeNote", "the client named person '" & claimed &
+            "' but no such person exists in this world; the session keeps " &
+            "whatever addressee it already had")
+    else:
+      chunkRemember(sess, claimed)
   var partial = ""
   var finalText = ""
   var note = ""
@@ -672,12 +908,48 @@ proc onChunk(url, body, session: string): string =
   if finalText.len > 0:
     discard emitEvent("heard.final",
                       done(objOf("text", finalText)).text, false)
-  var o = obj()
   o.put("ok", ok)
   o.put("session", sess)
+  o.put("seq", seqNo)
   o.put("partial", partial)
   o.put("final", finalText)
   o.put("note", note)
+  if final:
+    # The SAME order `up` uses in onPtt, deliberately: one turn is started by
+    # exactly one piece of code whichever way the audio arrived.
+    var addressee = chunkPersonOf(sess)
+    chunkForget(sess)
+    if addressee.len == 0: addressee = captiveOf()
+    if addressee.len == 0:
+      o.put("spokeTo", "")
+      o.put("sayNote", "nobody was addressed: the chunk session carried no " &
+            "`personId` on seq 0 and the encounter machine holds no " &
+            "captive/escorted person, so the brain was NOT asked. Send " &
+            "personId with seq 0 (CLIENT-CONTRACT 6.7) or POST " & SayRoute)
+    elif normalizeText(finalText).len == 0:
+      o.put("spokeTo", "")
+      o.put("sayNote", "'" & addressee & "' was addressed, but the " &
+            "transcript is empty, so the brain was not asked with an empty " &
+            "utterance -- a turn built from nothing answers a question the " &
+            "player never asked")
+    else:
+      var directives = 0
+      var tagNote = ""
+      var d = Decision(text: "", tags: @[], tier: "", cached: false,
+                       engine: "", ms: 0, notes: @[], segments: @[],
+                       turnId: 0, streaming: false)
+      withModLock:
+        d = speakTurn(addressee, finalText, directives, tagNote)
+      o.put("spokeTo", addressee)
+      o.put("reply", d.text)
+      o.put("tier", d.tier)
+      o.put("turnId", d.turnId)
+      o.put("streaming", d.streaming)
+      o.put("directives", directives)
+      o.put("sayNote", "the brain answered " & addressee &
+            (if d.streaming: "; the reply is STREAMING and its segments " &
+                             "arrive on /events as they are spoken"
+             else: ""))
   result = done(o).text
 
 proc onPtt(url, body, session: string): string =
@@ -766,7 +1038,8 @@ proc onPtt(url, body, session: string): string =
         var directives = 0
         var tagNote = ""
         var d = Decision(text: "", tags: @[], tier: "", cached: false,
-                         engine: "", ms: 0, notes: @[], segments: @[])
+                         engine: "", ms: 0, notes: @[], segments: @[],
+                         turnId: 0, streaming: false)
         withModLock:
           d = speakTurn(addressee, finalText, directives, tagNote)
         o.put("spokeTo", addressee)
@@ -2076,6 +2349,67 @@ proc chk19DistinctVoices() =
         " B) bytes differ " & $differ & "; " & tagA & " again cache-hit " &
         $cA2 & " identical " & $same & "; " & nA)
 
+proc chk20StreamingParser() =
+  ## The property that makes streaming STREAMING: text reaches the caller on a
+  ## poll STRICTLY BEFORE the poll that ends the stream. Asserting "the text
+  ## came out right" cannot fail differently for the synchronous path, so it
+  ## would prove nothing; the poll INDEX is the falsifiable part.
+  ##
+  ## No curl and no key: a fixture SSE file stands in for the process, revealed
+  ## a few bytes per poll, which is exactly how the real file grows.
+  let dir = getEnv("TEMP", "")
+  if dir.len == 0:
+    check(20, "streaming parser", "INCONCLUSIVE",
+          "no TEMP in the environment, so no fixture could be written")
+    return
+  let fixture = joinPath(dir, "aowlbm_selfcheck_stream.sse")
+  var sse = ""
+  sse.add "data: {\"choices\":[{\"delta\":{\"content\":\"Hold still. \"}}]}\n\n"
+  sse.add "data: {\"choices\":[{\"delta\":{\"content\":\"I know a way \"}}]}\n\n"
+  sse.add "data: {\"choices\":[{\"delta\":{\"content\":\"out of here.\"}}]}\n\n"
+  sse.add "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+  sse.add "data: [DONE]\n\n"
+  if not writeAll(fixture, sse):
+    check(20, "streaming parser", "INCONCLUSIVE",
+          "could not write the fixture to " & fixture)
+    return
+  let curlBefore = llmCurlCalls()
+  llmStreamingConfigure(true, 4, 60000, fixture, false, 60)
+  var id = 0
+  var snote = ""
+  if not llmStreamStart("system", "user", id, snote):
+    loadConfig()
+    check(20, "streaming parser", "FAIL",
+          "llmStreamStart refused the fixture: " & snote)
+    return
+  var full = ""
+  var polls = 0
+  var firstTextPoll = -1
+  var endPoll = -1
+  var fin = false
+  while polls < 40 and endPoll < 0:
+    polls = polls + 1
+    var nt = ""
+    var pn = ""
+    if not llmStreamPoll(id, nt, fin, pn):
+      break
+    if nt.len > 0:
+      full.add nt
+      if firstTextPoll < 0: firstTextPoll = polls
+    if fin: endPoll = polls
+  llmStreamDrop(id)
+  let curlAfter = llmCurlCalls()
+  loadConfig()
+  let ok = firstTextPoll > 0 and endPoll > firstTextPoll and
+           full == "Hold still. I know a way out of here." and
+           curlAfter == curlBefore
+  check(20, "streaming yields text before the stream ends", verdictOf(ok),
+        "first text on poll " & $firstTextPoll & ", stream ended on poll " &
+        $endPoll & " (the first must be STRICTLY earlier, or nothing was " &
+        "streamed); assembled " & $full.len & " chars = " & full &
+        "; curl invocations " & $curlBefore & "->" & $curlAfter &
+        " (the fixture must not start a process)")
+
 proc onSelfcheck(url, body, session: string): string =
   gCheckLines = @[]
   gPassN = 0
@@ -2101,6 +2435,7 @@ proc onSelfcheck(url, body, session: string): string =
     chk17AimHysteresis()
     chk18TalkWhileThreatened()
     chk19DistinctVoices()
+    chk20StreamingParser()
     # Put back whatever was on disk: the checks above generated and advanced a
     # world in memory, and leaving that in place would quietly replace the
     # player's.
@@ -2160,6 +2495,22 @@ proc basementSchema(): seq[Setting] =
                   category = "Engines"),
     intSetting("maxTokens", "Reply length (tokens)", 200, lo = 32, hi = 4096,
                step = 1, category = "Engines"),
+    boolSetting("llmStreaming", "Speak while the model is still writing", true,
+                category = "Engines",
+                description = "On: curl is spawned detached and each sentence " &
+                  "is spoken the moment it completes, so /say answers with a " &
+                  "receipt and the segments arrive on the event stream. Off: " &
+                  "the old synchronous shape -- one reply, after the whole " &
+                  "response has arrived (~4 s on gpt-4o-mini, MEASURED)"),
+    intSetting("maxTurnsInFlight", "Streaming turns at once", 4, lo = 1,
+               hi = 32, step = 1, category = "Engines",
+               description = "A turn beyond this bound is answered " &
+                 "synchronously rather than queued or dropped"),
+    intSetting("turnTimeoutMs", "Streaming turn timeout (ms)", 60000,
+               lo = 1000, hi = 600000, step = 1000, category = "Engines",
+               description = "A turn whose stream never ends speaks the " &
+                 "ontology's fallback line and says in its note that it " &
+                 "timed out -- it is never mistaken for a short reply"),
     enumSetting("sttEngine", "Speech to text", "whisper-server",
                 @["whisper-server", "none"], category = "Engines"),
     enumSetting("ttsEngine", "Text to speech", "piper",
@@ -2253,6 +2604,7 @@ proc onTick(payload: string): string =
     discard expirePending(worldClockMs(), dropped)
     var simNote = ""
     discard simAdvance(int64(gTickMs), simNote)
+    pumpStreamingTurns()
     if pttActive():
       # The progressive half of push-to-talk. Pumping every tick is free: the
       # session only runs whisper once `sttPartialMs` of NEW audio has arrived.
@@ -2268,6 +2620,32 @@ proc onTick(payload: string): string =
         discard emitEvent("world.saved",
                           done(objOf("version", worldVersion())).text, false)
   result = ""
+
+proc onDebugTick(url, body, session: string): string =
+  ## The sim runs every route BEFORE it runs a single tick, so without this
+  ## there is no way to drive the streaming parser offline at all. Gated twice
+  ## (`enabled` and `debugTickRoute`) and it does exactly what the timer does:
+  ## it calls `onTick`, it does not reimplement it.
+  if not gEnabled: return disabledJson()
+  if not gDebugTickRoute:
+    return errJson("the debug tick route is off; set \"debugTickRoute\": " &
+                   "true in mods/basement/config.json. It exists so the " &
+                   "offline checks can drive the tick, and it is not " &
+                   "something a client should ever call")
+  var n = queryInt(url, "n", jr.asInt(jr.field(body, "n"), 1))
+  if n < 1: n = 1
+  if n > 1000: n = 1000
+  var i = 0
+  while i < n:
+    discard onTick("")
+    i = i + 1
+  var o = obj()
+  o.put("ok", true)
+  o.put("ticks", n)
+  o.put("totalTicks", gTicks)
+  o.put("streamsInFlight", brainStreamCount())
+  o.put("turnsFinished", gTurnsFinished)
+  result = done(o).text
 
 proc onLoad(): Status =
   declareSettings(basementSchema())
@@ -2360,6 +2738,7 @@ proc onLoad(): Status =
   discard serve(AckRoute, onAck)
   discard serve(SpawnRoute, onSpawn)
   discard serve(SelfcheckRoute, onSelfcheck)
+  if gDebugTickRoute: discard serve(TickRoute, onDebugTick)
 
   discard on("tarkov.profile.listing", onProfileListing)
   discard on("tarkov.raid.configured", onRaidConfigured)

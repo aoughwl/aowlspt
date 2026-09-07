@@ -986,6 +986,246 @@ def check_crash_sequence(rep, store):
             "AssertionDefect that killed the backend" % (torn,))
 
 
+# ---------------------------------------------------------------------------
+# 7. streaming: sentences reach the client BEFORE the model has finished
+# ---------------------------------------------------------------------------
+#
+# The whole point of the feature is a TIMING property, and a timing property is
+# the easy one to write a check for that cannot fail: "the text came out right"
+# is true of the synchronous path too. So what is asserted here is the ORDER of
+# events -- a `say` segment on the stream while the turn is still in flight --
+# plus the things that a per-sentence path is uniquely able to get wrong: a
+# bracket tag spoken out loud, a `final` that never arrives, a tag applied
+# twice (once per sentence), and a stream that never ends hanging forever.
+#
+# No key, no curl, no network: `llmFakeStreamFile` points the engine at a
+# fixture SSE file which the poller reveals a few bytes at a time, exactly as
+# a growing curl output file behaves. `debugTickRoute` drives the tick, because
+# the simulator runs every route BEFORE it runs a single tick.
+
+FIXTURE_SSE = (
+    'data: {"choices":[{"delta":{"content":"Hold still. "}}]}\n\n'
+    'data: {"choices":[{"delta":{"content":"I know a way out "}}]}\n\n'
+    'data: {"choices":[{"delta":{"content":"of here. "}}]}\n\n'
+    'data: {"choices":[{"delta":{"content":"[REMEMBER: the player asked '
+    'about the medkit]"}}]}\n\n'
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+    'data: [DONE]\n\n'
+)
+FIXTURE_TEXT = "Hold still. I know a way out of here."
+
+
+def run_sim_cfg(store, routes, overrides, timeout=900):
+    """One run with config.json temporarily carrying `overrides` on top."""
+    path = os.path.join(MOD, "config.json")
+    before = open(path, "r", encoding="utf-8").read()
+    doc = json.loads(before)
+    doc.update(overrides)
+    open(path, "w", encoding="utf-8").write(json.dumps(doc, indent=2))
+    try:
+        return run_sim(store, routes, timeout=timeout)
+    finally:
+        open(path, "w", encoding="utf-8").write(before)
+
+
+def _say_segs(doc):
+    """Every `say` event on the stream, in order, as (text, final, idx)."""
+    out = []
+    for e in (doc or {}).get("events", []):
+        if not isinstance(e, dict) or e.get("kind") != "say":
+            continue
+        d = e.get("data")
+        if isinstance(d, str):
+            try:
+                d = json.loads(d)
+            except ValueError:
+                d = {}
+        d = d or {}
+        out.append((d.get("text", ""), bool(d.get("final")),
+                    d.get("segmentIdx", -1)))
+    return out
+
+
+def check_streaming(rep, store):
+    fixture = os.path.join(store, "fake-stream.sse")
+    open(fixture, "w", encoding="utf-8").write(FIXTURE_SSE)
+    # A PER-RUN cacheDir. The brain's line cache lives under the MOD's data/
+    # directory by default, not under --store, so it survives between whole
+    # invocations of this script: without this, the second run of the day
+    # answers every one of these from tier 0 and the checks below pass without
+    # ever touching the streaming path.
+    def cfg(n, **kw):
+        d = {"llmEngine": "openai",
+             "llmFakeStreamFile": fixture.replace("\\", "/"),
+             "debugTickRoute": True, "llmFakeChunkBytes": 120,
+             "turnTimeoutMs": 60000, "llmFakeStreamStall": False,
+             "cacheDir": os.path.join(store, "brain-%s" % n).replace("\\", "/")}
+        d.update(kw)
+        return d
+    base = cfg("probe")
+
+    docs, raw, err = run_sim_cfg(store, [
+        (BASE + "/world/new", '{"preset":"warlords","seed":7}'),
+        (BASE + "/world/people", ""),
+    ], base)
+    if err:
+        rep.add(INCONCLUSIVE, "streaming: world/new", err)
+        return
+    person = pick_person(docs[1], "grunt") or pick_person(docs[1], "slaver")
+    if not person:
+        rep.add(INCONCLUSIVE, "streaming: a person to talk to",
+                "the generated world has nobody with role grunt or slaver")
+        return
+    pid = person["id"]
+    # A DIFFERENT utterance per sub-run, deliberately: the brain's line cache
+    # is keyed on the normalised utterance and PERSISTS in the store between
+    # simulator runs, so re-using one makes every later run a tier-0 cache hit
+    # -- which is a check that cannot fail, in the exact shape section 9b of
+    # CLAUDE.md is about. MEASURED here first time round: the synchronous
+    # negative control came back `tier='cache'` and proved nothing.
+    utt = "what do you want for the medkit"
+    utt_sync = "how much do you want for the bandage"
+    utt_stall = "where does the road go at night"
+
+    routes = [
+        (BASE + "/world/new", '{"preset":"warlords","seed":7}'),
+        (BASE + "/say", json.dumps({"person": pid, "text": utt})),
+        # TWO ticks, not one: the parser holds the last fragment back because
+        # it may still be growing, so the first sentence can only be emitted
+        # on the poll that brings text AFTER it. Three ticks finish this
+        # fixture, so at two the turn is provably still in flight.
+        (BASE + "/tick", '{"n":2}'),
+        (BASE + "/events?since=0&wait=0", ""),
+        (BASE + "/tick", '{"n":20}'),
+        (BASE + "/events?since=0&wait=0", ""),
+        (BASE + "/status", ""),
+    ]
+    docs, raw, err = run_sim_cfg(store, routes, cfg("stream"))
+    if err:
+        rep.add(INCONCLUSIVE, "streaming: the run", err)
+        return
+    say, tick1, ev1, tickN, ev2, status = (docs[1], docs[2], docs[3], docs[4],
+                                           docs[5], docs[6])
+    if not isinstance(say, dict) or "__unparsed__" in say:
+        rep.add(FAIL, "streaming: /say answers with a receipt",
+                "route answered %s\n%s" % (json.dumps(say)[:300], raw[-800:]))
+        return
+    receipt = (say.get("streaming") is True and say.get("turnId", 0) > 0
+               and not say.get("text"))
+    rep.add(PASS if receipt else FAIL, "streaming: /say answers at once with a receipt",
+            "streaming=%s turnId=%s tier=%r text=%r (the reply has not been "
+            "generated yet, so text must be empty)"
+            % (say.get("streaming"), say.get("turnId"), say.get("tier"),
+               (say.get("text") or "")[:60]))
+    if not receipt:
+        return
+
+    # THE timing assertion. After ONE tick the turn must still be in flight and
+    # a sentence must already have been spoken. Either half alone is worthless:
+    # a segment after the stream ended is the synchronous path, and an
+    # in-flight turn with no segment is just a slow one.
+    early = _say_segs(ev1)
+    in_flight = (tick1 or {}).get("streamsInFlight", -1)
+    ok = bool(early) and in_flight >= 1 and not any(f for _, f, _ in early)
+    rep.add(PASS if ok else FAIL,
+            "streaming: a sentence is spoken BEFORE the stream ends",
+            "after 2 ticks: %d say segment(s) %s, streamsInFlight=%s "
+            "(a segment with the turn already finished would be the "
+            "synchronous path)"
+            % (len(early), [t for t, _, _ in early], in_flight))
+
+    late = _say_segs(ev2)
+    finals = [t for t, f, _ in late if f]
+    spoken = " ".join(t for t, _, _ in late if t)
+    rep.add(PASS if len(finals) == 1 else FAIL,
+            "streaming: exactly one segment carries final:true",
+            "%d segment(s) total, %d final: %s"
+            % (len(late), len(finals), finals))
+    bracketed = [t for t, _, _ in late if "[" in t or "]" in t]
+    rep.add(PASS if not bracketed else FAIL,
+            "streaming: no segment speaks a bracket tag",
+            "segments=%s; bracketed=%s" % ([t for t, _, _ in late], bracketed))
+    idxs = [i for _, _, i in late]
+    rep.add(PASS if idxs == sorted(idxs) and len(set(idxs)) == len(idxs) else FAIL,
+            "streaming: segmentIdx is strictly increasing",
+            "segmentIdx=%s" % idxs)
+
+    done = event_with_kind(ev2, "turn.done")
+    dd = (done or {}).get("data")
+    if isinstance(dd, str):
+        try:
+            dd = json.loads(dd)
+        except ValueError:
+            dd = {}
+    dd = dd or {}
+    tags = dd.get("tags") or []
+    remembers = [t for t in tags if str(t).upper().startswith("REMEMBER")]
+    rep.add(PASS if done and len(remembers) == 1 else FAIL,
+            "streaming: the reply's tag is applied ONCE, on completion",
+            "turn.done=%s tier=%r text=%r tags=%s directives=%s"
+            % (bool(done), dd.get("tier"), (dd.get("text") or "")[:70], tags,
+               dd.get("directives")))
+    rep.add(PASS if spoken == FIXTURE_TEXT else FAIL,
+            "streaming: the spoken text is the fixture's text",
+            "spoken=%r expected=%r" % (spoken, FIXTURE_TEXT))
+    st = (status or {}).get("stream", {})
+    print("    stream stats: %s" % json.dumps(st))
+
+    # ---- negative control 1: llmStreaming:false is synchronous, same text.
+    sync = cfg("sync", llmStreaming=False)
+    docs, raw, err = run_sim_cfg(store, [
+        (BASE + "/world/new", '{"preset":"warlords","seed":7}'),
+        (BASE + "/say", json.dumps({"person": pid, "text": utt_sync})),
+    ], sync)
+    if err:
+        rep.add(INCONCLUSIVE, "streaming: the synchronous negative control", err)
+    else:
+        s2 = docs[1] or {}
+        segs = [x.get("text", "") for x in (s2.get("segments") or [])]
+        same = (s2.get("streaming") is not True
+                and " ".join(segs) == FIXTURE_TEXT)
+        rep.add(PASS if same else FAIL,
+                "streaming OFF: the reply is synchronous and identical in text "
+                "(negative control)",
+                "streaming=%s tier=%r text=%r segments=%s"
+                % (s2.get("streaming"), s2.get("tier"),
+                   (s2.get("text") or "")[:70], segs))
+
+    # ---- negative control 2: a stream that never ends hits the timeout.
+    stall = cfg("stall", llmFakeStreamStall=True, turnTimeoutMs=1000)
+    docs, raw, err = run_sim_cfg(store, [
+        (BASE + "/world/new", '{"preset":"warlords","seed":7}'),
+        (BASE + "/say", json.dumps({"person": pid, "text": utt_stall})),
+        (BASE + "/tick", '{"n":1}'),
+        # The only way to make wall-clock time pass between routes without a
+        # sleep primitive: the bounded busy poll on the request thread.
+        (BASE + "/events?since=0&wait=2000", ""),
+        (BASE + "/tick", '{"n":1}'),
+        (BASE + "/events?since=0&wait=0", ""),
+    ], stall)
+    if err:
+        rep.add(INCONCLUSIVE, "streaming: the timeout path", err)
+        return
+    tdone = event_with_kind(docs[5], "turn.done")
+    td = (tdone or {}).get("data")
+    if isinstance(td, str):
+        try:
+            td = json.loads(td)
+        except ValueError:
+            td = {}
+    td = td or {}
+    notes = " ".join(str(n) for n in (td.get("notes") or []))
+    says = _say_segs(docs[5])
+    timed_out = (td.get("tier") == "timeout" and "TIMED OUT" in notes
+                 and any(f for _, f, _ in says))
+    rep.add(PASS if timed_out else FAIL,
+            "streaming: a stream that never ends times out and says so "
+            "(negative control)",
+            "tier=%r inFlight-after=%s segments=%s notes=%r"
+            % (td.get("tier"), (docs[4] or {}).get("streamsInFlight"),
+               [t for t, _, _ in says], notes[:200]))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--store", default="",
@@ -1022,6 +1262,8 @@ def main():
         check_ptt(rep, store)
         print("")
         check_crash_sequence(rep, store)
+        print("")
+        check_streaming(rep, store)
     finally:
         if cfg_path and original is not None:
             open(cfg_path, "w", encoding="utf-8").write(original)

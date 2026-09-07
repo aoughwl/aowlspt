@@ -12,19 +12,21 @@
 ## `llmComplete` returns "" with a note **without invoking curl at all** — a
 ## check in the selfcheck asserts exactly that, by counting curl invocations.
 ##
-## STREAMING, AND ITS ONE HONEST LIMITATION
-## ----------------------------------------
-## The anthropic path runs `curl -N -s` with the SSE written to a file, and then
-## parses that file. `util.runCmd` is `execCmdEx`, which BLOCKS until the child
-## exits, and a nimony mod has no threads and no async to poll the growing file
-## from. So the sentences reach the sink in order, one call per sentence, but
-## they reach it AFTER the response has finished arriving rather than while it
-## arrives. The parser is written against the real event stream (it consumes
-## `data:` lines incrementally in arrival order), so making this genuinely
-## concurrent is a change to how curl is launched — a detached curl plus a tick
-## that re-reads the file — and not a change to the parsing below. Said out loud
-## here because a "streaming" engine that silently is not one is exactly the
-## class of quiet wrongness this repo keeps paying for.
+## STREAMING: TWO PATHS, AND WHICH ONE YOU GOT IS SAID OUT LOUD
+## ------------------------------------------------------------
+## `llmComplete` (below) is the SYNCHRONOUS path: `util.runCmd` is `execCmdEx`,
+## which BLOCKS until curl exits, so its sentences reach the sink in order but
+## only AFTER the whole response has arrived. That cost ~4 s before the first
+## spoken sentence on gpt-4o-mini, MEASURED 2026-09-07.
+##
+## `llmStreamStart` / `llmStreamPoll` (bottom of this file) is the ASYNC path
+## the fix predicted: a DETACHED curl writing the SSE to a file, and a caller
+## that re-reads the new bytes every tick. The parsing did not have to change —
+## it always consumed `data:` lines in arrival order — only the launch did.
+## `llmStreaming: false` in config selects the synchronous path unchanged, and
+## `llmStreamStats().streaming` reports which one is live, because a "streaming"
+## engine that silently is not one is exactly the class of quiet wrongness this
+## repo keeps paying for.
 
 import std/[strutils, envvars]
 import aowlspt
@@ -144,6 +146,22 @@ type
     buf: string          ## text not yet emitted as a sentence
     emitted: int
 
+proc tailAfter*(buf, tail: string): string =
+  ## `tail` with the WHITESPACE `splitSentences` stripped off it put back.
+  ##
+  ## MEASURED 2026-09-07: re-seeding the buffer with `parts[^1]` ate the space
+  ## at the end of "I know a way out ", and the next arriving chunk landed
+  ## against it -- "I know a way outof here." The sentence text was right in
+  ## every check that happened to receive both chunks in one poll, which is
+  ## exactly the kind of defect that passes until the network is slow.
+  if tail.len == 0: return ""
+  if tail.len > buf.len: return tail
+  var i = buf.len - tail.len
+  while i >= 0:
+    if buf[i ..< i + tail.len] == tail: return buf[i ..< buf.len]
+    i = i - 1
+  result = tail
+
 proc feed(st: var Streamer; chunk: string; sink: SegmentSink) =
   ## Emit every COMPLETE sentence now available, in order, and keep the tail.
   st.buf.add chunk
@@ -155,7 +173,7 @@ proc feed(st: var Streamer; chunk: string; sink: SegmentSink) =
     if sink != nil: sink(parts[i], false)
     st.emitted = st.emitted + 1
     i = i + 1
-  st.buf = parts[parts.len - 1]
+  st.buf = tailAfter(st.buf, parts[parts.len - 1])
 
 proc finish(st: var Streamer; sink: SegmentSink) =
   let tail = st.buf.strip()
@@ -422,3 +440,377 @@ proc llmProbeJson*(p: LlmProbe): JsonObject =
   result.put("ok", p.ok)
   result.put("note", p.note)
   result.put("curlCalls", gCurlCalls)
+
+# ---------------------------------------------------------------------------
+# ASYNC STREAMING -- a detached curl plus a tick that re-reads the file
+# ---------------------------------------------------------------------------
+#
+# The limitation stated at the top of this file is what this section removes.
+# `llmComplete` runs curl to completion, so on gpt-4o-mini the first sentence
+# reaches the player ~4 s after they stopped talking (MEASURED 2026-09-07).
+# Here curl is spawned DETACHED, writing the SSE to a file with `-o`, and the
+# mod's tick polls that file: the parse is incremental and byte-positioned, so
+# each poll consumes only what arrived since the last one.
+#
+# HONESTY ABOUT THE END OF A STREAM. There are three independent end signals
+# and all three are used, because each alone has a hole: `data: [DONE]` /
+# `message_stop` (absent when the connection dies), the exit-code file the
+# `cmd /c` wrapper writes after curl returns (absent when the wrapper itself
+# never starts), and the caller's timeout. A turn that ends on the timeout says
+# so in its note rather than looking like a short reply.
+#
+# THE FAKE. `llmFakeStreamFile` points at a fixture SSE file and makes the
+# whole path run with NO curl and NO key: the poller reveals `fakeChunkBytes`
+# of it per poll, so "a sentence was emitted BEFORE the stream ended" is a
+# thing the sim can actually observe. `llmFakeStreamStall` reveals the first
+# chunk and then nothing, which is the input that makes the timeout path fire.
+
+var cStreaming: bool = true
+var cMaxInFlight: int = 4
+var cTurnTimeoutMs: int = 60000
+var cFakeFile: string = ""
+var cFakeStall: bool = false
+var cFakeChunk: int = 240
+
+var gTId: seq[int] = @[]
+var gTOut: seq[string] = @[]
+var gTCode: seq[string] = @[]
+var gTPos: seq[int] = @[]        ## bytes of the file already parsed
+var gTPend: seq[string] = @[]    ## the partial last line
+var gTFake: seq[bool] = @[]
+var gTEnded: seq[bool] = @[]     ## an end marker was seen
+var gTEvents: seq[int] = @[]
+var gTStop: seq[string] = @[]    ## stop_reason, when the provider sent one
+var gTErr: seq[string] = @[]
+var gNextTurn: int = 0
+var gStreamStarts: int = 0
+
+proc llmStreamingConfigure*(streaming: bool; maxInFlight, turnTimeoutMs: int;
+                            fakeFile: string; fakeStall: bool;
+                            fakeChunkBytes: int) =
+  cStreaming = streaming
+  if maxInFlight > 0: cMaxInFlight = maxInFlight
+  if turnTimeoutMs > 0: cTurnTimeoutMs = turnTimeoutMs
+  cFakeFile = fakeFile
+  cFakeStall = fakeStall
+  if fakeChunkBytes > 0: cFakeChunk = fakeChunkBytes
+
+proc llmStreamingEnabled*(): bool = cStreaming
+proc llmTurnTimeoutMs*(): int = cTurnTimeoutMs
+proc llmMaxInFlight*(): int = cMaxInFlight
+proc llmStreamInFlight*(): int = gTId.len
+proc llmStreamStarts*(): int = gStreamStarts
+
+proc llmCanStream*(): bool =
+  ## Which engines have a token-by-token wire format here. `llamacpp` prints to
+  ## stdout and `builtin`/`none` never call anything, so they stay synchronous
+  ## rather than pretending.
+  if not cStreaming: return false
+  if cFakeFile.len > 0: return true
+  result = cEngine == "anthropic" or cEngine == "openai"
+
+proc findTurn(id: int): int =
+  result = -1
+  var i = 0
+  while i < gTId.len:
+    if gTId[i] == id: return i
+    i = i + 1
+
+proc dropTurnAt(idx: int) =
+  if idx < 0 or idx >= gTId.len: return
+  var a: seq[int] = @[]
+  var b: seq[string] = @[]
+  var c: seq[string] = @[]
+  var d: seq[int] = @[]
+  var e: seq[string] = @[]
+  var f: seq[bool] = @[]
+  var g: seq[bool] = @[]
+  var h: seq[int] = @[]
+  var k: seq[string] = @[]
+  var m: seq[string] = @[]
+  var i = 0
+  while i < gTId.len:
+    if i != idx:
+      a.add gTId[i]
+      b.add gTOut[i]
+      c.add gTCode[i]
+      d.add gTPos[i]
+      e.add gTPend[i]
+      f.add gTFake[i]
+      g.add gTEnded[i]
+      h.add gTEvents[i]
+      k.add gTStop[i]
+      m.add gTErr[i]
+    i = i + 1
+  gTId = a
+  gTOut = b
+  gTCode = c
+  gTPos = d
+  gTPend = e
+  gTFake = f
+  gTEnded = g
+  gTEvents = h
+  gTStop = k
+  gTErr = m
+
+proc llmStreamDrop*(id: int) =
+  dropTurnAt(findTurn(id))
+
+proc openAiStreamBody(system, user: string): string =
+  var sys = obj()
+  sys.put("role", "system")
+  sys.put("content", system)
+  var usr = obj()
+  usr.put("role", "user")
+  usr.put("content", user)
+  var msgs = arr()
+  msgs.add done(sys)
+  msgs.add done(usr)
+  var root = obj()
+  root.put("model", cOpenAiModel)
+  root.put("max_tokens", cMaxTokens)
+  root.put("stream", true)
+  root.put("messages", done(msgs))
+  result = done(root).text
+
+proc spawnCurlDetached(curlCmd, codeFile: string): bool =
+  ## `Start-Process` so no handle is inherited (util.spawnDetached says why),
+  ## wrapping curl in a `cmd /c` that writes an exit-code file afterwards --
+  ## that file is the "the process is gone" signal the poller needs and that a
+  ## detached spawn otherwise cannot give.
+  let inner = curlCmd & " && (echo 0> " & quoteArg(codeFile) &
+              ") || (echo 1> " & quoteArg(codeFile) & ")"
+  let r = runCmd("powershell -NoProfile -NonInteractive -Command " &
+                 "\"Start-Process -FilePath 'cmd.exe' -ArgumentList " &
+                 psQuote("/c " & inner) & " -WindowStyle Hidden\"")
+  result = not r.failed
+
+proc llmStreamStart*(system, user: string; id: var int;
+                     note: var string): bool =
+  ## Launch a turn and return AT ONCE. False + a note means nothing was
+  ## launched and the caller must fall back to the synchronous path.
+  id = -1
+  note = ""
+  if not llmCanStream():
+    note = "engine '" & cEngine & "' has no streaming path here" &
+           (if cStreaming: "" else: " (llmStreaming is off)")
+    return false
+  if gTId.len >= cMaxInFlight:
+    note = "maxTurnsInFlight (" & $cMaxInFlight & ") already streaming; " &
+           "this turn was answered synchronously instead"
+    return false
+  let outFile = tempPath(".sse")
+  let codeFile = outFile & ".code"
+  var fake = false
+  if cFakeFile.len > 0:
+    # The fixture stands in for curl entirely: no key is read and no process
+    # is started, and `llmCurlCalls()` therefore does not move -- which is what
+    # the "no key -> no curl" check counts.
+    if not exists(cFakeFile):
+      note = "llmFakeStreamFile is set to " & cFakeFile & " and there is no " &
+             "such file; nothing was started"
+      return false
+    fake = true
+  elif cEngine == "anthropic":
+    let key = getEnv("ANTHROPIC_API_KEY", "")
+    if key.len == 0:
+      note = "anthropic: ANTHROPIC_API_KEY is not set; no request was made"
+      return false
+    let bodyFile = tempPath(".json")
+    if not writeAll(bodyFile, anthropicBody(system, user)):
+      note = "anthropic: could not write the request body to " & bodyFile
+      return false
+    gCurlCalls = gCurlCalls + 1
+    if not spawnCurlDetached(quoteArg(cCurlExe) & " -N -s --max-time 120" &
+        " -H \"x-api-key: " & key & "\"" &
+        " -H \"anthropic-version: " & AnthropicVersion & "\"" &
+        " -H \"content-type: application/json\"" &
+        " --data-binary @" & quoteArg(bodyFile) &
+        " -o " & quoteArg(outFile) & " " & quoteArg(AnthropicUrl), codeFile):
+      note = "anthropic: could not spawn a detached curl"
+      return false
+  else:
+    let key = getEnv("OPENAI_API_KEY", "")
+    if key.len == 0:
+      note = "openai: OPENAI_API_KEY is not set; no request was made"
+      return false
+    let bodyFile = tempPath(".json")
+    if not writeAll(bodyFile, openAiStreamBody(system, user)):
+      note = "openai: could not write the request body to " & bodyFile
+      return false
+    gCurlCalls = gCurlCalls + 1
+    if not spawnCurlDetached(quoteArg(cCurlExe) & " -N -s --max-time 120" &
+        " -H \"Content-Type: application/json\"" &
+        " -H \"Authorization: Bearer " & key & "\"" &
+        " --data-binary @" & quoteArg(bodyFile) &
+        " -o " & quoteArg(outFile) &
+        " https://api.openai.com/v1/chat/completions", codeFile):
+      note = "openai: could not spawn a detached curl"
+      return false
+  gNextTurn = gNextTurn + 1
+  gStreamStarts = gStreamStarts + 1
+  id = gNextTurn
+  gTId.add id
+  gTOut.add (if fake: cFakeFile else: outFile)
+  gTCode.add codeFile
+  gTPos.add 0
+  gTPend.add ""
+  gTFake.add fake
+  gTEnded.add false
+  gTEvents.add 0
+  gTStop.add ""
+  gTErr.add ""
+  note = (if fake: "streaming from the fixture " & cFakeFile &
+                   " (no curl, no key)"
+          else: "streaming " & cEngine & " " & llmModel() & " into " & outFile)
+  result = true
+
+proc deltaOfPayload(payload: string; stopReason: var string; apiErr: var string;
+                    ended: var bool): string =
+  ## One payload, either wire shape. Anthropic events carry `type`; OpenAI's
+  ## chunks carry `choices`. Neither is assumed of the other.
+  result = ""
+  let t = jr.asText(jr.child(jr.whole(payload), "type"), "")
+  if t.len > 0:
+    case t
+    of "content_block_delta":
+      result = deltaTextOf(payload)
+    of "message_delta":
+      let sr = jr.asText(jr.field(payload, "delta.stop_reason"), "")
+      if sr.len > 0: stopReason = sr
+    of "message_stop":
+      ended = true
+    of "error":
+      apiErr = jr.asText(jr.field(payload, "error.message"), "")
+      if apiErr.len == 0: apiErr = oneLine(payload)
+    else:
+      discard
+    return
+  let ch = jr.at(jr.field(payload, "choices"), 0)
+  result = jr.asText(jr.child(jr.child(ch, "delta"), "content"), "")
+  let fr = jr.asText(jr.child(ch, "finish_reason"), "")
+  if fr.len > 0 and fr != "null":
+    stopReason = fr
+    ended = true
+  let em = jr.asText(jr.field(payload, "error.message"), "")
+  if em.len > 0: apiErr = em
+
+proc llmStreamPoll*(id: int; newText: var string; finished: var bool;
+                    note: var string): bool =
+  ## Consume whatever arrived since the last poll. `finished` is the finished
+  ## STATE of the stream, not "this poll produced nothing" -- a stream that is
+  ## merely slow reports false with an empty `newText`.
+  newText = ""
+  finished = false
+  note = ""
+  let idx = findTurn(id)
+  if idx < 0:
+    note = "no in-flight turn " & $id
+    return false
+  let content = readAll(gTOut[idx])
+  var avail = content.len
+  if gTFake[idx]:
+    let want = gTPos[idx] + cFakeChunk
+    if cFakeStall and gTPos[idx] > 0:
+      avail = gTPos[idx]
+    elif want < avail:
+      avail = want
+  if avail > gTPos[idx]:
+    let text = gTPend[idx] & content[gTPos[idx] ..< avail]
+    gTPos[idx] = avail
+    # Only COMPLETE lines are parsed; the tail is carried to the next poll.
+    var lines: seq[string] = @[]
+    var cur = ""
+    for chx in text:
+      if chx == '\n':
+        lines.add cur
+        cur = ""
+      elif chx != '\r':
+        cur.add chx
+    gTPend[idx] = cur
+    for line in lines:
+      if not line.startsWith("data:"): continue
+      let payload = line[5 ..< line.len].strip()
+      if payload.len == 0: continue
+      if payload == "[DONE]":
+        gTEnded[idx] = true
+        continue
+      gTEvents[idx] = gTEvents[idx] + 1
+      var stop = gTStop[idx]
+      var err = gTErr[idx]
+      var ended = gTEnded[idx]
+      let piece = deltaOfPayload(payload, stop, err, ended)
+      gTStop[idx] = stop
+      gTErr[idx] = err
+      gTEnded[idx] = ended
+      if piece.len > 0: newText.add piece
+  if gTEnded[idx]:
+    finished = true
+  elif gTFake[idx]:
+    if gTPos[idx] >= content.len and not cFakeStall: finished = true
+  elif exists(gTCode[idx]) and gTPos[idx] >= content.len:
+    # curl is gone AND everything it wrote has been parsed. Both halves matter:
+    # the exit-code file can land while the last bytes are still unread.
+    finished = true
+  if finished:
+    if gTErr[idx].len > 0:
+      note = "the API returned an error event: " & gTErr[idx]
+    elif gTEvents[idx] == 0:
+      note = "the stream ended with no SSE events (" & $content.len &
+             " bytes in " & gTOut[idx] & ") -- curl wrote something that is " &
+             "not an event stream"
+    else:
+      note = $gTEvents[idx] & " SSE events" &
+             (if gTStop[idx].len > 0: ", stop_reason=" & gTStop[idx] else: "")
+  result = true
+
+proc llmStreamStopReason*(id: int): string =
+  let idx = findTurn(id)
+  if idx < 0: return ""
+  result = gTStop[idx]
+
+proc llmStreamStats*(): JsonObject =
+  result = obj()
+  result.put("streaming", cStreaming)
+  result.put("canStream", llmCanStream())
+  result.put("inFlight", gTId.len)
+  result.put("maxInFlight", cMaxInFlight)
+  result.put("turnTimeoutMs", cTurnTimeoutMs)
+  result.put("started", gStreamStarts)
+  result.put("fakeStreamFile", cFakeFile)
+  result.put("fakeStall", cFakeStall)
+
+proc llmHasFake*(): bool = cFakeFile.len > 0
+
+proc llmFakeSyncComplete*(sink: SegmentSink; note: var string): string =
+  ## The SYNCHRONOUS shape of the very same fixture, so the negative control
+  ## ("with llmStreaming off the reply is identical in text") compares like
+  ## with like instead of comparing streaming against the builtin fallback --
+  ## which would differ for a reason that is not the code under test.
+  note = ""
+  let text = readAll(cFakeFile)
+  if text.len == 0:
+    note = "llmFakeStreamFile " & cFakeFile & " is missing or empty"
+    return ""
+  var st = Streamer(buf: "", emitted: 0)
+  var full = ""
+  var events = 0
+  var stop = ""
+  var err = ""
+  var ended = false
+  for line in splitLines0(text):
+    if not line.startsWith("data:"): continue
+    let payload = line[5 ..< line.len].strip()
+    if payload.len == 0 or payload == "[DONE]": continue
+    events = events + 1
+    let piece = deltaOfPayload(payload, stop, err, ended)
+    if piece.len > 0:
+      full.add piece
+      feed(st, piece, sink)
+  finish(st, sink)
+  if err.len > 0:
+    note = "the fixture carries an error event: " & err
+    return ""
+  note = "llmFakeStreamFile (SYNCHRONOUS): " & $events & " SSE events, " &
+         $full.len & " chars, no curl and no key"
+  result = full
