@@ -81,8 +81,13 @@ proc llmModel*(): string =
   else: result = ""
 
 proc tempPath(suffix: string): string =
+  ## WALL-clock ms, not `nowMs()` (ms since the host started): MEASURED
+  ## 2026-09-07, two backend restarts issued their first turn ~8125 ms after
+  ## start, so both named their files `aowlbm_8125_1.sse`; the second turn
+  ## found the first's `.code` file already on disk and the pump declared it
+  ## finished at 1.2 s with "0 bytes" before curl had written anything.
   gSeq = gSeq + 1
-  result = joinPath(cWorkDir, "aowlbm_" & $nowMs() & "_" & $gSeq & suffix)
+  result = joinPath(cWorkDir, "aowlbm_" & $wallMs() & "_" & $gSeq & suffix)
 
 # ---------------------------------------------------------------------------
 # Probe
@@ -574,16 +579,44 @@ proc openAiStreamBody(system, user: string): string =
   result = done(root).text
 
 proc spawnCurlDetached(curlCmd, codeFile: string): bool =
-  ## `Start-Process` so no handle is inherited (util.spawnDetached says why),
-  ## wrapping curl in a `cmd /c` that writes an exit-code file afterwards --
-  ## that file is the "the process is gone" signal the poller needs and that a
-  ## detached spawn otherwise cannot give.
-  let inner = curlCmd & " && (echo 0> " & quoteArg(codeFile) &
-              ") || (echo 1> " & quoteArg(codeFile) & ")"
-  let r = runCmd("powershell -NoProfile -NonInteractive -Command " &
-                 "\"Start-Process -FilePath 'cmd.exe' -ArgumentList " &
-                 psQuote("/c " & inner) & " -WindowStyle Hidden\"")
-  result = not r.failed
+  ## A per-turn PowerShell wrapper FILE runs curl through `cmd /c` and writes
+  ## the exit code afterwards; that file is the "the process is gone" signal
+  ## the poller needs and that a detached spawn otherwise cannot give.
+  ##
+  ## Why a file and not an inline command line -- MEASURED 2026-09-07 on the
+  ## live sidecar: the inline form `... && (echo 0> code) || (echo 1> code)`
+  ## produced a 0-byte code file at once and NO .sse at all: cmd reads the
+  ## digit before `>` as a stream handle (`0>` redirects stdin), and the
+  ## nested PowerShell/cmd quoting of the `-H "..."` headers broke the curl
+  ## line, so the `||` branch ran immediately. The recorder wrapper
+  ## (speech.nim) already uses a script file for the same reason.
+  let ps1 = codeFile & ".ps1"
+  # No `cmd /c`: MEASURED 2026-09-07, a line that BEGINS with a quoted exe
+  # (`"curl.exe" -N ...`) makes cmd strip the first and last quote of the
+  # whole line, which mangles the `-o "<path>"` at the end -- curl exited 1
+  # and wrote nothing. The wrapper starts curl itself: exe and arguments
+  # split here, each in a single-quoted PowerShell string.
+  var exe = curlCmd
+  var args = ""
+  if curlCmd.len > 0 and curlCmd[0] == '"':
+    let q = curlCmd.find('"', 1)
+    if q > 0:
+      exe = curlCmd[1 ..< q]
+      args = curlCmd[q + 1 .. ^1].strip()
+  else:
+    let sp = curlCmd.find(' ')
+    if sp > 0:
+      exe = curlCmd[0 ..< sp]
+      args = curlCmd[sp + 1 .. ^1].strip()
+  let script = "$ErrorActionPreference = 'Continue'\r\n" &
+    "$p = Start-Process -FilePath '" & exe.replace("'", "''") &
+    "' -ArgumentList '" & args.replace("'", "''") &
+    "' -Wait -PassThru -WindowStyle Hidden\r\n" &
+    "Set-Content -Path '" & codeFile.replace("'", "''") &
+    "' -Value ([string]$p.ExitCode) -NoNewline\r\n"
+  if not writeAll(ps1, script): return false
+  result = spawnDetached("powershell.exe",
+    "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File " & quoteArg(ps1))
 
 proc llmStreamStart*(system, user: string; id: var int;
                      note: var string): bool =

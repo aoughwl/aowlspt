@@ -10012,3 +10012,11 @@ MEASURED on boots 7 and 8 of the day (`aowlspt-launch --raid Woods --raidexit 45
 * **python on PATH in this repo's shells is MSYS ucrt64 CPython 3.14 with NO pip**; kokoro-onnx pins <3.14 and onnxruntime/torch have no MinGW wheels -- `uv` (`~/.local/bin/uv`) makes the venvs.
 * `basement_check.py --set KEY=VALUE` overrides config per run; CHECK 19 (two voice tags -> different wav bytes; same tag -> cache hit) PASSES on kokoro (6972) and chatterbox (6973), INCONCLUSIVE on piper (one model for every tag).
 * Decision (coordinator): the live sidecar defaults to `kokoro` (responsive: ~1.3 s a sentence, first chunk 0.6 s); `chatterbox` is the cloning option at 3-5 s a sentence until a streaming build exists.
+
+## 2026-09-07 (afternoon, 2): the streaming turn went live on the sidecar -- three launcher traps and one lock cost
+
+* `echo 0> file` in a `cmd /c` line writes an EMPTY file (the digit before `>` is a stream handle) -- the detached curl's exit-code file was born empty and the pump declared the turn finished at once. Same trap the PTT wrapper hit earlier in the day.
+* A `cmd /c` line that BEGINS with a quoted exe (`"curl.exe" -N ...`) makes cmd strip the first and last quote of the whole line, mangling the trailing `-o "<path>"` -- curl exited 1 with no output. The wrapper `.ps1` now starts curl itself (`Start-Process -FilePath curl.exe -ArgumentList '...' -Wait -PassThru`) and writes the exit code with Set-Content.
+* `nowMs()` is ms since the HOST started, so two restarted backends named their first turn's files identically (`aowlbm_8125_1.sse`) and the second turn found the first's `.code` file -> "finished, 0 bytes". Temp names use `wallMs()` now.
+* With all three fixed: a gpt-4o-mini reply streamed as 5 `say` segments, each with its Kokoro wav, while the model was still writing; the trailing `[MOOD: -0.2]` was split at the decimal point and SPOKEN as two segments -> the pump now holds everything from the first `[` until the stream ends.
+* COST to record: TTS runs inside the tick under the mod lock, so a 1.3 s Kokoro sentence blocks every route (one `/events` poll timed out at 5 s during a 5-sentence turn). Moving synthesis out of the lock (detached server request + tick pickup, like the LLM stream) is the next performance step.

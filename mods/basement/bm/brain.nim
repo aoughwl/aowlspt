@@ -424,13 +424,22 @@ proc brainStreamPump*(id: int; sink: SegmentSink; d: var Decision;
   if newText.len > 0:
     var buf = gSBuf[idx]
     buf.add newText
-    let parts = splitSentences(buf)
+    # Tags sit at the END of a reply, and a half-arrived tag must never be
+    # spoken: MEASURED 2026-09-07 on the live sidecar, `[MOOD: -0.2]` was
+    # split at its decimal point and spoken as "[MOOD: -0." and "2]". So only
+    # the text BEFORE the first `[` is split into sentences; everything from
+    # the bracket on waits in the buffer until the stream ends, where
+    # emitStreamSentence strips and records it.
+    let cut = buf.find('[')
+    let head = (if cut >= 0: buf[0 ..< cut] else: buf)
+    let tail = (if cut >= 0: buf[cut .. ^1] else: "")
+    let parts = splitSentences(head)
     if parts.len > 1:
       var i = 0
       while i < parts.len - 1:
         emitStreamSentence(idx, parts[i], false, sink)
         i = i + 1
-      buf = tailAfter(buf, parts[parts.len - 1])
+      buf = tailAfter(head, parts[parts.len - 1]) & tail
     gSBuf[idx] = buf
   let timedOut = (not finished) and
                  (wallMs() - gSStartMs[idx]) > int64(llmTurnTimeoutMs())
@@ -450,7 +459,22 @@ proc brainStreamPump*(id: int; sink: SegmentSink; d: var Decision;
   else:
     if pnote.len > 0: appendJoined(notes, pnote)
     gSNotesJ[idx] = notes
-    emitStreamSentence(idx, gSBuf[idx].strip(), true, sink)
+    # The remainder may hold several sentences plus the tags: strip the tags
+    # once, record them, then speak the sentences in order, the last as final.
+    var restFound: seq[string] = @[]
+    let rest = stripTags(gSBuf[idx], restFound).strip()
+    if restFound.len > 0:
+      var tg = gSTagsJ[idx]
+      for t in restFound: appendJoined(tg, t)
+      gSTagsJ[idx] = tg
+    let restParts = splitSentences(rest)
+    if restParts.len == 0:
+      emitStreamSentence(idx, "", true, sink)
+    else:
+      var j = 0
+      while j < restParts.len:
+        emitStreamSentence(idx, restParts[j], j == restParts.len - 1, sink)
+        j = j + 1
     gSBuf[idx] = ""
     d = buildStreamDecision(idx, "llm")
     gNLlm = gNLlm + 1
