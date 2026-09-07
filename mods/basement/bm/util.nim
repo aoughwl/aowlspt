@@ -64,15 +64,172 @@ proc psQuote*(s: string): string =
 proc quoteArg*(s: string): string =
   result = "\"" & s.replace("\"", "") & "\""
 
-proc spawnDetached*(exe, args: string): bool =
-  ## `Start-Process` passes `bInheritHandles = FALSE`; `CreateProcess` does not,
-  ## and a child holding the write end of our stdout pipe means the read end
-  ## never sees EOF (measured in aowl.voice, twice).
+proc spawnDetachedPs(exe, args: string): bool =
+  ## `Start-Process` passes `bInheritHandles = FALSE`, which is the property
+  ## that matters (see the block below `quoteArg` for the two mechanisms that
+  ## do not have it and what each one cost). It buys that property with a whole
+  ## PowerShell start-up: MEASURED 2026-09-07, 197-204 ms on an idle machine
+  ## and 300-500 ms on the live sidecar. `spawnDetachedProc` gets the same
+  ## property from a direct CreateProcessW, so this is now the FALLBACK and the
+  ## `spawnMode = "powershell"` setting -- kept, because a working slow path is
+  ## worth having when an FFI call is the thing under suspicion.
   let r = runCmd("powershell -NoProfile -NonInteractive -Command " &
                  "\"Start-Process -FilePath " & psQuote(exe) &
                  " -ArgumentList " & psQuote(args) &
                  " -WindowStyle Hidden\"")
   result = not r.failed
+
+# CreateProcessW, called DIRECTLY, because both of the ready-made mechanisms
+# fail the one property that matters and both failures were MEASURED here on
+# 2026-09-07:
+#
+# * `cmd /c start /b "" <child>` is reached THROUGH `runCmd`, so the grandchild
+#   inherits the pipe `runCmd` created for that very call and the parent's read
+#   never sees EOF: a 10-second child blocked the parent for 10110 ms.
+#   Redirecting the child's streams in the command line does not help
+#   (10112 ms); neither does dropping `/b` for a new console (10218 ms). The
+#   handle is inherited before the child performs any redirection of its own.
+# * `std/osproc.startProcess` hardcodes `bInheritHandles = WINBOOL 1`. It is
+#   fast (~1 ms) and it does NOT capture the caller's own runCmd pipe -- but it
+#   hands the child every inheritable handle the PROCESS holds, including the
+#   stdout pipe whoever launched US is reading. MEASURED: with this backend run
+#   under `subprocess.run(capture_output=True)`, four detached whisper-server
+#   children inherited the pipe and `tools/basement_check.py` hung FOREVER
+#   after the simulator itself had already exited. That is the same bug as the
+#   first one with no time limit on it.
+#
+# `bInheritHandles = FALSE` is the property, not the mechanism. PowerShell's
+# `Start-Process` has it and costs 197-204 ms of PowerShell start-up; this
+# costs a CreateProcessW. No STARTF_USESTDHANDLES, so the child is given no
+# std handles at all -- curl writes its body to a file (`-o`) and never to a
+# pipe, and a server we start logs to its own file.
+
+type
+  StartupInfoW = object
+    cb: uint32
+    lpReserved, lpDesktop, lpTitle: pointer
+    dwX, dwY, dwXSize, dwYSize: uint32
+    dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags: uint32
+    wShowWindow, cbReserved2: uint16
+    lpReserved2: pointer
+    hStdInput, hStdOutput, hStdError: pointer
+
+  ProcessInformation = object
+    hProcess, hThread: pointer
+    dwProcessId, dwThreadId: uint32
+
+proc createProcessW(appName, cmdLine, procAttrs, threadAttrs: pointer;
+                    inheritHandles: int32; creationFlags: uint32;
+                    environment, currentDir, startupInfo,
+                    procInfo: pointer): int32 {.
+  stdcall, dynlib: "kernel32", importc: "CreateProcessW", sideEffect.}
+
+proc closeHandleK(h: pointer): int32 {.
+  stdcall, dynlib: "kernel32", importc: "CloseHandle", sideEffect.}
+
+const
+  CreateNoWindow = 0x08000000'u32
+  DetachedProcess = 0x00000008'u32
+
+proc nilPtr(): pointer = cast[pointer](0)
+
+proc toWide(s: string): seq[uint16] =
+  ## UTF-16LE with a NUL terminator. Non-ASCII bytes are passed through as
+  ## Latin-1 code units rather than decoded: every path this is used with comes
+  ## from config.json, which the loader has already read as UTF-8, and a wrong
+  ## GUESS at an encoding would produce a path that silently does not exist.
+  result = @[]
+  for ch in s: result.add uint16(uint8(ch))
+  result.add 0'u16
+
+proc spawnDetachedProc(exe, args: string): bool =
+  ## The command line is `"<exe>" <args>` with `lpApplicationName` NULL, which
+  ## is what every other caller here already builds, so quoting behaviour does
+  ## not change with the mechanism.
+  var ok = false
+  try:
+    var cmdline = quoteArg(exe) & (if args.len > 0: " " & args else: "")
+    var wide = toWide(cmdline)
+    # Zeroed field by field rather than `default(T)`: nimony rejects `default`
+    # on these, and a partially-initialised STARTUPINFOW is a CreateProcess
+    # that reads garbage for `dwFlags` and takes a handle we never set.
+    var si = StartupInfoW(cb: uint32(sizeof(StartupInfoW)),
+                          lpReserved: nilPtr(), lpDesktop: nilPtr(),
+                          lpTitle: nilPtr(),
+                          dwX: 0'u32, dwY: 0'u32, dwXSize: 0'u32,
+                          dwYSize: 0'u32, dwXCountChars: 0'u32,
+                          dwYCountChars: 0'u32, dwFillAttribute: 0'u32,
+                          dwFlags: 0'u32, wShowWindow: 0'u16,
+                          cbReserved2: 0'u16, lpReserved2: nilPtr(),
+                          hStdInput: nilPtr(), hStdOutput: nilPtr(),
+                          hStdError: nilPtr())
+    var pi = ProcessInformation(hProcess: nilPtr(), hThread: nilPtr(),
+                                dwProcessId: 0'u32, dwThreadId: 0'u32)
+    let nilp = nilPtr()
+    let rc = createProcessW(nilp, cast[pointer](addr wide[0]), nilp, nilp,
+                            0'i32,                      # bInheritHandles FALSE
+                            CreateNoWindow or DetachedProcess,
+                            nilp, nilp,
+                            cast[pointer](addr si), cast[pointer](addr pi))
+    if rc != 0'i32:
+      # We never wait on it, so both handles are released at once; the child
+      # keeps running. Leaking them would keep a zombie entry per sentence.
+      discard closeHandleK(pi.hThread)
+      discard closeHandleK(pi.hProcess)
+      ok = true
+  except:
+    ok = false
+  result = ok
+
+var cSpawnMode: string = "process"
+var gSpawnCalls: int = 0
+var gSpawnFallbacks: int = 0
+var gSpawnFailures: int = 0
+var gSpawnLastMs: int64 = 0
+var gSpawnNote: string = "no detached spawn yet"
+
+proc spawnModeConfigure*(mode: string) =
+  ## Anything other than the two known words is REFUSED and the note says so,
+  ## rather than being taken as "the default" -- a typo in config.json must not
+  ## read as a deliberate choice.
+  if mode == "process" or mode == "powershell":
+    cSpawnMode = mode
+    gSpawnNote = "spawnMode = " & mode
+  elif mode.len > 0:
+    gSpawnNote = "spawnMode '" & mode & "' is not one of process|powershell; " &
+                 "keeping " & cSpawnMode
+
+proc spawnMode*(): string = cSpawnMode
+proc spawnCalls*(): int = gSpawnCalls
+proc spawnFallbacks*(): int = gSpawnFallbacks
+proc spawnFailures*(): int = gSpawnFailures
+proc spawnLastMs*(): int64 = gSpawnLastMs
+proc spawnNote*(): string = gSpawnNote
+
+proc spawnDetached*(exe, args: string): bool =
+  ## Start `exe args` and return without waiting. The measured cost of THIS
+  ## call is `spawnLastMs()`; `spawnNote()` says which mechanism produced it.
+  let t0 = nowMs()
+  gSpawnCalls = gSpawnCalls + 1
+  var ok = false
+  var how = ""
+  if cSpawnMode == "process":
+    ok = spawnDetachedProc(exe, args)
+    how = "startProcess"
+    if not ok:
+      # A CreateProcess failure is nearly always a path PowerShell cannot fix
+      # either, so the fallback is one attempt and it is COUNTED, never silent.
+      gSpawnFallbacks = gSpawnFallbacks + 1
+      ok = spawnDetachedPs(exe, args)
+      how = "startProcess FAILED, fell back to Start-Process"
+  else:
+    ok = spawnDetachedPs(exe, args)
+    how = "Start-Process"
+  gSpawnLastMs = nowMs() - t0
+  if not ok: gSpawnFailures = gSpawnFailures + 1
+  gSpawnNote = how & ": " & (if ok: "started" else: "FAILED") & " " & exe &
+               " in " & $gSpawnLastMs & " ms"
+  result = ok
 
 # ---------------------------------------------------------------------------
 # Files
@@ -111,6 +268,18 @@ proc dirPresent*(dir: string): bool =
     result = true
   except:
     result = false
+
+proc removeIfPresent*(target: string): bool =
+  ## True when the path is gone AFTERWARDS -- "it was not there" and "I deleted
+  ## it" are the same finished state and the caller wants that, not the verb.
+  ## False means something is still there that we could not remove.
+  if target.len == 0: return true
+  if not exists(target): return true
+  try:
+    discard tryRemoveFile(path(target))
+  except:
+    discard
+  result = not exists(target)
 
 proc writeAll*(path, content: string): bool =
   try:
@@ -167,6 +336,15 @@ proc ensureDir*(dir: string): bool =
       seg.add ch
     i = i + 1
   result = made
+
+proc trimSlash*(s: string): string =
+  ## A base URL without its trailing separator, so `<base> & "/path"` cannot
+  ## produce a double slash. One copy, in the one module both llm and speech
+  ## already import -- it was briefly two, which is how a fix lands in one.
+  result = s
+  while result.len > 0 and (result[result.len-1] == '/' or
+                            result[result.len-1] == '\\'):
+    result = result[0 ..< result.len - 1]
 
 proc baseName*(path: string): string =
   var i = path.len - 1

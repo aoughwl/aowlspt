@@ -1449,13 +1449,21 @@ def check_groq(rep, store):
     probe = ((status or {}).get("engines") or {})
     text = (say or {}).get("text") or ""
     tier = (say or {}).get("tier")
-    ok = (tier not in (None, "refused") and len(text) > 20
-          and elapsed < 120)
+    # `tier` is the ONLY thing that distinguishes "the model answered" from
+    # "the model was called, failed, and the ontology/builtin row answered
+    # instead" -- and the fallback still returns fluent text of the right
+    # length. MEASURED 2026-09-07: the first version of this check asserted
+    # only "not refused and >20 chars" and PASSED on tier='builtin' while the
+    # notes said `openai answered but had no content: {"error...`. A check
+    # that cannot fail is the bug; this one names the tier it requires.
+    notes = json.dumps((say or {}).get("notes") or [])
+    ok = (tier == "llm" and len(text) > 20 and elapsed < 120)
     rep.add(PASS if ok else FAIL, "groq: the chat engine answers",
-            "tier=%r engine=%r %d chars in %.2f s (whole simulator run, not "
-            "just the request); notes=%s"
+            "tier=%r (must be 'llm'; 'builtin'/'ontology'/'cache' means the "
+            "request FAILED and a table answered) engine=%r %d chars in "
+            "%.2f s (whole simulator run, not just the request); notes=%s"
             % (tier, (say or {}).get("engine"), len(text), elapsed,
-               json.dumps((say or {}).get("notes"))[:400]))
+               notes[:700]))
 
     # STT needs REAL SPEECH, and the push-to-talk path needs a microphone, so
     # the fixture is synthesised by the local kokoro test server and fed

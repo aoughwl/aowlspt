@@ -5,6 +5,11 @@
                  "lang": "en-us", "out": "C:/path/to/write.wav"}
         -> audio/wav (24 kHz mono 16-bit PCM) when "out" is absent, or
         -> {"ok":true,"path":...,"bytes":N,"ms":T,"voice":...} when "out" names
+           When "out" is given the wav is written ATOMICALLY (a .tmp then
+           os.replace) and an empty `<out>.done` marker follows it, so a
+           caller that spawned the request detached can poll for the marker
+           instead of blocking on the response. A stale marker is removed
+           before synthesis starts.
            a file the server should write instead (the caller keeps the bytes
            off the wire -- that is what a curl-only client wants).
         Errors are HTTP 4xx/5xx with a JSON body {"ok":false,"error":"..."}
@@ -47,6 +52,35 @@ def default_root():
         return env
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     return os.path.join(base, "aowlspt", "kokoro")
+
+
+def write_out_atomic(out, data):
+    """Write `data` to `out` and then an empty `<out>.done` marker.
+
+    The wav goes to `<out>.tmp` first and is `os.replace`d into place, so a
+    poller that is watching the path NEVER sees a half-written RIFF file; the
+    `.done` marker is written only after the rename, so its existence means
+    "the wav at `out` is complete". A stale marker from an earlier synthesis
+    of the same text is removed FIRST -- otherwise a caller that spawned this
+    request would read the previous run's marker and take a truncated file
+    for a finished one. Raises OSError; the caller reports it.
+    """
+    d = os.path.dirname(out)
+    if d and not os.path.isdir(d):
+        os.makedirs(d, exist_ok=True)
+    done = out + ".done"
+    try:
+        os.remove(done)
+    except OSError:
+        pass
+    tmp = out + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, out)
+    with open(done, "wb"):
+        pass
 
 
 def wav_bytes(samples, rate):
@@ -219,11 +253,7 @@ class Handler(BaseHTTPRequestHandler):
                 w.setframerate(SAMPLE_RATE)
                 w.writeframes(all_pcm)
             try:
-                d = os.path.dirname(out)
-                if d and not os.path.isdir(d):
-                    os.makedirs(d, exist_ok=True)
-                with open(out, "wb") as f:
-                    f.write(buf.getvalue())
+                write_out_atomic(out, buf.getvalue())
             except OSError as e:
                 sys.stderr.write("could not write %s: %s\n" % (out, e))
         sys.stderr.write("stream %s: first chunk %.0f ms, total %.0f ms, %d chunks\n"
@@ -272,11 +302,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if out:
             try:
-                d = os.path.dirname(out)
-                if d and not os.path.isdir(d):
-                    os.makedirs(d, exist_ok=True)
-                with open(out, "wb") as f:
-                    f.write(wav)
+                write_out_atomic(out, wav)
             except OSError as e:
                 self._json(500, {"ok": False, "error": "could not write %s: %s" % (out, e)})
                 return

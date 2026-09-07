@@ -51,6 +51,28 @@ var cLlamaModel: string = ""
 var cCurlExe: string = "curl.exe"
 var cWorkDir: string = ""
 var cMaxTokens: int = 200
+# The `openai` engine is really "any OpenAI-compatible chat endpoint". Groq
+# serves the SAME wire format (chat/completions, the same SSE delta shape) at
+# https://api.groq.com/openai/v1, so pointing these two settings at it is the
+# WHOLE port -- MEASURED 2026-09-07: openai/gpt-oss-120b answered a full
+# in-character reply in 0.56 s against ~4 s on gpt-4o-mini.
+#
+# The KEY is still never in config.json or in source: `openAiKeyEnv` names an
+# ENVIRONMENT VARIABLE and the value is read from the process environment, so
+# switching provider changes which variable is read, never where a secret is
+# written down.
+var cOpenAiBase: string = "https://api.openai.com/v1"
+var cOpenAiKeyEnv: string = "OPENAI_API_KEY"
+# Extra top-level request fields, as a raw JSON fragment WITHOUT the braces
+# (e.g. `"reasoning_effort":"low"`). It exists because a compatible endpoint is
+# not an identical one: MEASURED 2026-09-07 on Groq openai/gpt-oss-120b, the
+# model spends its budget on a `reasoning` field FIRST -- at max_tokens 80 the
+# spoken `content` came back EMPTY and at 120 it was cut off mid-word
+# (finish_reason "length"). With `"reasoning_effort":"low"` the reasoning fell
+# from 487 to 57 characters and the reply landed whole in 488 ms. Sending that
+# field unconditionally would 400 on real OpenAI, so it is configuration, not
+# a special case in the code.
+var cOpenAiExtra: string = ""
 var gSeq: int = 0
 var gCurlCalls: int = 0      ## proves "no key -> no curl" instead of asserting it
 
@@ -59,6 +81,38 @@ const AnthropicVersion = "2023-06-01"
 
 proc defaulted(v, fallback: string): string =
   if v.len > 0: v else: fallback
+
+proc openAiUrl(): string = trimSlash(cOpenAiBase) & "/chat/completions"
+proc openAiKey(): string = getEnv(cOpenAiKeyEnv, "")
+proc openAiBaseUrl*(): string = trimSlash(cOpenAiBase)
+proc openAiKeyEnvName*(): string = cOpenAiKeyEnv
+
+proc llmConfigureOpenAi*(baseUrl, keyEnv, extraJson: string) =
+  cOpenAiBase = defaulted(baseUrl, "https://api.openai.com/v1")
+  cOpenAiKeyEnv = defaulted(keyEnv, "OPENAI_API_KEY")
+  # UNESCAPE `\"` -> `"`. MEASURED 2026-09-07: `aowlspt/json` hands a string
+  # setting back with its backslash escapes STILL IN IT (the tts cache index
+  # hit the same thing and works around it by hex-encoding), so a config value
+  # written as "\"reasoning_effort\":\"low\"" arrived here with literal
+  # backslashes and Groq answered, word for word:
+  #   failed to unmarshal JSON: invalid character '\' looking for beginning
+  #   of object key string
+  # -- after which the turn fell through to the builtin template tier, which
+  # answers fluently and is NOT a language model. Worth reading twice: the
+  # visible symptom was a perfectly good reply.
+  cOpenAiExtra = extraJson.strip().replace("\\\"", "\"")
+  while cOpenAiExtra.len > 0 and cOpenAiExtra[0] == ',':
+    cOpenAiExtra = cOpenAiExtra[1 ..< cOpenAiExtra.len].strip()
+  while cOpenAiExtra.len > 0 and cOpenAiExtra[cOpenAiExtra.len-1] == ',':
+    cOpenAiExtra = cOpenAiExtra[0 ..< cOpenAiExtra.len-1].strip()
+
+proc withExtra(body: string): string =
+  ## Splice the fragment in before the closing brace. A body that does not end
+  ## in `}` is returned UNCHANGED rather than corrupted -- a malformed fragment
+  ## must cost a missing field, never an unparseable request.
+  if cOpenAiExtra.len == 0: return body
+  if body.len < 2 or body[body.len-1] != '}': return body
+  result = body[0 ..< body.len-1] & "," & cOpenAiExtra & "}"
 
 proc llmConfigure*(engine, anthropicModel, openAiModel, llamaExe, llamaModel,
                    curlExe, workDir: string; maxTokens: int) =
@@ -116,15 +170,17 @@ proc llmProbe*(): LlmProbe =
       p.note = "ok (cloud; model " & cAnthropicModel & ", streaming SSE via " &
                cCurlExe & ")"
   of "openai":
-    p.path = "https://api.openai.com/v1/chat/completions"
+    p.path = openAiUrl()
     p.model = cOpenAiModel
-    if getEnv("OPENAI_API_KEY", "").len == 0:
+    if openAiKey().len == 0:
       p.ok = false
-      p.note = "OPENAI_API_KEY is not set in this process's environment " &
-               "(never read from config or source)"
+      p.note = cOpenAiKeyEnv & " is not set in this process's environment " &
+               "(never read from config or source). That is the env var " &
+               "`openAiKeyEnv` names for base " & openAiBaseUrl()
     else:
       p.ok = true
-      p.note = "ok (cloud; model " & cOpenAiModel & ", non-streaming)"
+      p.note = "ok (cloud; " & openAiBaseUrl() & " model " & cOpenAiModel &
+               ", streaming SSE via " & cCurlExe & ")"
   of "llamacpp":
     p.path = cLlamaExe
     p.model = cLlamaModel
@@ -350,13 +406,13 @@ proc openAiBody(system, user: string): string =
   root.put("model", cOpenAiModel)
   root.put("max_tokens", cMaxTokens)
   root.put("messages", done(msgs))
-  result = done(root).text
+  result = withExtra(done(root).text)
 
 proc runOpenAi(system, user: string; sink: SegmentSink;
                note: var string): string =
-  let key = getEnv("OPENAI_API_KEY", "")
+  let key = openAiKey()
   if key.len == 0:
-    note = "openai: OPENAI_API_KEY is not set; no request was made " &
+    note = "openai: " & cOpenAiKeyEnv & " is not set; no request was made " &
            "(curl was NOT invoked)"
     return ""
   let bodyFile = tempPath(".json")
@@ -367,8 +423,7 @@ proc runOpenAi(system, user: string; sink: SegmentSink;
   let r = runCmd(quoteArg(cCurlExe) & " -s --max-time 90" &
     " -H \"Content-Type: application/json\"" &
     " -H \"Authorization: Bearer " & key & "\"" &
-    " --data-binary @" & quoteArg(bodyFile) &
-    " https://api.openai.com/v1/chat/completions")
+    " --data-binary @" & quoteArg(bodyFile) & " " & quoteArg(openAiUrl()))
   if r.failed or r.output.len == 0:
     note = "openai: no response from curl"
     return ""
@@ -381,7 +436,8 @@ proc runOpenAi(system, user: string; sink: SegmentSink;
   var st = Streamer(buf: "", emitted: 0)
   feed(st, content, sink)
   finish(st, sink)
-  note = "openai " & cOpenAiModel & ": " & $content.len & " chars (non-streaming)"
+  note = "openai " & cOpenAiModel & " at " & openAiBaseUrl() & ": " &
+         $content.len & " chars (non-streaming)"
   result = content
 
 proc runLlama(system, user: string; sink: SegmentSink;
@@ -576,7 +632,7 @@ proc openAiStreamBody(system, user: string): string =
   root.put("max_tokens", cMaxTokens)
   root.put("stream", true)
   root.put("messages", done(msgs))
-  result = done(root).text
+  result = withExtra(done(root).text)
 
 proc spawnCurlDetached(curlCmd, codeFile: string): bool =
   ## A per-turn PowerShell wrapper FILE runs curl through `cmd /c` and writes
@@ -663,9 +719,9 @@ proc llmStreamStart*(system, user: string; id: var int;
       note = "anthropic: could not spawn a detached curl"
       return false
   else:
-    let key = getEnv("OPENAI_API_KEY", "")
+    let key = openAiKey()
     if key.len == 0:
-      note = "openai: OPENAI_API_KEY is not set; no request was made"
+      note = "openai: " & cOpenAiKeyEnv & " is not set; no request was made"
       return false
     let bodyFile = tempPath(".json")
     if not writeAll(bodyFile, openAiStreamBody(system, user)):
@@ -676,8 +732,7 @@ proc llmStreamStart*(system, user: string; id: var int;
         " -H \"Content-Type: application/json\"" &
         " -H \"Authorization: Bearer " & key & "\"" &
         " --data-binary @" & quoteArg(bodyFile) &
-        " -o " & quoteArg(outFile) &
-        " https://api.openai.com/v1/chat/completions", codeFile):
+        " -o " & quoteArg(outFile) & " " & quoteArg(openAiUrl()), codeFile):
       note = "openai: could not spawn a detached curl"
       return false
   gNextTurn = gNextTurn + 1

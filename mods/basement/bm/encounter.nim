@@ -40,6 +40,7 @@ import util
 import items
 import gen
 import speech
+import offscreen
 
 # ---------------------------------------------------------------------------
 # Configuration. Literal initialisers only — nimony zeroes a DLL global whose
@@ -699,10 +700,15 @@ proc cardFor*(personId: string): PersonCard =
   result = PersonCard(id: personId, name: "", faction: "", factionCreed: "",
                       role: "", voice: "", traits: "", wants: "", forbids: "",
                       attitude: 0, factionRep: 0, mood: 0.0,
-                      inventoryNote: "", placeName: "", map: "", known: "")
+                      inventoryNote: "", placeName: "", map: "", objective: "",
+                      known: "")
   let i = findPerson(personId)
   if i < 0: return
   result.known = renderKnown(i, 12)
+  # What their group is actually doing right now. It comes from the objective
+  # ROW, so a person can never describe an errand the world is not running.
+  discard rebuildGroups()
+  result.objective = objectiveSentence(i)
   result.name = personName(i)
   result.role = personRole(i)
   result.voice = personVoice(i)
@@ -1169,9 +1175,27 @@ proc sceneJson*(map: string; x, y, z, radius: float): JsonObject =
   var people = arr()
   var groups = arr()
   var seenGroups: seq[string] = @[]
+  discard rebuildGroups()
   for pi in peopleNear(map, x, y, z, rad):
     var po = personJson(pi)
     po.put("encounterState", encounterState(personId(pi)))
+    # What this person is DOING, from the objective row their group holds. The
+    # client shows it and the dialogue tiers talk about it; both read the same
+    # row, so they cannot describe two different errands.
+    var okind = ""
+    var otarget = ""
+    var orole = ""
+    if objectiveOfPerson(pi, okind, otarget, orole):
+      var oo = obj()
+      oo.put("kind", okind)
+      oo.put("target", otarget)
+      oo.put("targetName", objectiveTargetName(
+        objectiveTargetKind(activeObjectiveOf(personGroup(pi))), otarget))
+      oo.put("role", orole)
+      oo.put("sentence", objectiveSentence(pi))
+      po.put("objective", oo)
+    else:
+      po.put("objective", raw("null"))
     people.add po
   var caches = arr()
   var lootA = arr()
@@ -1230,8 +1254,91 @@ proc sceneJson*(map: string; x, y, z, radius: float): JsonObject =
     io.put("y", ly)
     io.put("z", lz)
     io.put("cacheId", lootCache(li))
+    # A corpse is a loot row whose tpl names the dead. Their inventoryNote is
+    # what makes the body identifiable -- without it the client would spawn an
+    # anonymous pile and the person who died offscreen would leave no trace.
+    let tpl = lootTpl(li)
+    if tpl.len > 7 and tpl.substr(0, 6) == "corpse:":
+      let who = tpl.substr(7, tpl.len - 1)
+      let wi = findPerson(who)
+      io.put("personId", who)
+      io.put("corpse", true)
+      if wi >= 0:
+        io.put("name", personName(wi))
+        io.put("inventoryNote", personInventoryNote(wi))
+        io.put("factionId", personFaction(wi))
     lootItems.add io
     lootN2 = lootN2 + 1
+  # Whatever the OFFSCREEN state says is on this map right now: groups that are
+  # mid-objective and are not guarding a cache would otherwise never appear,
+  # because the loop above only walks caches.
+  var gotoA = arr()
+  var gi2 = 0
+  while gi2 < groupCount():
+    if groupMap(gi2) == map:
+      let gid = groupId(gi2)
+      var dup = false
+      for g in seenGroups:
+        if g == gid: dup = true
+      var gx = 0.0
+      var gy = 0.0
+      var gz = 0.0
+      groupPos(gi2, gx, gy, gz)
+      let inRange = (gx - x) * (gx - x) + (gz - z) * (gz - z) <= rad * rad
+      let oi = activeObjectiveOf(gid)
+      if not dup and inRange and groupSize(gi2) > 0:
+        seenGroups.add gid
+        var names = arr()
+        for pj in groupMembers(gi2):
+          names.add personName(pj)
+        var go = obj()
+        go.put("groupId", gid)
+        go.put("factionId", groupFactionOf(gi2))
+        go.put("role", (if oi >= 0: objectiveKind(oi) else: "idle"))
+        go.put("count", groupSize(gi2))
+        go.put("names", names)
+        go.put("map", map)
+        go.put("x", gx)
+        go.put("y", gy)
+        go.put("z", gz)
+        if oi >= 0:
+          var oo = obj()
+          oo.put("kind", objectiveKind(oi))
+          oo.put("targetKind", objectiveTargetKind(oi))
+          oo.put("target", objectiveTarget(oi))
+          oo.put("targetName", objectiveTargetName(objectiveTargetKind(oi),
+                                                   objectiveTarget(oi)))
+          oo.put("note", objectiveNote(oi))
+          go.put("objective", oo)
+          go.put("reason", objectiveNote(oi))
+        else:
+          go.put("objective", raw("null"))
+          go.put("reason", "no objective")
+        groups.add go
+      # The bots must WALK toward what their group is for, once spawned. The
+      # point comes from the objective's target, never from a guess.
+      if oi >= 0 and inRange:
+        var tmap = ""
+        var tx = 0.0
+        var ty = 0.0
+        var tz = 0.0
+        if targetPos(objectiveTargetKind(oi), objectiveTarget(oi),
+                     tmap, tx, ty, tz) and tmap == map:
+          for pj in groupMembers(gi2):
+            var d = obj()
+            d.put("personId", personId(pj))
+            d.put("map", map)
+            d.put("x", tx)
+            d.put("y", ty)
+            d.put("z", tz)
+            d.put("why", objectiveKind(oi) & ": " & objectiveNote(oi))
+            gotoA.add d
+            # emitted here, one per bot, because a JsonArray cannot be walked
+            # back afterwards -- and a directive nobody sent is a group that
+            # spawns and then stands still.
+            discard directive("npc.goto", done(d).text, true, 30000)
+    gi2 = gi2 + 1
+
   var directives = arr()
   if groups.len > 0:
     var d1 = obj()
@@ -1245,6 +1352,11 @@ proc sceneJson*(map: string; x, y, z, radius: float): JsonObject =
     d2.put("items", lootItems)
     directives.add d2
     discard directive("loot.spawn", done(objOf("items", lootItems)).text, true, 60000)
+  if gotoA.len > 0:
+    var d3 = obj()
+    d3.put("kind", "npc.goto")
+    d3.put("orders", gotoA)
+    directives.add d3
   let sceneId = map & "@" & $int(x) & "," & $int(z) & "#" & $worldClockMs()
   discard journal("scene.built", "", map,
                   jsonOf2("scene", sceneId, "note",
@@ -2111,11 +2223,26 @@ proc observe*(kind, actorId, targetId, dataJson: string; note: var string): int 
         setState(i, "none", kind)
       i = i + 1
     discard journal(kind, "player", "", "{}")
+    # The raid is over: the map goes back to being emulated. A map left frozen
+    # would silently stop for the rest of the session, and "the world stopped"
+    # looks exactly like "the world is quiet".
+    let wasFrozen = offscreenFrozenMap()
+    offscreenThaw()
+    if wasFrozen.len > 0:
+      discard journal("region.thawed", "player", wasFrozen,
+                      jsonOf2("map", wasFrozen, "why", "the raid ended"))
+      notes.add wasFrozen & " is emulated again"
     notes.add "encounters reset; captivity (if any) survives the raid"
 
   of "raid_started":
     hearingReset()
     let map = dataText(dataJson, "map", "")
+    # The client owns this map from here until the raid ends. Freezing BEFORE
+    # anything else in this branch is deliberate: the emulator must not get one
+    # more step on a map the player is already standing in.
+    offscreenFreezeMap(map)
+    discard journal("region.frozen", "player", map,
+                    jsonOf2("map", map, "why", "the player is in a raid here"))
     setPlayerPos(map, dataFloat(dataJson, "x", 0.0),
                  dataFloat(dataJson, "y", 0.0), dataFloat(dataJson, "z", 0.0))
     discard journal("raid.started", "player", "", jsonOf2("map", map, "why", "client"))

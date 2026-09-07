@@ -40,11 +40,13 @@
 ## plausible garbage, and an entry whose wav has vanished from disk is dropped
 ## on load rather than handed back as a path to nothing.
 
-import std/[strutils, base64]
+import std/[strutils, base64, envvars]
 import aowlspt
 import aowlspt/server as server
 import aowlspt/json as jr
 import util
+import stream
+import hearing
 
 type
   SpeechProbe* = object
@@ -83,6 +85,19 @@ var cChatterRoot: string = ""
 var cChatterExe: string = ""
 var cVoicesDir: string = ""       ## <stem>.wav reference voices for chatterbox
 
+# OpenAI-COMPATIBLE cloud speech. Groq serves the same shapes at
+# https://api.groq.com/openai/v1 -- MEASURED 2026-09-07: whisper-large-v3-turbo
+# transcribed a 42 KB push-to-talk wav in 0.53 s round trip. The KEY is never
+# in config.json or in source: these settings name an ENVIRONMENT VARIABLE and
+# the value is read from the process environment, so switching provider changes
+# which variable is read, never where a secret is written down.
+var cSttBase: string = "https://api.openai.com/v1"
+var cSttKeyEnv: string = "OPENAI_API_KEY"
+var cSttModel: string = "whisper-large-v3-turbo"
+var cTtsBase: string = "https://api.openai.com/v1"
+var cTtsKeyEnv: string = "OPENAI_API_KEY"
+var cTtsModel: string = "canopylabs/orpheus-v1-english"
+
 var gWhisperSpawned: bool = false
 var gKokoroSpawned: bool = false
 var gChatterSpawned: bool = false
@@ -96,6 +111,8 @@ var gVChatter: seq[string] = @[]
 var gVExag: seq[float] = @[]
 var gVCfg: seq[float] = @[]
 var gVPiper: seq[string] = @[]
+var gVOrpheus: seq[string] = @[]
+var gPoolOrpheus: seq[string] = @[]
 var gPoolKokoro: seq[string] = @[]
 var gPoolChatter: seq[string] = @[]
 var gVoicesNote: string = "voices.json not loaded"
@@ -187,6 +204,7 @@ type
     exaggeration*: float
     cfgWeight*: float
     piper*: string
+    orpheus*: string     ## the openai-tts (Groq Orpheus) voice name
     note*: string
 
 proc voicesLoad*(text: string): int =
@@ -194,8 +212,8 @@ proc voicesLoad*(text: string): int =
   ## chatterbox,exaggeration,cfg_weight,piper}}}`. Returns the tag count; 0
   ## with `voicesNote` saying why when the text is empty or malformed.
   gVTag = @[]; gVKokoro = @[]; gVSpeed = @[]; gVChatter = @[]
-  gVExag = @[]; gVCfg = @[]; gVPiper = @[]
-  gPoolKokoro = @[]; gPoolChatter = @[]
+  gVExag = @[]; gVCfg = @[]; gVPiper = @[]; gVOrpheus = @[]
+  gPoolKokoro = @[]; gPoolChatter = @[]; gPoolOrpheus = @[]
   if text.len == 0:
     gVoicesNote = "voices.json is empty or unreadable"
     return 0
@@ -207,6 +225,9 @@ proc voicesLoad*(text: string): int =
   for e in jr.each(jr.child(pools, "chatterbox")):
     let t = jr.asText(e, "")
     if t.len > 0: gPoolChatter.add t
+  for e in jr.each(jr.child(pools, "orpheus")):
+    let t = jr.asText(e, "")
+    if t.len > 0: gPoolOrpheus.add t
   let tags = jr.child(root, "tags")
   for k in jr.keys(tags):
     let row = jr.child(tags, k)
@@ -217,8 +238,10 @@ proc voicesLoad*(text: string): int =
     gVExag.add jr.asFloat(jr.child(row, "exaggeration"), 0.5)
     gVCfg.add jr.asFloat(jr.child(row, "cfg_weight"), 0.5)
     gVPiper.add jr.asText(jr.child(row, "piper"), "")
+    gVOrpheus.add jr.asText(jr.child(row, "orpheus"), "")
   gVoicesNote = $gVTag.len & " tags, pools kokoro=" & $gPoolKokoro.len &
-                " chatterbox=" & $gPoolChatter.len
+                " chatterbox=" & $gPoolChatter.len & " orpheus=" &
+                $gPoolOrpheus.len
   if gVTag.len == 0: gVoicesNote = "voices.json parsed but has no `tags`"
   result = gVTag.len
 
@@ -239,7 +262,7 @@ proc resolveVoice*(tag, personId: string): VoiceSpec =
   ## always sounds the same across restarts) and says so in `note`.
   var r = VoiceSpec(tag: tag, mapped: false, kokoro: "am_michael", speed: 1.0,
                     chatterbox: "default", exaggeration: 0.5, cfgWeight: 0.5,
-                    piper: "", note: "")
+                    piper: "", orpheus: "daniel", note: "")
   var i = 0
   while i < gVTag.len:
     if gVTag[i] == tag:
@@ -250,12 +273,14 @@ proc resolveVoice*(tag, personId: string): VoiceSpec =
       r.exaggeration = gVExag[i]
       r.cfgWeight = gVCfg[i]
       r.piper = gVPiper[i]
+      r.orpheus = defaulted(gVOrpheus[i], "daniel")
       r.note = "voices.json[" & tag & "]"
       return r
     i = i + 1
   let seed = (if personId.len > 0: personId else: tag)
   r.kokoro = pickFrom(gPoolKokoro, seed, "am_michael")
   r.chatterbox = pickFrom(gPoolChatter, seed, "default")
+  r.orpheus = pickFrom(gPoolOrpheus, seed, "daniel")
   # Spread the speed a little too, so two unmapped people who hash to the
   # same pool entry still differ: 0.90 .. 1.10 in 0.02 steps.
   let step = int((fnv1a64("speed:" & seed) shr 8'u64) mod 11'u64)
@@ -275,6 +300,7 @@ proc voiceSpecJson*(v: VoiceSpec): JsonObject =
   o.put("exaggeration", v.exaggeration)
   o.put("cfg_weight", v.cfgWeight)
   o.put("piper", v.piper)
+  o.put("orpheus", v.orpheus)
   o.put("note", v.note)
   result = o
 
@@ -327,14 +353,49 @@ proc probeOf(slot, engine, path, model: string): SpeechProbe =
     r.note = (if path.len > 0: "ok: " & path else: "ok (no external file)")
   result = r
 
+proc speechConfigureCloud*(sttBaseUrl, sttKeyEnv, sttModel,
+                           ttsBaseUrl, ttsKeyEnv, ttsModel: string) =
+  cSttBase = defaulted(sttBaseUrl, "https://api.openai.com/v1")
+  cSttKeyEnv = defaulted(sttKeyEnv, "OPENAI_API_KEY")
+  cSttModel = defaulted(sttModel, "whisper-large-v3-turbo")
+  cTtsBase = defaulted(ttsBaseUrl, "https://api.openai.com/v1")
+  cTtsKeyEnv = defaulted(ttsKeyEnv, "OPENAI_API_KEY")
+  cTtsModel = defaulted(ttsModel, "canopylabs/orpheus-v1-english")
+
+proc sttUrl(): string = trimSlash(cSttBase) & "/audio/transcriptions"
+proc ttsUrl(): string = trimSlash(cTtsBase) & "/audio/speech"
+proc sttKey(): string = getEnv(cSttKeyEnv, "")
+proc ttsKeyValue(): string = getEnv(cTtsKeyEnv, "")
+
+proc apiErrorOf(resp: string): string =
+  ## The provider's own message, verbatim. An OpenAI-compatible error is
+  ## `{"error":{"message":...}}`; Groq's terms-acceptance refusal is a 400 in
+  ## exactly that shape, and repeating it word for word is the difference
+  ## between "TTS failed" and "click accept on the model's terms page".
+  result = jr.asText(jr.child(jr.field(resp, "error"), "message"), "")
+  if result.len == 0:
+    result = jr.asText(jr.field(resp, "error"), "")
+
 proc sttProbe*(): SpeechProbe =
   case cSttEngine
   of "whisper-server": result = probeOf("stt", cSttEngine, cWhisperExe, cWhisperModel)
   of "none": result = probeOf("stt", "none", "", "")
+  of "openai-whisper":
+    result = SpeechProbe(slot: "stt", engine: cSttEngine, path: sttUrl(),
+                         model: cSttModel, note: "", ok: false)
+    if sttKey().len == 0:
+      result.note = cSttKeyEnv & " is not set in this process's environment, " &
+        "so no transcription will be attempted (the key is never read from " &
+        "config.json or from source; sttKeyEnv only NAMES the variable)"
+    else:
+      result.ok = true
+      result.note = "ok (cloud; " & sttUrl() & " model " & cSttModel &
+        "). MEASURED 2026-09-07 against Groq: 0.53 s round trip for a 42 KB wav"
   else:
     result = probeOf("stt", cSttEngine, "", "")
     result.ok = false
-    result.note = "unknown stt engine '" & cSttEngine & "' (have: whisper-server, none)"
+    result.note = "unknown stt engine '" & cSttEngine &
+      "' (have: whisper-server, openai-whisper, none)"
 
 proc kokoroModelPath(): string = joinPath(cKokoroRoot, "kokoro-v1.0.onnx")
 proc kokoroServerPy(): string = joinPath(cKokoroRoot, "server.py")
@@ -355,7 +416,22 @@ proc serverProbe(engine, url, exe, model, serverPy, setupCmd: string): SpeechPro
     r.note = "ok: " & exe & " serves " & url & " (started on first use)"
   result = r
 
+proc ttsProbeCloud(): SpeechProbe =
+  result = SpeechProbe(slot: "tts", engine: cTtsEngine, path: ttsUrl(),
+                       model: cTtsModel, note: "", ok: false)
+  if ttsKeyValue().len == 0:
+    result.note = cTtsKeyEnv & " is not set in this process's environment, " &
+      "so nothing will be synthesised (the key is never read from " &
+      "config.json or from source; ttsKeyEnv only NAMES the variable)"
+  else:
+    result.ok = true
+    result.note = "ok (cloud; " & ttsUrl() & " model " & cTtsModel &
+      ", response_format wav). A 400 whose message asks you to accept the " &
+      "model's terms is a REAL answer and is surfaced verbatim in the " &
+      "segment's ttsNote, not folded into a generic failure"
+
 proc ttsProbe*(): SpeechProbe =
+  if cTtsEngine == "openai-tts": return ttsProbeCloud()
   case cTtsEngine
   of "piper": result = probeOf("tts", "piper", cPiperExe, cPiperVoice)
   of "kokoro":
@@ -560,6 +636,55 @@ proc ttsCacheLoad*() =
   gTLoadNote = $gTKey.len & " entries loaded" &
     (if skipped > 0: ", " & $skipped & " dropped (wav missing)" else: "")
 
+proc ttsCommit(key, dst, sentence: string) =
+  ## The ONE place a finished wav enters the cache. Both the synchronous
+  ## `ttsSegment` and the asynchronous poller land here, so a wav that arrived
+  ## late is cached on exactly the same terms as one that arrived on time.
+  let idx = findTts(key)
+  if idx >= 0:
+    gTWav[idx] = dst
+    gTSentence[idx] = sentence
+  else:
+    gTKey.add key
+    gTWav.add dst
+    gTSentence.add sentence
+  ttsPersist()
+
+proc orpheusInput(spec: VoiceSpec; sentence: string; yell: bool): string =
+  ## Orpheus honours inline emotive cues (`<laugh>`, `<sigh>`) but there is NO
+  ## documented shout tag. WHAT WAS TRIED, so the next person does not repeat
+  ## it: `<yell>` and `<shout>` are not in the published cue set and are read
+  ## as literal text, which the model then SPEAKS -- that is worse than a flat
+  ## delivery. What is left is the prosody the text itself carries, so a yell
+  ## is upper-cased and given a terminal `!`. That is a WEAK effect and this
+  ## comment says so rather than claiming the shout works.
+  if not yell: return sentence
+  var t = sentence.toUpperAscii()
+  while t.len > 0 and (t[t.len-1] == '.' or t[t.len-1] == ' '):
+    t = t[0 ..< t.len - 1]
+  if t.len == 0: return sentence
+  if t[t.len-1] != '!' and t[t.len-1] != '?': t.add '!'
+  result = t
+
+proc ttsCloudBody(spec: VoiceSpec; sentence: string; yell: bool): string =
+  var o = obj()
+  o.put("model", cTtsModel)
+  o.put("input", orpheusInput(spec, sentence, yell))
+  o.put("voice", defaulted(spec.orpheus, "daniel"))
+  o.put("response_format", "wav")
+  result = done(o).text
+
+proc ttsCloudArgs(bodyPath, dst: string): string =
+  ## The wav comes back as the RESPONSE BODY, so `-o` writes it straight to the
+  ## cache path. An HTTP error writes the provider's JSON there instead, which
+  ## is exactly why the failure note reads `dst` -- the message is surfaced
+  ## verbatim rather than replaced by "not a wav".
+  result = "-s --max-time 180" &
+           " -H \"Content-Type: application/json\"" &
+           " -H \"Authorization: Bearer " & ttsKeyValue() & "\"" &
+           " --data-binary @" & quoteArg(bodyPath) &
+           " -o " & quoteArg(dst) & " " & quoteArg(ttsUrl())
+
 proc synthesize(spec: VoiceSpec; voiceModel, sentence: string; dst: string;
                 note: var string): bool =
   ## Produce a wav at `dst`. Returns false with a note a person can act on.
@@ -602,6 +727,30 @@ proc synthesize(spec: VoiceSpec; voiceModel, sentence: string; dst: string;
       note = "chatterbox: " & n2
       return false
     note = "chatterbox " & spec.chatterbox & " " & n2
+    return true
+  of "openai-tts":
+    let p = ttsProbe()
+    if not p.ok:
+      note = "tts unavailable -- " & p.note
+      return false
+    let bodyPath = tempPath(".json")
+    if not writeAll(bodyPath, ttsCloudBody(spec, sentence, false)):
+      note = "could not write the request body to " & bodyPath
+      return false
+    discard removeIfPresent(dst)
+    let r = runCmd(quoteArg(cCurlExe) & " " & ttsCloudArgs(bodyPath, dst))
+    if r.failed:
+      note = "curl could not be started: " & cCurlExe
+      return false
+    let bytes = readAll(dst)
+    if bytes.len <= 44 or bytes[0 ..< 4] != "RIFF":
+      let em = apiErrorOf(bytes)
+      note = ttsUrl() & " did not return a wav (" & $bytes.len &
+             " bytes at " & dst & ")" &
+             (if em.len > 0: ": " & em else: ": " & oneLine(bytes))
+      return false
+    note = cTtsModel & "/" & defaulted(spec.orpheus, "daniel") & " wrote " &
+           $bytes.len & " bytes"
     return true
   of "piper":
     let p = ttsProbe()
@@ -657,6 +806,7 @@ proc voiceModelKey*(spec: VoiceSpec; voice: string): string =
     result = voiceToPiperModel(if spec.mapped and spec.piper.len > 0: spec.piper
                                else: voice)
   of "kokoro": result = spec.kokoro & "@" & fmtF(spec.speed)
+  of "openai-tts": result = cTtsModel & "/" & defaulted(spec.orpheus, "daniel")
   of "chatterbox":
     result = spec.chatterbox & "@ex" & fmtF(spec.exaggeration) & ",cfg" &
              fmtF(spec.cfgWeight)
@@ -697,16 +847,37 @@ proc ttsSegment*(voice, sentence: string; note: var string;
   if not synthesize(spec, model, sentence, dst, n2):
     note = n2
     return ""
-  if idx >= 0:
-    gTWav[idx] = dst
-    gTSentence[idx] = sentence
-  else:
-    gTKey.add key
-    gTWav.add dst
-    gTSentence.add sentence
-  ttsPersist()
+  ttsCommit(key, dst, sentence)
   note = n2 & " (cached as " & baseName(dst) & ")"
   result = dst
+
+proc sayPayloadOf*(personId, voice, text: string; segmentIdx: int;
+                   final: bool; source, wav: string; cached: bool;
+                   note: string): string =
+  ## THE shape of a spoken line, given a wav that has ALREADY been decided.
+  ## Split out of `sayPayload` so the asynchronous path -- which learns the wav
+  ## path a second or two after the sentence -- cannot grow a second copy of
+  ## this object. That drift is exactly the bug of 2026-09-07 (`"wav":""`
+  ## hardcoded in the encounter machine's own copy).
+  ##
+  ## `tts` names the engine so a client knows whether an empty `wav` means
+  ## "synthesise it yourself" (client) or "the backend failed / gave up
+  ## waiting" (anything else, with ttsNote saying which). `voiceSpec` is the
+  ## resolved voices.json row so a client-side engine maps the same person to
+  ## the same voice.
+  var o = obj()
+  o.put("personId", personId)
+  o.put("text", text)
+  o.put("wav", wav)
+  o.put("segmentIdx", segmentIdx)
+  o.put("final", final)
+  o.put("cachedWav", cached)
+  o.put("source", source)
+  o.put("voice", voice)
+  o.put("tts", cTtsEngine)
+  o.put("voiceSpec", voiceSpecJson(resolveVoice(voice, personId)))
+  o.put("ttsNote", note)
+  result = done(o).text
 
 proc sayPayload*(personId, voice, text: string; segmentIdx: int; final: bool;
                  source: string; wav: var string; cached: var bool;
@@ -732,19 +903,528 @@ proc sayPayload*(personId, voice, text: string; segmentIdx: int; final: bool;
   # "synthesise it yourself" (client) or "the backend failed" (anything else,
   # with ttsNote saying why). `voiceSpec` is the resolved voices.json row so a
   # client-side engine can map the same person to the same voice.
+  result = sayPayloadOf(personId, voice, text, segmentIdx, final, source,
+                        wav, cached, note)
+
+# ---------------------------------------------------------------------------
+# ASYNCHRONOUS TTS + the ordered say queue
+#
+# THE PROBLEM, MEASURED 2026-09-07 on the live sidecar: `ttsSegment` ran INSIDE
+# the tick, under the mod lock, because `saySink` called it while
+# `pumpStreamingTurns` held the lock. One kokoro sentence is ~1.3 s, so a
+# five-sentence turn held the lock for ~6 s and every route queued behind it --
+# an `/events` long-poll TIMED OUT mid-turn.
+#
+# THE SHAPE OF THE FIX is the one the LLM stream already uses: a request is
+# STARTED and the tick picks up its completion. curl is spawned detached; the
+# server writes the wav and then an empty `<wav>.done` marker (added to
+# tools/kokoro/server.py and tools/chatterbox/server.py); the poller looks for
+# the marker. Nothing here ever waits on a socket or a process, so the lock is
+# only ever held across memory reads.
+#
+# WHAT IS DELIBERATELY NOT ASYNCHRONOUS: piper and sapi. Both are subprocesses
+# we run to completion for their exit status, and there is no server to leave a
+# marker. They stay synchronous and `ttsAsyncNote` SAYS SO -- a probe that
+# claimed "async" for every engine would be a check that cannot fail.
+#
+# THE BOUNDED WAIT: `ttsTimeoutMs` (default 8000). After it, the segment is
+# emitted WITHOUT a wav and the note says the wait was given up on, so the
+# client shows the subtitle rather than the turn going silent forever. The
+# entry is NOT dropped: it stays in the table as `late`, and when the wav does
+# land it is committed to the cache, so the same sentence is instant next time.
+# ---------------------------------------------------------------------------
+
+var cTtsAsync: bool = true
+var cTtsTimeoutMs: int = 8000
+
+var gPKey: seq[string] = @[]        ## cache key, for the commit on arrival
+var gPDst: seq[string] = @[]        ## where the server is writing the wav
+var gPResp: seq[string] = @[]       ## curl's -o body, read only to explain a failure
+var gPSent: seq[string] = @[]
+var gPStart: seq[int64] = @[]
+var gPLate: seq[bool] = @[]         ## true once the bounded wait was given up on
+var gPId: seq[int] = @[]
+var gPNextId: int = 0
+
+var gTAsyncStarts: int = 0
+var gTAsyncArrived: int = 0
+var gTAsyncTimeouts: int = 0
+var gTAsyncLateArrivals: int = 0
+var gTAsyncSpawnFails: int = 0
+var gTAsyncNote: string = "no asynchronous synthesis yet"
+
+proc speechConfigureAsync*(async: bool; timeoutMs: int) =
+  cTtsAsync = async
+  if timeoutMs > 0: cTtsTimeoutMs = timeoutMs
+
+proc ttsAsyncEngine*(): bool =
+  ## The two local HTTP servers (which leave a `<wav>.done` marker themselves)
+  ## and the cloud endpoint (where `cmd` writes the marker after curl exits).
+  result = cTtsEngine == "kokoro" or cTtsEngine == "chatterbox" or
+           cTtsEngine == "openai-tts"
+
+proc ttsAsyncActive*(): bool = cTtsAsync and ttsAsyncEngine()
+
+proc ttsTimeoutMs*(): int = cTtsTimeoutMs
+
+proc ttsAsyncNote*(): string =
+  if not ttsAsyncEngine():
+    result = "engine '" & cTtsEngine & "' is SYNCHRONOUS here (it is a " &
+             "subprocess we run to completion, not an endpoint that can leave " &
+             "a done-marker); only kokoro, chatterbox and openai-tts " &
+             "synthesise off the tick"
+  elif not cTtsAsync:
+    result = "asynchronous synthesis is available for '" & cTtsEngine &
+             "' but ttsAsync is false in config.json, so the tick blocks on it"
+  else:
+    result = "asynchronous: detached curl, the server writes <wav>.done, the " &
+             "tick collects it; bounded wait " & $cTtsTimeoutMs & " ms"
+
+proc ttsPendingCount*(): int = gPId.len
+
+proc findPending(id: int): int =
+  var i = 0
+  while i < gPId.len:
+    if gPId[i] == id: return i
+    i = i + 1
+  result = -1
+
+proc dropPending(i: int) =
+  if i < 0 or i >= gPId.len: return
+  var j = i
+  while j + 1 < gPId.len:
+    let tgPId = gPId[j+1]
+    gPId[j] = tgPId
+    let tgPKey = gPKey[j+1]
+    gPKey[j] = tgPKey
+    let tgPDst = gPDst[j+1]
+    gPDst[j] = tgPDst
+    let tgPResp = gPResp[j+1]
+    gPResp[j] = tgPResp
+    let tgPSent = gPSent[j+1]
+    gPSent[j] = tgPSent
+    let tgPStart = gPStart[j+1]
+    gPStart[j] = tgPStart
+    let tgPLate = gPLate[j+1]
+    gPLate[j] = tgPLate
+    j = j + 1
+  discard gPId.pop()
+  discard gPKey.pop()
+  discard gPDst.pop()
+  discard gPResp.pop()
+  discard gPSent.pop()
+  discard gPStart.pop()
+  discard gPLate.pop()
+
+proc ttsBodyFor(spec: VoiceSpec; sentence, dst: string): string =
+  if cTtsEngine == "chatterbox":
+    result = "{\"text\":" & jr.quoted(sentence) & ",\"voice\":" &
+             jr.quoted(spec.chatterbox) & ",\"exaggeration\":" &
+             fmtF(spec.exaggeration) & ",\"cfg_weight\":" &
+             fmtF(spec.cfgWeight) & ",\"out\":" & jr.quoted(dst) & "}"
+  else:
+    result = "{\"text\":" & jr.quoted(sentence) & ",\"voice\":" &
+             jr.quoted(spec.kokoro) & ",\"speed\":" & fmtF(spec.speed) &
+             ",\"out\":" & jr.quoted(dst) & "}"
+
+proc ttsStartAsync(spec: VoiceSpec; sentence, key, dst: string; yell: bool;
+                   id: var int; note: var string): bool =
+  ## Spawn the request and return AT ONCE. False means nothing was started and
+  ## the caller must fall back to the synchronous path -- never "wait and see".
+  id = -1
+  let cloud = cTtsEngine == "openai-tts"
+  let url = (if cTtsEngine == "chatterbox": cChatterUrl else: cKokoroUrl)
+  if not cloud:
+    if cTtsEngine == "chatterbox": discard ensureChatterbox()
+    else: discard ensureKokoro()
+  let donePath = dst & ".done"
+  # A marker left by an EARLIER synthesis of this same sentence would be read
+  # as "this request finished" on the very first poll, and the caller would
+  # ship whatever bytes happen to be at `dst`. Clearing it is not optional.
+  if not removeIfPresent(donePath):
+    note = "a stale " & donePath & " could not be removed, so a done-marker " &
+           "could not be trusted; synthesised synchronously instead"
+    return false
+  let bodyPath = tempPath(".json")
+  let body = (if cloud: ttsCloudBody(spec, sentence, yell)
+              else: ttsBodyFor(spec, sentence, dst))
+  if not writeAll(bodyPath, body):
+    note = "could not write the request body to " & bodyPath
+    return false
+  # For the cloud engine the WAV IS THE RESPONSE BODY, so curl writes it to
+  # `dst` and an HTTP error lands there instead -- which is why `dst` is also
+  # the file the failure note reads: the provider's message survives verbatim.
+  let respPath = (if cloud: dst else: tempPath(".resp"))
+  if cloud:
+    discard removeIfPresent(dst)
+    if ttsKeyValue().len == 0:
+      note = cTtsKeyEnv & " is not set, so no request was made"
+      return false
+    # No server to leave the marker, so `cmd` writes it after curl exits 0.
+    # This is `cmd` as the DIRECT child of startProcess, not reached through
+    # `runCmd`: the measured 10110 ms EOF hang was `cmd /c start` inside a
+    # `runCmd`, whose pipe the grandchild inherited. There is no such pipe on
+    # this path -- see util.spawnDetachedProc for the measurement.
+    let line = "/s /c \"" & quoteArg(cCurlExe) & " " &
+               ttsCloudArgs(bodyPath, dst) & " && type nul > " &
+               quoteArg(donePath) & "\""
+    if not spawnDetached("cmd.exe", line):
+      gTAsyncSpawnFails = gTAsyncSpawnFails + 1
+      note = "could not spawn a detached curl (" & spawnNote() & ")"
+      return false
+    gPNextId = gPNextId + 1
+    id = gPNextId
+    gPId.add id
+    gPKey.add key
+    gPDst.add dst
+    gPResp.add respPath
+    gPSent.add sentence
+    gPStart.add nowMs()
+    gPLate.add false
+    gTAsyncStarts = gTAsyncStarts + 1
+    gTAsyncNote = "started " & cTtsEngine & " request " & $id & " in " &
+                  $spawnLastMs() & " ms (spawn only)"
+    note = "synthesising asynchronously into " & baseName(dst) & " via " &
+           cTtsModel
+    return true
+  # --retry-connrefused with a long --max-time so a COLD server (kokoro loads
+  # in 1.6-3.5 s) still lands the wav; the bounded wait below is what protects
+  # the turn, not curl's timeout.
+  let args = "-s -o " & quoteArg(respPath) &
+             " --retry 30 --retry-connrefused --retry-delay 1 --max-time 600" &
+             " -H \"Content-Type: application/json\"" &
+             " --data-binary @" & quoteArg(bodyPath) & " " &
+             quoteArg(url & "/tts")
+  if not spawnDetached(cCurlExe, args):
+    gTAsyncSpawnFails = gTAsyncSpawnFails + 1
+    note = "could not spawn a detached curl (" & spawnNote() & ")"
+    return false
+  gPNextId = gPNextId + 1
+  id = gPNextId
+  gPId.add id
+  gPKey.add key
+  gPDst.add dst
+  gPResp.add respPath
+  gPSent.add sentence
+  gPStart.add nowMs()
+  gPLate.add false
+  gTAsyncStarts = gTAsyncStarts + 1
+  gTAsyncNote = "started " & cTtsEngine & " request " & $id & " in " &
+                $spawnLastMs() & " ms (spawn only)"
+  note = "synthesising asynchronously into " & baseName(dst)
+  result = true
+
+proc wavIsComplete(dst: string): bool =
+  ## The marker says the server finished; the RIFF magic says the bytes really
+  ## are a wav. BOTH, because either alone has been wrong: a marker can outlive
+  ## a failed write, and a RIFF header appears before the file is whole when it
+  ## is written in place (which is why the server now renames into position).
+  if not exists(dst & ".done"): return false
+  let bytes = readAll(dst)
+  result = bytes.len > 44 and bytes[0 ..< 4] == "RIFF"
+
+proc ttsPollAsync*(id: int; wav: var string; note: var string): int =
+  ## 1 = ready (`wav` is the path), 0 = still pending, -1 = gave up waiting
+  ## (emit the text without audio and SAY why). Never blocks.
+  wav = ""
+  note = ""
+  let i = findPending(id)
+  if i < 0:
+    note = "no pending synthesis with id " & $id
+    return -1
+  if wavIsComplete(gPDst[i]):
+    wav = gPDst[i]
+    let waited = nowMs() - gPStart[i]
+    ttsCommit(gPKey[i], gPDst[i], gPSent[i])
+    gTAsyncArrived = gTAsyncArrived + 1
+    note = cTtsEngine & " wrote " & baseName(gPDst[i]) & " in " & $waited &
+           " ms, off the tick"
+    dropPending(i)
+    return 1
+  let waited = nowMs() - gPStart[i]
+  if waited >= int64(cTtsTimeoutMs):
+    gTAsyncTimeouts = gTAsyncTimeouts + 1
+    gPLate[i] = true
+    let resp = oneLine(readAll(gPResp[i]))
+    note = "no wav after " & $waited & " ms (ttsTimeoutMs = " &
+           $cTtsTimeoutMs & "): the line is being spoken as text only. The " &
+           "request is still being watched and will fill the cache if it " &
+           "lands" & (if resp.len > 0: "; the server said: " & resp
+                      else: "; the server has answered nothing yet")
+    return -1
+  result = 0
+
+proc ttsPumpLate*(): int =
+  ## Entries whose bounded wait expired but whose wav may still arrive. Called
+  ## from the tick: a late arrival is CACHED so the next identical sentence is
+  ## instant, and an entry that never arrives is dropped after 8x the timeout
+  ## rather than accumulating forever.
+  result = 0
+  var i = 0
+  while i < gPId.len:
+    if not gPLate[i]:
+      i = i + 1
+      continue
+    if wavIsComplete(gPDst[i]):
+      ttsCommit(gPKey[i], gPDst[i], gPSent[i])
+      gTAsyncLateArrivals = gTAsyncLateArrivals + 1
+      result = result + 1
+      dropPending(i)
+      continue
+    if nowMs() - gPStart[i] > int64(cTtsTimeoutMs) * 8:
+      discard removeIfPresent(gPResp[i])
+      dropPending(i)
+      continue
+    i = i + 1
+
+# ---------------------------------------------------------------------------
+# The ordered say queue
+#
+# A segment is emitted ONLY when its wav exists, and IN PER-PERSON ORDER: two
+# people can speak concurrently but one person's second sentence never
+# overtakes their first, because a client plays segments in the order they
+# arrive. The queue lives here, next to the synthesis, so the two cannot drift;
+# the emission itself is `stream.emitEvent`, which is what every other
+# directive already goes through.
+# ---------------------------------------------------------------------------
+
+var gQPerson: seq[string] = @[]
+var gQVoice: seq[string] = @[]
+var gQText: seq[string] = @[]
+var gQIdx: seq[int] = @[]
+var gQFinal: seq[bool] = @[]
+var gQSource: seq[string] = @[]
+var gQAck: seq[bool] = @[]
+var gQHandle: seq[int] = @[]      ## -1 = resolved already
+var gQWav: seq[string] = @[]
+var gQCached: seq[bool] = @[]
+var gQNote: seq[string] = @[]
+var gQReady: seq[bool] = @[]
+# The hearing decoration the EMITTER decided (encounter.emitBarkEx needs the
+# audibility verdict before it picks the words, so it cannot be re-derived at
+# drain time). `gQDeco` false means "let stream.emitEvent decide", which is
+# what it already does for any say payload without an "audible" field.
+var gQDeco: seq[bool] = @[]
+var gQDist: seq[float] = @[]
+var gQMode: seq[string] = @[]
+var gQAudible: seq[bool] = @[]
+var gQReaction: seq[bool] = @[]
+var gQWhy: seq[string] = @[]
+
+var gQEmitted: int = 0
+var gQMuted: int = 0
+
+proc sayQueueDepth*(): int = gQPerson.len
+proc sayEmitted*(): int = gQEmitted
+proc sayMuted*(): int = gQMuted
+
+proc qDrop(i: int) =
+  var j = i
+  while j + 1 < gQPerson.len:
+    let tgQPerson = gQPerson[j+1]
+    gQPerson[j] = tgQPerson
+    let tgQVoice = gQVoice[j+1]
+    gQVoice[j] = tgQVoice
+    let tgQText = gQText[j+1]
+    gQText[j] = tgQText
+    let tgQIdx = gQIdx[j+1]
+    gQIdx[j] = tgQIdx
+    let tgQFinal = gQFinal[j+1]
+    gQFinal[j] = tgQFinal
+    let tgQSource = gQSource[j+1]
+    gQSource[j] = tgQSource
+    let tgQAck = gQAck[j+1]
+    gQAck[j] = tgQAck
+    let tgQHandle = gQHandle[j+1]
+    gQHandle[j] = tgQHandle
+    let tgQWav = gQWav[j+1]
+    gQWav[j] = tgQWav
+    let tgQCached = gQCached[j+1]
+    gQCached[j] = tgQCached
+    let tgQNote = gQNote[j+1]
+    gQNote[j] = tgQNote
+    let tgQReady = gQReady[j+1]
+    gQReady[j] = tgQReady
+    let tgQDeco = gQDeco[j+1]
+    gQDeco[j] = tgQDeco
+    let tgQDist = gQDist[j+1]
+    gQDist[j] = tgQDist
+    let tgQMode = gQMode[j+1]
+    gQMode[j] = tgQMode
+    let tgQAudible = gQAudible[j+1]
+    gQAudible[j] = tgQAudible
+    let tgQReaction = gQReaction[j+1]
+    gQReaction[j] = tgQReaction
+    let tgQWhy = gQWhy[j+1]
+    gQWhy[j] = tgQWhy
+    j = j + 1
+  discard gQPerson.pop()
+  discard gQVoice.pop()
+  discard gQText.pop()
+  discard gQIdx.pop()
+  discard gQFinal.pop()
+  discard gQSource.pop()
+  discard gQAck.pop()
+  discard gQHandle.pop()
+  discard gQWav.pop()
+  discard gQCached.pop()
+  discard gQNote.pop()
+  discard gQReady.pop()
+  discard gQDeco.pop()
+  discard gQDist.pop()
+  discard gQMode.pop()
+  discard gQAudible.pop()
+  discard gQReaction.pop()
+  discard gQWhy.pop()
+
+proc sayEnqueue*(personId, voice, text: string; segmentIdx: int; final: bool;
+                 source: string; needsAck: bool;
+                 deco: bool = false; distanceM: float = 0.0;
+                 mode: string = "speak"; audible: bool = true;
+                 reaction: bool = false; why: string = ""): bool =
+  ## Queue one spoken segment and START its synthesis. Returns true when the
+  ## segment was queued -- NOT when it has been emitted; `sayDrain` does that,
+  ## this tick or a later one.
+  ##
+  ## The synchronous engines resolve here and now, so nothing about piper's
+  ## behaviour changes; only kokoro and chatterbox defer.
+  var handle = -1
+  var wav = ""
+  var cached = false
+  var note = ""
+  var ready = true
+  if text.len == 0:
+    note = "no text in this segment, so nothing was synthesised"
+  elif ttsAsyncActive():
+    let spec = resolveVoice(voice, personId)
+    let model = voiceModelKey(spec, voice)
+    # A YELL is different AUDIO for the cloud engine (the input text is
+    # upper-cased), so it must be a different cache entry or the first
+    # delivery of a sentence would be served for both. It changes nothing for
+    # kokoro/chatterbox, whose key is deliberately left alone so they do not
+    # start missing the cache for a distinction they do not make.
+    let keyModel = (if cTtsEngine == "openai-tts" and mode == "yell":
+                      model & "|yell" else: model)
+    let key = ttsKey(cTtsEngine, keyModel, text)
+    let idx = findTts(key)
+    if idx >= 0 and exists(gTWav[idx]):
+      gTHits = gTHits + 1
+      wav = gTWav[idx]
+      cached = true
+      note = "cache hit: " & wav
+    else:
+      gTMiss = gTMiss + 1
+      let p = ttsProbe()
+      let dir = ttsCacheDir()
+      if not p.ok:
+        note = "tts unavailable -- " & p.note
+      elif dir.len == 0 or not ensureTtsDir():
+        note = "no writable cache directory, so there is nowhere for the " &
+               "server to write the wav; the line is text only"
+      else:
+        let dst = joinPath(dir, hex64(fnv1a64(key)) & ".wav")
+        var n2 = ""
+        if ttsStartAsync(spec, text, key, dst, mode == "yell", handle, n2):
+          ready = false
+          note = n2
+        else:
+          # Falling back to the blocking path is a DECISION, and it is stated:
+          # nothing was started, so waiting here is the only way to have audio.
+          var n3 = ""
+          wav = ttsSegment(voice, text, n3, cached, personId)
+          note = "asynchronous start refused (" & n2 &
+                 "); synthesised on the tick instead: " & n3
+  else:
+    wav = ttsSegment(voice, text, note, cached, personId)
+  gQPerson.add personId
+  gQVoice.add voice
+  gQText.add text
+  gQIdx.add segmentIdx
+  gQFinal.add final
+  gQSource.add source
+  gQAck.add needsAck
+  gQHandle.add handle
+  gQWav.add wav
+  gQCached.add cached
+  gQNote.add note
+  gQReady.add ready
+  gQDeco.add deco
+  gQDist.add distanceM
+  gQMode.add mode
+  gQAudible.add audible
+  gQReaction.add reaction
+  gQWhy.add why
+  result = true
+
+proc sayDrain*(): int =
+  ## Emit every segment whose wav has landed, in per-person order. Returns the
+  ## number emitted. Safe to call as often as you like; it never blocks.
+  ##
+  ## A person is BLOCKED by their own first unresolved segment and by nothing
+  ## else, so a slow line from one NPC cannot mute another's.
+  result = 0
+  var blocked: seq[string] = @[]
+  var i = 0
+  while i < gQPerson.len:
+    var isBlocked = false
+    for b in blocked:
+      if b == gQPerson[i]:
+        isBlocked = true
+        break
+    if isBlocked:
+      i = i + 1
+      continue
+    if not gQReady[i]:
+      var w = ""
+      var n = ""
+      let st = ttsPollAsync(gQHandle[i], w, n)
+      if st == 0:
+        blocked.add gQPerson[i]
+        i = i + 1
+        continue
+      gQReady[i] = true
+      gQWav[i] = w
+      gQNote[i] = n
+      if st < 0: gQMuted = gQMuted + 1
+    var payload = sayPayloadOf(gQPerson[i], gQVoice[i], gQText[i], gQIdx[i],
+                               gQFinal[i], gQSource[i], gQWav[i], gQCached[i],
+                               gQNote[i])
+    if gQDeco[i]:
+      # The emitter already decided who can hear this and in what voice mode.
+      # Re-deciding here would use the distance at DRAIN time, which is a
+      # second or two later and after the player has moved.
+      payload = decorateSay(payload, gQDist[i], gQMode[i], gQAudible[i],
+                            gQReaction[i], gQWhy[i])
+    discard emitEvent("say", payload, gQAck[i])
+    discard broadcast("basement.say", payload)
+    gQEmitted = gQEmitted + 1
+    result = result + 1
+    qDrop(i)
+
+proc ttsAsyncStats*(): JsonObject =
   var o = obj()
-  o.put("personId", personId)
-  o.put("text", text)
-  o.put("wav", wav)
-  o.put("segmentIdx", segmentIdx)
-  o.put("final", final)
-  o.put("cachedWav", cached)
-  o.put("source", source)
-  o.put("voice", voice)
-  o.put("tts", cTtsEngine)
-  o.put("voiceSpec", voiceSpecJson(resolveVoice(voice, personId)))
-  o.put("ttsNote", note)
-  result = done(o).text
+  o.put("enabled", cTtsAsync)
+  o.put("engineCanAsync", ttsAsyncEngine())
+  o.put("active", ttsAsyncActive())
+  o.put("timeoutMs", cTtsTimeoutMs)
+  o.put("starts", gTAsyncStarts)
+  o.put("arrived", gTAsyncArrived)
+  o.put("timedOut", gTAsyncTimeouts)
+  o.put("lateArrivals", gTAsyncLateArrivals)
+  o.put("spawnFailures", gTAsyncSpawnFails)
+  o.put("pending", gPId.len)
+  o.put("queueDepth", gQPerson.len)
+  o.put("emitted", gQEmitted)
+  o.put("mutedByTimeout", gQMuted)
+  o.put("spawnMode", spawnMode())
+  o.put("spawnCalls", spawnCalls())
+  o.put("spawnFallbacks", spawnFallbacks())
+  o.put("spawnFailures", spawnFailures())
+  o.put("spawnLastMs", int(spawnLastMs()))
+  o.put("spawnNote", spawnNote())
+  o.put("lastStart", gTAsyncNote)
+  o.put("note", ttsAsyncNote())
+  result = o
 
 proc ttsStats*(): JsonObject =
   var o = obj()
@@ -896,6 +1576,33 @@ proc runWhisper(wav: string; note: var string): string =
   if not exists(wav):
     note = "no such wav: " & wav
     return ""
+  if cSttEngine == "openai-whisper":
+    # The SAME funnel the local whisper uses, so the PARTIAL every sttPartialMs
+    # and the FINAL transcription both go through here -- there is no second
+    # copy that could take a different endpoint.
+    let key = sttKey()
+    if key.len == 0:
+      note = "stt: " & cSttKeyEnv & " is not set; no request was made"
+      return ""
+    let rc = runCmd(quoteArg(cCurlExe) & " -s --max-time 120" &
+                    " -H \"Authorization: Bearer " & key & "\"" &
+                    " -F file=@" & quoteArg(wav) &
+                    " -F model=" & quoteArg(cSttModel) &
+                    " -F response_format=json " & quoteArg(sttUrl()))
+    if rc.failed or rc.output.len == 0:
+      note = "no response from curl for " & sttUrl()
+      return ""
+    let tc = jr.asText(jr.field(rc.output, "text"), "")
+    if tc.len == 0:
+      let em = apiErrorOf(rc.output)
+      note = (if em.len > 0: sttUrl() & " refused: " & em
+              else: "the transcription endpoint answered but had no `text`: " &
+                    oneLine(rc.output))
+      return ""
+    result = oneLine(tc)
+    note = "transcribed " & $result.len & " chars via " & cSttModel &
+           " at " & trimSlash(cSttBase)
+    return result
   discard ensureWhisper()
   let url = "http://127.0.0.1:" & $cWhisperPort & "/inference"
   let r = runCmd(quoteArg(cCurlExe) & " -s --retry 20 --retry-connrefused" &

@@ -41,6 +41,9 @@ import "bm" / encounter
 import "bm" / prompt
 import "bm" / ontology
 import "bm" / hearing
+# --- offscreen begin ---
+import "bm" / offscreen
+# --- offscreen end ---
 import "bm" / llm
 import "bm" / brain
 import "bm" / speech
@@ -72,6 +75,9 @@ const
   SceneRoute     = Base & "/world/scene"
   LootRoute      = Base & "/world/loot"
   CachesRoute    = Base & "/world/caches"
+  # --- offscreen begin ---
+  RegionsRoute   = Base & "/world/regions"
+  # --- offscreen end ---
   SelfcheckRoute = Base & "/selfcheck"
   TickRoute      = Base & "/tick"
 
@@ -299,10 +305,17 @@ proc newWorld(presetId: string; seed: int; promptOverride: string;
     note = "generation failed: " & genNote
     return false
   resetEncounters()
+  # --- offscreen begin ---
+  # A generated world where nobody has anything to do is not a world. Planning
+  # BEFORE the save means the objectives are in the store from version 1, so a
+  # backend that never advances still answers "what are you doing".
+  var planNote = ""
+  discard planAll(planNote)
+  # --- offscreen end ---
   var saveNote = ""
   discard saveWorld(saveNote)
   gWorldNote = "generated seed " & $int64(s) & " preset " & presetId &
-               ": " & genNote
+               ": " & genNote & "; " & planNote
   note = gWorldNote & "; saved: " & saveNote
   result = true
 
@@ -849,6 +862,40 @@ proc onPerson(url, body, session: string): string =
   o.put("encounterState", encounterState(id))
   o.put("contracts", contracts)
   o.put("quests", quests)
+  # --- offscreen begin ---
+  var okind = ""
+  var otarget = ""
+  var orole = ""
+  if objectiveOfPerson(i, okind, otarget, orole):
+    var oo = obj()
+    oo.put("kind", okind)
+    oo.put("target", otarget)
+    oo.put("role", orole)
+    oo.put("sentence", objectiveSentence(i))
+    o.put("objective", oo)
+  else:
+    o.put("objective", raw("null"))
+  # The objective rows in the journal tail, so a caller can see what this
+  # person's group has been ordered to do and what came of it -- without
+  # pulling the whole journal.
+  var objRows = arr()
+  for e in jr.each(jr.whole(done(journalTail(200)).text)):
+    let jk = jr.asText(jr.child(e, "kind"), "")
+    let ja = jr.asText(jr.child(e, "actor"), "")
+    if ja == personGroup(i) and jk.len >= 9 and jk.substr(0, 8) == "objective":
+      # rebuilt, not forwarded: the journal comes back as a READER handle
+      # (JsonRef) and the response is a WRITER (JsonArray); they are different
+      # types and mixing them is the type error this replaced.
+      var jo = obj()
+      jo.put("seq", jr.asInt(jr.child(e, "seq"), 0))
+      jo.put("atMs", jr.asInt(jr.child(e, "atMs"), 0))
+      jo.put("kind", jk)
+      jo.put("actor", ja)
+      jo.put("target", jr.asText(jr.child(e, "target"), ""))
+      jo.put("data", jr.asText(jr.child(e, "data"), ""))
+      objRows.add jo
+  o.put("objectiveJournal", objRows)
+  # --- offscreen end ---
   result = done(o).text
 
 proc onSave(url, body, session: string): string =
@@ -1328,6 +1375,18 @@ proc onCaches(url, body, session: string): string =
   o.put("caches", a)
   result = done(o).text
 
+# --- offscreen begin ---
+proc onRegions(url, body, session: string): string =
+  ## Per map: the groups, what each is doing, the last thing that resolved
+  ## there, and whether the map is FROZEN (the player is in a raid on it, so
+  ## the client is the truth) or EMULATED (the backend keeps it running).
+  if not gEnabled: return disabledJson()
+  var o = obj()
+  withModLock:
+    o = regionsJson()
+  result = done(o).text
+# --- offscreen end ---
+
 # ---------------------------------------------------------------------------
 # The emulator bus (DESIGN.md 11). `emit` returns no payload, so each of these
 # is a round trip: mods/tarkov asks, this composes from world rows, this emits
@@ -1497,7 +1556,7 @@ proc chk2Persistence() =
   # cannot fail for the nine it does not look at.
   let kinds: seq[string] = @["meta", "factions", "people", "places",
                              "contracts", "quests", "facts", "caches",
-                             "loot", "journal"]
+                             "loot", "objectives", "journal"]
   var before: seq[string] = @[]
   var bytes = 0
   for k in kinds:
@@ -2733,6 +2792,104 @@ proc chk23Triggers() =
         "served " & $drift & " (expected 0); a 12 m drop to 5 m served " &
         $closed & " (expected >=1): " & text)
 
+# --- offscreen begin ---
+proc chk24Offscreen() =
+  ## (a)-(e) come from `bm/offscreen.offscreenChecks`, which lives next to the
+  ## engine so the two cannot drift. (f) and (g) are here because they need the
+  ## scene builder and the dialogue tiers, which this file owns.
+  for r in offscreenChecks(joinPath(gPresetDir, "warlords.json")):
+    var parts: seq[string] = @[]
+    var cur = ""
+    for ch in r:
+      if ch == '\x1f':
+        parts.add cur
+        cur = ""
+      else:
+        cur.add ch
+    parts.add cur
+    if parts.len == 3: check(24, parts[1], parts[0], parts[2])
+    else: check(24, "offscreen: a check row was malformed", "FAIL", r)
+
+  # (f) the scene on the player`s map lists a group AND its objective.
+  var mapWithGroups = ""
+  discard rebuildGroups()
+  var gi = 0
+  while gi < groupCount():
+    if mapWithGroups.len == 0 and activeObjectiveOf(groupId(gi)) >= 0:
+      mapWithGroups = groupMap(gi)
+    gi = gi + 1
+  if mapWithGroups.len == 0:
+    check(25, "offscreen: world/scene carries a group objective", "INCONCLUSIVE",
+          "no group in the generated world holds an objective, so there is " &
+          "nothing for a scene to carry")
+  else:
+    var gx = 0.0
+    var gy = 0.0
+    var gz = 0.0
+    groupPos(0, gx, gy, gz)
+    let scene = done(sceneJson(mapWithGroups, gx, gy, gz, 4000.0)).text
+    let hasObjective = find(scene, "\"objective\"") >= 0
+    let hasSentence = find(scene, "\"sentence\"") >= 0
+    let hasGoto = find(scene, "npc.goto") >= 0
+    check(25, "offscreen: world/scene on the player`s map carries each group`s objective",
+          verdictOf(hasObjective and hasSentence),
+          "the scene on " & mapWithGroups & " is " & $scene.len &
+          " bytes; it names an objective " & $hasObjective &
+          ", a person`s objective sentence " & $hasSentence &
+          ", and an npc.goto order toward the objective target " & $hasGoto &
+          " (npc.goto is absent when every group is already standing on its " &
+          "target, which is a real answer and not a failure)")
+
+  # (g) asked what they are doing, a person answers about their objective --
+  #     from the ontology TABLE, no model. The negative control is the person
+  #     with no objective: the row must be REFUSED, not served empty.
+  var who = -1
+  var none = -1
+  var pi = 0
+  while pi < personCount():
+    var k = ""
+    var t = ""
+    var r2 = ""
+    if objectiveOfPerson(pi, k, t, r2):
+      if who < 0: who = pi
+    elif none < 0:
+      none = pi
+    pi = pi + 1
+  if who < 0:
+    check(26, "offscreen: a person answers about their objective", "INCONCLUSIVE",
+          "nobody in the generated world is inside an objective")
+  else:
+    var conf = 0.0
+    let intent = classifyIntent("what are you doing", conf)
+    let card = cardFor(personId(who))
+    let sit = situationFor(personId(who))
+    var reply = ""
+    var tags: seq[string] = @[]
+    let served = ontologyReply(intent, card, sit, "what are you doing", reply, tags)
+    let sentence = objectiveSentence(who)
+    var mentions = false
+    if sentence.len > 0 and reply.len > 0:
+      if find(reply, sentence) >= 0: mentions = true
+    var refusedForNone = true
+    var noneNote = "no objective-less person exists to use as a control"
+    if none >= 0:
+      var reply2 = ""
+      var tags2: seq[string] = @[]
+      let card2 = cardFor(personId(none))
+      let sit2 = situationFor(personId(none))
+      refusedForNone = not ontologyReply(intent, card2, sit2,
+                                         "what are you doing", reply2, tags2)
+      noneNote = personName(none) & " has no objective and the row was " &
+                 (if refusedForNone: "REFUSED (correct)"
+                  else: "SERVED anyway: " & reply2)
+    check(26, "offscreen: asked what they are doing, a person answers about their objective",
+          verdictOf(served and mentions and refusedForNone),
+          "intent classified as " & intent & " (confidence " & fmtF(conf) &
+          "); " & personName(who) & " answered: " & reply &
+          " -- their objective clause is [" & sentence &
+          "] and the reply contains it " & $mentions & "; control: " & noneNote)
+# --- offscreen end ---
+
 proc onSelfcheck(url, body, session: string): string =
   gCheckLines = @[]
   gPassN = 0
@@ -2762,6 +2919,9 @@ proc onSelfcheck(url, body, session: string): string =
     chk21Hearing()
     chk22OneReply()
     chk23Triggers()
+    # --- offscreen begin ---
+    chk24Offscreen()
+    # --- offscreen end ---
     # Put back whatever was on disk: the checks above generated and advanced a
     # world in memory, and leaving that in place would quietly replace the
     # player's.
@@ -3127,6 +3287,9 @@ proc onLoad(): Status =
   discard servePrefix(SceneRoute, onScene)
   discard servePrefix(LootRoute, onLoot)
   discard servePrefix(CachesRoute, onCaches)
+  # --- offscreen begin ---
+  discard servePrefix(RegionsRoute, onRegions)
+  # --- offscreen end ---
   discard servePrefix(WorldRoute, onWorld)
   discard serve(ObserveRoute, onObserve)
   discard serve(SayRoute, onSay)
