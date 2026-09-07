@@ -127,3 +127,6 @@ docs/aowl-facts.db.backup
 
 # aowl.basement: the selfcheck writes TTS wavs and the brain line cache here
 mods/basement/data/cache/
+
+# voice benchmark samples are regenerable and large; notes stay tracked
+mods/basement/data/samples/*.wav
