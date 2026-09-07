@@ -130,6 +130,18 @@ proc closeHandleK(h: pointer): int32 {.
 const
   CreateNoWindow = 0x08000000'u32
   DetachedProcess = 0x00000008'u32
+    ## NOT USED, and deliberately kept named so nobody re-adds it. MEASURED
+    ## 2026-09-07 with a ctypes CreateProcessW harness outside this mod, the
+    ## same command line three times:
+    ##   flags 0x08000008 (NO_WINDOW|DETACHED) -> rc=1, a pid, and powershell
+    ##                                            NEVER RAN (no output file)
+    ##   flags 0x00000008 (DETACHED alone)     -> rc=1, a pid, same silence
+    ##   flags 0x08000000 (NO_WINDOW alone)    -> rc=1, the file appears
+    ## A console host handed no console AND no std handles dies before it runs
+    ## its script, and CreateProcessW still reports success -- which is why
+    ## `pttStart` reported "the wrapper may not have started" for a day.
+    ## `bInheritHandles = FALSE` is the property we actually need, and
+    ## CREATE_NO_WINDOW keeps it while giving the child its own hidden console.
 
 proc nilPtr(): pointer = cast[pointer](0)
 
@@ -168,7 +180,7 @@ proc spawnDetachedProc(exe, args: string): bool =
     let nilp = nilPtr()
     let rc = createProcessW(nilp, cast[pointer](addr wide[0]), nilp, nilp,
                             0'i32,                      # bInheritHandles FALSE
-                            CreateNoWindow or DetachedProcess,
+                            CreateNoWindow,   # NOT DetachedProcess: see above
                             nilp, nilp,
                             cast[pointer](addr si), cast[pointer](addr pi))
     if rc != 0'i32:

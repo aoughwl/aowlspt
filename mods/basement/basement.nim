@@ -3333,7 +3333,21 @@ proc onLoad(): Status =
   discard on("tarkov.loot.taken", onLootTakenEvent)
 
   if gEnabled:
-    discard everyMs(gTickMs, onTick)
+    # THE DEBUG TICK ROUTE OWNS THE CLOCK. With both the timer and the route
+    # running, `drainWork()` in aowlspt-sim fires a tick BETWEEN two routes
+    # whenever more than `tickMs` of wall time has passed -- MEASURED
+    # 2026-09-07: `/tick n=1` answered `totalTicks:2, streamsInFlight:1` and
+    # the very next `/events` already carried the finished turn, because a
+    # background tick had run in between. The offline streaming check reads
+    # the tick's counter and the stream and compares them, so that race made
+    # it report a segment "spoken after the stream ended" that had in fact
+    # been spoken before it. A check driving the tick explicitly must be the
+    # ONLY thing driving it; this flag is off in every real deployment.
+    if gDebugTickRoute:
+      info ModName & ": the periodic tick is OFF because debugTickRoute is " &
+           "on -- POST " & TickRoute & " is the only clock in this process"
+    else:
+      discard everyMs(gTickMs, onTick)
     success ModName & " " & ModVersion & " on: " & gLoadNote & " | " & gWorldNote
     let lp = llmProbe()
     if not lp.ok:
