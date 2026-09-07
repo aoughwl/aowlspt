@@ -101,7 +101,7 @@
   "maxWaitMs": 2000,
 
   "_tick": "tickMs: how often the backend advances the sim, steps escorts, and expires un-acked directives. saveEveryTicks: how many ticks between automatic saves (0 = only on demand). The world keeps moving while you are in the menu -- that is the point of it.",
-  "tickMs": 1000,
+  "tickMs": 200,
   "saveEveryTicks": 60,
 
   "_sim": "simMaxCatchUpHours caps the catch-up that runs when a world is loaded after the process was not running -- without a cap, a world left for a month would try to simulate a month at boot. simMoveEveryMinutes is how much world time passes between movement decisions. ambushChance is the per-opportunity chance that being near a hostile faction's dangerous place turns into a group.spawn.",
