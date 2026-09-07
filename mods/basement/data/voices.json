@@ -31,15 +31,12 @@
       "placeholder-sapi-zira"
     ],
     "orpheus": [
+      "austin",
       "daniel",
-      "tara",
-      "leah",
-      "jess",
-      "leo",
-      "dan",
-      "mia",
-      "zac",
-      "zoe"
+      "troy",
+      "autumn",
+      "diana",
+      "hannah"
     ]
   },
   "tags": {
@@ -50,7 +47,7 @@
       "exaggeration": 0.35,
       "cfg_weight": 0.6,
       "piper": "lessac",
-      "orpheus": "leo"
+      "orpheus": "troy"
     },
     "steady-female": {
       "kokoro": "af_sarah",
@@ -59,7 +56,7 @@
       "exaggeration": 0.3,
       "cfg_weight": 0.55,
       "piper": "lessac",
-      "orpheus": "zoe"
+      "orpheus": "autumn"
     },
     "flat-male": {
       "kokoro": "am_eric",
@@ -68,7 +65,7 @@
       "exaggeration": 0.2,
       "cfg_weight": 0.65,
       "piper": "lessac",
-      "orpheus": "zac"
+      "orpheus": "austin"
     },
     "harsh-male": {
       "kokoro": "am_fenrir",
@@ -77,7 +74,7 @@
       "exaggeration": 0.75,
       "cfg_weight": 0.45,
       "piper": "lessac",
-      "orpheus": "dan"
+      "orpheus": "daniel"
     },
     "manic-male": {
       "kokoro": "am_puck",
@@ -86,7 +83,7 @@
       "exaggeration": 0.95,
       "cfg_weight": 0.3,
       "piper": "lessac",
-      "orpheus": "leo"
+      "orpheus": "austin"
     },
     "cold-female": {
       "kokoro": "bf_alice",
@@ -95,7 +92,7 @@
       "exaggeration": 0.2,
       "cfg_weight": 0.7,
       "piper": "lessac",
-      "orpheus": "zoe"
+      "orpheus": "diana"
     },
     "old-male": {
       "kokoro": "bm_george",
@@ -104,7 +101,7 @@
       "exaggeration": 0.4,
       "cfg_weight": 0.5,
       "piper": "lessac",
-      "orpheus": "dan"
+      "orpheus": "troy"
     },
     "quiet-female": {
       "kokoro": "af_river",
@@ -113,7 +110,7 @@
       "exaggeration": 0.25,
       "cfg_weight": 0.6,
       "piper": "lessac",
-      "orpheus": "tara"
+      "orpheus": "hannah"
     },
     "rasping-male": {
       "kokoro": "bm_lewis",
@@ -131,7 +128,7 @@
       "exaggeration": 0.45,
       "cfg_weight": 0.4,
       "piper": "lessac",
-      "orpheus": "leo"
+      "orpheus": "troy"
     },
     "clipped-female": {
       "kokoro": "bf_emma",
@@ -140,7 +137,7 @@
       "exaggeration": 0.35,
       "cfg_weight": 0.65,
       "piper": "lessac",
-      "orpheus": "mia"
+      "orpheus": "autumn"
     },
     "heavy-male": {
       "kokoro": "am_adam",
@@ -149,7 +146,7 @@
       "exaggeration": 0.5,
       "cfg_weight": 0.55,
       "piper": "lessac",
-      "orpheus": "zac"
+      "orpheus": "austin"
     },
     "soft-male": {
       "kokoro": "am_liam",
@@ -158,7 +155,7 @@
       "exaggeration": 0.3,
       "cfg_weight": 0.35,
       "piper": "lessac",
-      "orpheus": "dan"
+      "orpheus": "daniel"
     },
     "whispering-female": {
       "kokoro": "af_nicole",
@@ -167,7 +164,7 @@
       "exaggeration": 0.15,
       "cfg_weight": 0.4,
       "piper": "lessac",
-      "orpheus": "mia"
+      "orpheus": "diana"
     },
     "choral-male": {
       "kokoro": "bm_fable",
@@ -176,7 +173,7 @@
       "exaggeration": 0.6,
       "cfg_weight": 0.4,
       "piper": "lessac",
-      "orpheus": "dan"
+      "orpheus": "troy"
     },
     "tired-male": {
       "kokoro": "am_echo",
@@ -185,7 +182,7 @@
       "exaggeration": 0.25,
       "cfg_weight": 0.45,
       "piper": "lessac",
-      "orpheus": "daniel"
+      "orpheus": "austin"
     },
     "brisk-female": {
       "kokoro": "af_bella",
@@ -194,7 +191,7 @@
       "exaggeration": 0.5,
       "cfg_weight": 0.5,
       "piper": "lessac",
-      "orpheus": "leah"
+      "orpheus": "hannah"
     },
     "gravel-male": {
       "kokoro": "bm_daniel",
@@ -212,7 +209,7 @@
       "exaggeration": 0.8,
       "cfg_weight": 0.35,
       "piper": "lessac",
-      "orpheus": "leah"
+      "orpheus": "autumn"
     },
     "young-male": {
       "kokoro": "am_puck",
@@ -221,7 +218,7 @@
       "exaggeration": 0.55,
       "cfg_weight": 0.3,
       "piper": "lessac",
-      "orpheus": "daniel"
+      "orpheus": "troy"
     },
     "hoarse-female": {
       "kokoro": "bf_isabella",
@@ -230,7 +227,7 @@
       "exaggeration": 0.45,
       "cfg_weight": 0.6,
       "piper": "lessac",
-      "orpheus": "jess"
+      "orpheus": "diana"
     },
     "warm-male": {
       "kokoro": "am_michael",
@@ -239,7 +236,7 @@
       "exaggeration": 0.4,
       "cfg_weight": 0.3,
       "piper": "lessac",
-      "orpheus": "dan"
+      "orpheus": "austin"
     },
     "bright-female": {
       "kokoro": "af_sky",
@@ -248,7 +245,7 @@
       "exaggeration": 0.6,
       "cfg_weight": 0.45,
       "piper": "lessac",
-      "orpheus": "tara"
+      "orpheus": "hannah"
     },
     "dry-male": {
       "kokoro": "am_eric",
@@ -257,7 +254,7 @@
       "exaggeration": 0.2,
       "cfg_weight": 0.75,
       "piper": "lessac",
-      "orpheus": "dan"
+      "orpheus": "daniel"
     },
     "default": {
       "kokoro": "am_michael",
@@ -266,7 +263,8 @@
       "exaggeration": 0.5,
       "cfg_weight": 0.5,
       "piper": "lessac",
-      "orpheus": "leo"
+      "orpheus": "daniel"
     }
-  }
+  },
+  "_orpheusNote": "Orpheus voices are the SIX Groq serves for canopylabs/orpheus-v1-english (MEASURED 2026-09-07: `voice must be one of [autumn diana hannah austin daniel troy]`; the model's own tara/leo/zoe/... are refused there). Male tags spread over austin/daniel/troy, female over autumn/diana/hannah."
 }
