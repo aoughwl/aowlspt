@@ -1,0 +1,28 @@
+{
+  "//registryPath": "Full path to a checkout's mods.json. Empty means: look in this mod's data/ directory, then in registry/ beside the mods folder, then one and two directories above that. Set it when the registry is cloned somewhere else.",
+  "registryPath": "",
+
+  "//activeLists": "The lists that are active on a fresh install, in order. A later list overrides an earlier one for the same mod. Once you change the selection through /aowlspt/mods/select this value is not consulted again -- your choice lives in the mod's own store, not in this file.",
+  "activeLists": ["aowl.list.core"],
+
+  "//controlProbeMs": "How long to wait for a host to answer the live-control probe before concluding there is none. Silence has to become an answer on a timer, or the reply would depend on whether the manager loaded before the host finished wiring its subscriptions.",
+  "controlProbeMs": 750,
+
+  "//registryUrl": "Where a newer mods.json can be fetched from. An http:// or https:// URL, a file:// URL, or a plain path. Empty means there is nothing to fetch. Setting this alone does nothing -- see registryFetchEnabled.",
+  "registryUrl": "",
+
+  "//registryFetchEnabled": "Whether the manager may fetch that URL at all. False, and it is two switches rather than one on purpose: a URL you wrote down to try later must not start reaching the network the moment you save the file. Metadata only -- a fetched registry that describes mod binaries to download is refused, with a sentence saying why. See registry/README.md.",
+  "registryFetchEnabled": false,
+
+  "//registryFetchOnStart": "Fetch once when the manager loads, rather than only when /aowlspt/mods/registry/fetch is called. Ignored unless registryFetchEnabled is true.",
+  "registryFetchOnStart": false,
+
+  "//registryFetchTimeoutMs": "Deadline for the whole fetch, connect to last byte -- not a per-operation timeout, which would not bound a server that answers one byte at a time forever. It runs on a worker thread, so this bounds how long a fetch takes, never how long a request or a frame takes.",
+  "registryFetchTimeoutMs": 8000,
+
+  "//registryFetchMaxBytes": "Hard ceiling on the fetched document. A body that reaches it is refused, not truncated: a registry cut short still parses, it just has fewer mods in it than the publisher wrote.",
+  "registryFetchMaxBytes": 4000000,
+
+  "//writeSelectionFile": "Write the resolved load order to aowlspt-selection.json beside the mods. Inert until a host reads it at startup; harmless either way, and it is what makes 'takes effect on restart' true rather than aspirational.",
+  "writeSelectionFile": true
+}

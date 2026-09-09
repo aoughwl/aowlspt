@@ -1,0 +1,30 @@
+{
+  "_comment": "aowl.ammoloading (\"Ammo Loading\") — TWO features. (1) THE ANIMATION, configured by every key below: first-person magazine loading animations, ported from Manimal's ManimalAmmoLoadingAnimations (MIT, v1.6.0) to the post-1.0 IL2CPP host. This is a HOST-NATIVE APPROXIMATION, not a 1:1 port: the upstream mod injects a managed Player.UsableItemController subclass and instantiates generic controller-swap methods with it, and neither is reachable on IL2CPP. We instead instantiate the upstream bundle's prefab directly and drive its Animator by verified static RVA. Every key here is declared in ammoloading.nim's settings schema. (2) THE SPEED of loading and unloading, which is deliberately NOT a key here: it is a server database value -- globals.config.BaseLoadTime (0.85), globals.config.BaseUnloadTime (0.3) and globals.config.LoadTimeSpeedProgress (1) -- already exposed as three rows of aowl.tarkov's Globals tuning page. Change it there. A second control writing the same value is how you get 'I changed it and nothing happened'.",
+
+  "_enabledComment": "Master switch. False installs no hooks at all and the game behaves exactly as vanilla. DEFAULT OFF: this feature detours the live magazine-loading flow during gameplay.",
+  "enabled": false,
+
+  "_modeComment": "ESCALATION LADDER — move up ONE rung at a time and confirm the game still plays at each. off: install nothing. probe: install the verified prefix on LoadMagazineProcess::Start @0x768F50 and COUNT firings only; proves detection fires on a real mag load with zero dereferences. read: also walk _magazine@0x18 -> Item.Template@0x60 -> ItemTemplate._id._stringID@0xF0 and resolve the mag template id to a mesh name; writes nothing, calls nothing. The tplId is required to be 24 hex characters, so a wrong offset REFUSES instead of inventing a number. spawn: also instantiate the bundle prefab via ObjectsFactory::InstantiateWithoutPool @0x93AB40 using the IEasyAssets latched from ObjectsFactory::.ctor @0x938430, and enable the matching mag mesh. animate: also drive the bundle Animator (Play/SetBool/Update) so rounds are thumbed in over time. Only 'animate' produces the visible feature.",
+  "mode": "off",
+
+  "_bundlePathComment": "ABSOLUTE path to stanags_container.bundle, the upstream mod's shipped asset (MIT). A copy ships at mods/ammoloading/data/stanags_container.bundle and is the default when this is empty. The file is Unity 2022.3.43f1; this client is 2022.3.43f2 — same patch, differing only in hotfix digit, so the serialization version matches. EMPTY AND MISSING = the feature REFUSES LOUDLY and vanilla behaviour is untouched; it never silently no-ops.",
+  "bundlePath": "",
+
+  "_hijackKeyComment": "THE BUNDLE-KEY PROBLEM, STATED PLAINLY. We cannot ADD a bundle key: the game builds one EasyBundle per entry in BSG's own manifest, and mods/textures/redirect.nim can only rewrite an existing key's _path, never introduce a new one. So our bundle must ride an EXISTING vanilla key, and that key's real asset is unavailable while this feature is on. The redirect itself is performed by mods/textures (redirectMode=full, bundleRoot containing a file named exactly like this key) BECAUSE TWO DETOURS ON EasyBundle::Load WOULD OVERWRITE EACH OTHER'S TRAMPOLINE AND SILENTLY KILL THE FIRST. This mod therefore never detours EasyBundle::Load; it rides the one mods/textures already owns. Empty = no redirect is expected and the spawn rung will refuse unless the key already resolves.",
+  "hijackKey": "",
+
+  "_drawClipSecondsComment": "Length of the bundle's draw clip, from the upstream mod (LoadAmmoAnimDriver.DrawClipSeconds = 0.867). Used to stretch the first-bullet wait so the draw finishes before a round actually seats. Upstream value, carried over — not re-measured against this build.",
+  "drawClipSeconds": 0.867,
+
+  "_putAwayMaxWaitSecondsComment": "Ceiling on how long we wait for the put-away clip before tearing down anyway. Upstream uses 1.5s for a roughly 1s clip. This is a CAP, not an expectation: it is what stops a stuck animator from holding the session open forever.",
+  "putAwayMaxWaitSeconds": 1.5,
+
+  "_maxFaultsComment": "Self-disable threshold (rule 6). After this many unreadable hops or faulted calls the feature retires for the session: hooks stay installed and keep counting, but nothing is dereferenced, called or written again. A path that has faulted this often is not a transient.",
+  "maxFaults": 8,
+
+  "_armDelayMsComment": "How long after the mod loads before hooks are installed. Deferred past the boot asset storm, and the mod additionally waits until GameAssembly.dll is mapped and the target prologues byte-verify. 0 arms as soon as those hold.",
+  "armDelayMs": 12000,
+
+  "_logSessionsComment": "Log a line per loading session (start, mesh chosen, spawn outcome, teardown). Capped internally so a long looting session cannot storm the log. Turn off once the feature is settled.",
+  "logSessions": true
+}

@@ -1,0 +1,641 @@
+{
+ "//": "Cases for `python tools/toolcheck.py`. Data, not code, exactly like",
+ "//1": "deploy.json -- adding a case must not require touching the runner.",
+ "//2": "",
+ "//3": "FIELDS",
+ "//4": "  name     unique id",
+ "//5": "  why      the bug this case exists to stop coming back. Required.",
+ "//6": "  needs    'any' | 'menu' (client at the main menu) | 'raid' (in a raid)",
+ "//7": "  write    true if the batch needs liveInspectorWrite + 'allow write'",
+ "//8": "  batches  list of batches. SEPARATE batches on purpose: per-batch",
+ "//9": "           anchors ($comp, $f1) do NOT survive across batches, and one",
+ "//10": "          of the historical bugs was exactly that they seemed to.",
+ "//11": "  assert   regexes that MUST appear in the normalised answer",
+ "//12": "  refuse   regexes that MUST appear AND are declared to be a REFUSAL.",
+ "//13": "           Reported separately, because 'the tool correctly declined'",
+ "//14": "           is the behaviour half these bugs broke, and a case with no",
+ "//15": "           refuse entry cannot lock it in.",
+ "//16": "  deny     regexes that must NOT appear -- the WRONG answer's shape.",
+ "//17": "           A refuse case without a deny is weak: it proves the",
+ "//18": "           refusal was printed, not that no answer was also printed.",
+ "//19": "",
+ "//20": "Answers are NORMALISED before matching: every pointer becomes <PTR>,",
+ "//21": "every count-of-nodes/ms becomes <N>. Assert on names, shapes, counts",
+ "//22": "and the FORM of an answer. Never on an address -- they change per run",
+ "//23": "and an address assertion fails for a reason that is not a regression.",
+ "cases": [
+  {
+   "name": "channel-alive",
+   "why": "If the channel is dead every other case 'passes' by matching nothing. This must run first and its failure aborts the suite.",
+   "needs": "any",
+   "batches": [
+    [
+     "echo aowl-toolcheck-alive"
+    ]
+   ],
+   "assert": [
+    "aowl-toolcheck-alive"
+   ]
+  },
+  {
+   "name": "roots-shape",
+   "why": "`roots` is how everything is reached. Its answer shape (transform + GameObject + name, two distinct anchors) is the contract every other case depends on.",
+   "needs": "any",
+   "batches": [
+    [
+     "roots"
+    ]
+   ],
+   "assert": [
+    "\\[\\$r\\d+\\] transform=<PTR>\\s+go=<PTR> \\(\\$rgo\\d+\\)\\s+name=\"",
+    "DontDestroyOnLoad"
+   ],
+   "deny": [
+    "rootCount=0\\s*$"
+   ]
+  },
+  {
+   "name": "roots-lists-menu-ui",
+   "why": "The live UI is in DontDestroyOnLoad, which SceneManager excludes. Before `roots`, `find` searched only $preloader's subtree and reported names 'NOT PRESENT' that were merely unreachable.",
+   "needs": "menu",
+   "batches": [
+    [
+     "roots"
+    ]
+   ],
+   "assert": [
+    "name=\"Menu UI\"",
+    "name=\"Preloader UI\""
+   ]
+  },
+  {
+   "name": "find-stopped-early-is-not-absence",
+   "why": "A bounded search that ran out of budget must SAY SO. Reporting a name as absent when the search merely stopped is a confidently-wrong answer.",
+   "needs": "menu",
+   "batches": [
+    [
+     "find CharacterSlotView in Menu UI 400"
+    ]
+   ],
+   "refuse": [
+    "STOPPED EARLY"
+   ],
+   "deny": [
+    "NOT PRESENT",
+    "searched EXHAUSTIVELY"
+   ]
+  },
+  {
+   "name": "find-exhaustive-says-so",
+   "why": "The other half of the same contract: a search that DID cover the tree must be distinguishable from one that did not, or 'not found' means nothing.",
+   "needs": "menu",
+   "batches": [
+    [
+     "find zzz-no-such-object-zzz in Preloader UI 2000000"
+    ]
+   ],
+   "assert": [
+    "searched EXHAUSTIVELY"
+   ],
+   "deny": [
+    "STOPPED EARLY"
+   ]
+  },
+  {
+   "name": "component-null-is-an-answer",
+   "why": "A failed component lookup must be reported as an ANSWER, not swallowed. When it was swallowed, $comp kept the PREVIOUS batch's pointer.",
+   "needs": "any",
+   "batches": [
+    [
+     "roots",
+     "component $rgo0 EFT.NoSuchTypeAtAll"
+    ]
+   ],
+   "refuse": [
+    "(?i)NULL|no such (component|type)|not found"
+   ],
+   "deny": [
+    "\\$comp = <PTR>",
+    "(?i)^\\s*fields of "
+   ]
+  },
+  {
+   "name": "comp-anchor-not-stale",
+   "why": "THE bug: a failed `component` left $comp holding the previous lookup's pointer, so the next `click`/`dump` acted on the wrong object and printed a complete, entirely fictional field map.",
+   "needs": "any",
+   "batches": [
+    [
+     "roots",
+     "component $rgo0 UnityEngine.RectTransform",
+     "component $rgo0 EFT.NoSuchTypeAtAll",
+     "dump $comp"
+    ]
+   ],
+   "refuse": [
+    "(?i)\\$comp (is|was) (not set|null|invalid|cleared)|no \\$comp"
+   ],
+   "deny": [
+    "(?i)^\\s*\\+0x[0-9a-f]+ "
+   ]
+  },
+  {
+   "name": "gameobject-into-transform-walker-refused",
+   "why": "Feeding a GameObject to a Transform walker used to read a plausible childCount and INVENT a hierarchy of wrong children without faulting. Silence would be better; a refusal is correct.",
+   "needs": "any",
+   "batches": [
+    [
+     "roots",
+     "children $rgo0"
+    ]
+   ],
+   "refuse": [
+    "(?i)REFUS|is a GameObject|expects a Transform"
+   ],
+   "deny": [
+    "(?i)child\\s*\\d+\\s*:",
+    "childCount="
+   ]
+  },
+  {
+   "name": "label-on-transform-is-not-empty-text",
+   "why": "`label` on a Transform reported `text = \"\"`, which reads as 'the label is empty' and is not an answer. It must say there is no text component.",
+   "needs": "menu",
+   "batches": [
+    [
+     "roots",
+     "label $r0"
+    ]
+   ],
+   "deny": [
+    "text = \"\"\\s*$"
+   ],
+   "refuse": [
+    "(?i)no (TMP_Text|text component|LocalizedText)|not a label|has no text"
+   ]
+  },
+  {
+   "name": "click-refuses-a-non-button",
+   "why": "`click`/`invoke` imposed UnityEngine.UI.Button's layout on ANY pointer, calling UnityEvent::Invoke on a GameObject and escaping the guard.",
+   "needs": "any",
+   "write": true,
+   "batches": [
+    [
+     "roots",
+     "click $rgo0"
+    ]
+   ],
+   "refuse": [
+    "(?i)REFUS|not a (UnityEngine\\.UI\\.)?Button|no Button component"
+   ],
+   "deny": [
+    "(?i)invoked|clicked ok|pressed"
+   ]
+  },
+  {
+   "name": "write-gate-holds-without-allow-write",
+   "why": "liveInspectorWrite alone must not be enough; the batch must also say `allow write`. A write that goes through without it means the gate is decorative.",
+   "needs": "any",
+   "batches": [
+    [
+     "roots",
+     "write $r0+0x10 i32 1"
+    ]
+   ],
+   "refuse": [
+    "(?i)REFUS|allow write|read-only|not permitted"
+   ],
+   "deny": [
+    "(?i)wrote |write ok"
+   ]
+  },
+  {
+   "name": "open-refusal-names-a-reason",
+   "why": "`open` rejected a CORRECT target because the prologue snapshot had recorded our own trampoline. A refusal is acceptable; a refusal with no stated reason is not, because it is indistinguishable from that bug.",
+   "needs": "menu",
+   "batches": [
+    [
+     "open"
+    ]
+   ],
+   "deny": [
+    "(?i)refus[a-z]*\\.?\\s*$"
+   ]
+  },
+  {
+   "name": "state-explains-every-null-anchor",
+   "why": "`state` exists to say WHY an anchor is null. An anchor listed as null with no reason sends you hunting for an object the host simply has not learned yet.",
+   "needs": "any",
+   "batches": [
+    [
+     "state"
+    ]
+   ],
+   "assert": [
+    "\\$preloader",
+    "\\$settings"
+   ],
+   "deny": [
+    "(?i)\\$settings\\s*=\\s*(null|0x0+)\\s*$"
+   ]
+  },
+  {
+   "name": "state-does-not-claim-not-in-raid-from-a-slot",
+   "why": "fact #51: `state` reported `in-raid anchor slot=-1` while a human WAS in a raid. A slot number is the anchor's binding, not the raid state, and must never be printed as if it were the raid state.",
+   "needs": "raid",
+   "batches": [
+    [
+     "state"
+    ]
+   ],
+   "deny": [
+    "(?i)not in (a )?raid",
+    "(?i)in-raid anchor slot=-1"
+   ]
+  },
+  {
+   "name": "state-settings-null-does-not-invent-a-cause",
+   "why": "`state` asserted the SettingsScreen anchor was null because the screen 'has not been opened this session' while the host log showed ShowScreen already firing and $settings still null -- a cause it never checked. The message must name what it actually knows (two independent hooks, either can be un-armed) rather than a single invented cause.",
+   "needs": "menu",
+   "batches": [
+    [
+     "state"
+    ]
+   ],
+   "assert": [
+    "(?i)ShowScreen postfix",
+    "(?i)invoke2 ladder"
+   ]
+  },
+  {
+   "name": "find-single-numeric-arg-is-budget-not-root",
+   "why": "`find NAME 200000` silently read 200000 decimal (0x30d40) as a ROOT pointer, walked that one bogus node, and reported the name genuinely NOT PRESENT. A bare integer that does not read back as a live pointer must be treated as BUDGET and the tool must say which interpretation it picked.",
+   "needs": "menu",
+   "batches": [
+    [
+     "find CharacterSlotView 200000"
+    ]
+   ],
+   "assert": [
+    "(?i)treated as BUDGET"
+   ],
+   "deny": [
+    "(?i)genuinely NOT PRESENT",
+    "(?i)searched EXHAUSTIVELY"
+   ]
+  },
+  {
+   "name": "find-invalid-root-refused-not-reported-absent",
+   "why": "An explicit root that does not read back as a live Transform must be refused up front, the way `tree` already refuses -- never walked as if valid and then reported 'searched EXHAUSTIVELY, genuinely NOT PRESENT' off one bogus node.",
+   "needs": "any",
+   "batches": [
+    [
+     "find Foo 0x1 500"
+    ]
+   ],
+   "refuse": [
+    "(?i)not readable"
+   ],
+   "deny": [
+    "(?i)genuinely NOT PRESENT",
+    "(?i)searched EXHAUSTIVELY"
+   ]
+  },
+  {
+   "name": "findtext-single-numeric-arg-is-budget-not-root",
+   "why": "`findtext` had its own copy of the ROOT-vs-BUDGET parser from BEFORE this ambiguity was fixed in `find`: `findtext SETTINGS 300000` silently read 300000 decimal (0x493e0) as a ROOT, walked one bogus node, and claimed the text genuinely NOT PRESENT. Now shares `find`'s readability-based disambiguator (`iFindResolveRoot`).",
+   "needs": "menu",
+   "batches": [
+    [
+     "findtext SETTINGS 300000"
+    ]
+   ],
+   "assert": [
+    "(?i)treated as BUDGET"
+   ],
+   "deny": [
+    "(?i)NOT PRESENT under this root",
+    "(?i)searched EXHAUSTIVELY"
+   ]
+  },
+  {
+   "name": "findtext-invalid-root-refused-not-reported-absent",
+   "why": "`findtext` accepted an unreadable explicit root and then asserted a confident, exhaustive absence from it. It must refuse up front, the same as `find` and `tree` already do.",
+   "needs": "any",
+   "batches": [
+    [
+     "findtext Foo 0x1 500"
+    ]
+   ],
+   "refuse": [
+    "(?i)not readable"
+   ],
+   "deny": [
+    "(?i)NOT PRESENT under this root",
+    "(?i)searched EXHAUSTIVELY"
+   ]
+  },
+  {
+   "name": "findtext-echoes-once-not-per-frame",
+   "why": "A frame-spanning `findtext` re-entered iExec every frame and the echo-suppression check only ever covered `find`'s resume flag, so a 57-frame findtext search printed 57 identical `> findtext ...` header lines around a 4-line answer.",
+   "needs": "menu",
+   "batches": [
+    [
+     "findtext e"
+    ]
+   ],
+   "deny": [
+    "(> findtext e\\s*\\n[\\s\\S]*){2}"
+   ]
+  },
+  {
+   "name": "findtext-hit-reports-active-state-and-scope",
+   "why": "findtext hits gave no way to tell an active, pressable control from an inactive one -- pressing an inactive node returns success and does nothing (fact #72). A hit must state activeInHierarchy, and the summary must state which scope (active-only vs all) was actually searched.",
+   "needs": "menu",
+   "batches": [
+    [
+     "findtext e"
+    ]
+   ],
+   "assert": [
+    "(?i)scope: ACTIVE nodes only"
+   ]
+  },
+  {
+   "name": "rect-decodes-vector2-and-rect-struct-returns",
+   "why": "`rect` used to call the Vector2/Rect getters and admit it could not decode a struct-BY-VALUE return, pointing at a `fields` workaround that measurement showed is impossible on RectTransform (only one il2cpp field, reapplyDrivenProperties). This asserts the numbers now print instead of the old disclaimer.",
+   "needs": "menu",
+   "batches": [
+    [
+     "rect $verlabel"
+    ]
+   ],
+   "assert": [
+    "anchoredPosition = \\([-0-9.]+, [-0-9.]+\\)",
+    "sizeDelta\\s* = \\([-0-9.]+, [-0-9.]+\\)",
+    "anchorMin\\s* = \\([-0-9.]+, [-0-9.]+\\)",
+    "anchorMax\\s* = \\([-0-9.]+, [-0-9.]+\\)",
+    "pivot\\s* = \\([-0-9.]+, [-0-9.]+\\)",
+    "rect \\(x,y,w,h\\) = \\([-0-9.]+, [-0-9.]+, [-0-9.]+, [-0-9.]+\\)"
+   ],
+   "deny": [
+    "call shapes do not decode yet"
+   ]
+  },
+  {
+   "name": "tab-refuses-a-wrong-receiver-type",
+   "why": "MEASURED: `tab` fed an EFT.UI.AnimatedToggle and then a UnityEngine.CanvasRenderer called SettingsTab::set_IsSelected on both, wrote +0x90 on objects with no such field, printed a plausible 'first-select latch' line, and desynced the Settings screen (escapes=1). A typed call on an untyped pointer must refuse by KLASS.",
+   "needs": "menu",
+   "write": true,
+   "batches": [
+    [
+     "roots",
+     "component $rgo0 CanvasRenderer",
+     "tab $comp"
+    ]
+   ],
+   "refuse": [
+    "tab REFUSED",
+    "(WRONG RECEIVER TYPE|TYPE INCONCLUSIVE|not readable)"
+   ],
+   "deny": [
+    "first-select latch",
+    "set_IsSelected"
+   ]
+  },
+  {
+   "name": "tab-drives-the-toggle-not-the-highlight",
+   "why": "Even on a REAL SettingsTab the old `tab` moved the highlight and not the panel: the screen switches on the toggle's onValueChanged, not on set_IsSelected. The verb must name Toggle::set_isOn and must read _currentTab back as the finished state.",
+   "needs": "menu",
+   "write": true,
+   "batches": [
+    [
+     "help"
+    ]
+   ],
+   "assert": [
+    "SELECT A TAB THE WAY A CLICK DOES",
+    "set_isOn"
+   ],
+   "deny": [
+    "tab EXPR \\[0\\|1\\]\\s+SettingsTab::set_IsSelected"
+   ]
+  },
+  {
+   "name": "open-unknown-group-is-refused-not-zero",
+   "why": "MEASURED: `open Graphics` opened Game. An unrecognised name was evaluated as an expression, the failed parse's return was DISCARDED, and group stayed 0 -- a check that cannot fail. An unknown name must refuse and list the valid ones.",
+   "needs": "menu",
+   "write": true,
+   "batches": [
+    [
+     "open Nonsense"
+    ]
+   ],
+   "refuse": [
+    "is not a settings group",
+    "PostFX"
+   ],
+   "deny": [
+    "ShowScreen @0x"
+   ]
+  },
+  {
+   "name": "open-accepts-group-names-case-insensitively",
+   "why": "The fix for the above must actually map the names, not just refuse everything. `graphics` is ESettingsGroup.Screen = 0 (measured from metadata), which is the mapping the reporter expected and did not get.",
+   "needs": "any",
+   "batches": [
+    [
+     "help"
+    ]
+   ],
+   "assert": [
+    "GROUP is a NAME or 0\\.\\.4",
+    "Screen \\(aka Graphics"
+   ]
+  },
+  {
+   "name": "open-refuses-a-screen-that-is-not-active",
+   "why": "MEASURED: `open N` immediately after pressing BACK ran ShowScreen on a screen mid-close and ESCAPED the SEH guard (escapes=1). $settings survives a close -- the same pointer comes back on reopen -- so a non-null pointer proves nothing about callability. activeInHierarchy is the state that differs.",
+   "needs": "menu",
+   "write": true,
+   "batches": [
+    [
+     "help"
+    ]
+   ],
+   "assert": [
+    "not activeInHierarchy \\(closing/closed\\)"
+   ]
+  },
+  {
+   "name": "find-cap-message-names-the-real-limiter",
+   "why": "MEASURED: a search that visited 30,720 of an 80,000 node budget printed 'STOPPED EARLY on the NODE BUDGET', sending the reader to raise a budget with 49,280 nodes still unspent. The frame cap and the node budget are different limiters and the message must say which one fired.",
+   "needs": "menu",
+   "batches": [
+    [
+     "find zzzz-no-such-object-zzzz 80000"
+    ]
+   ],
+   "assert": [
+    "(searched EXHAUSTIVELY|STOPPED EARLY on the (FRAME CAP|NODE BUDGET))"
+   ],
+   "deny": [
+    "STOPPED EARLY on the NODE BUDGET \\(80000\\)[\\s\\S]*budget still has room"
+   ]
+  },
+  {
+   "name": "parent-level-0-is-the-node-you-passed",
+   "why": "Reported inconsistent: `parent <SettingsList> 1` printed the node itself as [0] in one call and the PARENT as [0] in another. The numbering is now a stated contract, printed on every call, and a GameObject argument (the reachable cause) is refused.",
+   "needs": "menu",
+   "batches": [
+    [
+     "roots",
+     "parent $r0 1",
+     "parent $rgo0 1"
+    ]
+   ],
+   "assert": [
+    "\\[0\\] is THE NODE YOU PASSED"
+   ],
+   "refuse": [
+    "parent was given a GameObject"
+   ]
+  },
+  {
+   "name": "pressname-fail-names-the-failing-check",
+   "why": "MEASURED: pressname found exactly one VISIBLE candidate and printed 'could not be pressed (see the line above)' with no reason findable in the out-file -- while the same object pressed fine by hand via component+press. A verdict that points at absent evidence is worse than no verdict.",
+   "needs": "any",
+   "batches": [
+    [
+     "help"
+    ]
+   ],
+   "assert": [
+    "a FAIL prints the failing check ON THE VERDICT LINE"
+   ],
+   "deny": [
+    "see the line above"
+   ]
+  },
+  {
+   "name": "pressname-resumes-until-exhaustive",
+   "why": "MEASURED: `pressname BackButton` with no root visited 20,000 nodes in ONE slice, left a ~13-15k frontier, and reported '0 name match(es) ... INCONCLUSIVE' for a button that was on screen. One frame is smaller than the scene.",
+   "needs": "any",
+   "batches": [
+    [
+     "help"
+    ]
+   ],
+   "assert": [
+    "RESUMES ACROSS FRAMES until EXHAUSTIVE"
+   ]
+  },
+  {
+   "name": "roots-reaches-dontdestroyonload-in-a-raid",
+   "why": "MEASURED in a live Woods raid: `roots` returned only the location scene (woods_terrain, AICoversData, Location Scene, ...) and rootless `find MenuScreen 80000` + two `find more` answered 'searched EXHAUSTIVELY ... genuinely NOT PRESENT' for a live screen. PreloaderUI does not tick in a raid, so the DDOL anchor is dead; the handle is now remembered and revalidated by name.",
+   "needs": "raid",
+   "batches": [
+    [
+     "roots"
+    ]
+   ],
+   "assert": [
+    "name=\"Common UI\"",
+    "DontDestroyOnLoad"
+   ],
+   "deny": [
+    "^\\s*$"
+   ]
+  },
+  {
+   "name": "roots-at-the-menu-still-lists-the-ddol-set",
+   "why": "The in-raid fix must not change the menu answer. A regression here would mean the remembered handle displaced the live anchor rather than backing it up.",
+   "needs": "menu",
+   "batches": [
+    [
+     "roots"
+    ]
+   ],
+   "assert": [
+    "name=\"Menu UI\"",
+    "name=\"Preloader UI\""
+   ]
+  },
+  {
+   "name": "raid-verb-refuses-inside-a-raid",
+   "why": "The raid-entry state machine walks the MENU hierarchy; running it during a raid load stalls the Unity thread (fact #261). A live GameWorld is a POSITIVE test for being in a raid -- the converse is deliberately not asserted.",
+   "needs": "raid",
+   "write": true,
+   "batches": [
+    [
+     "raid"
+    ]
+   ],
+   "refuse": [
+    "raid REFUSED",
+    "IN A RAID"
+   ],
+   "deny": [
+    "queued #"
+   ]
+  },
+  {
+   "name": "raid-verb-arms-at-the-menu",
+   "why": "The user's verdict on outside-driven UI automation was that it is far too slow; the host-native path is ~970ms menu-to-READY. The verb must ARM it and must say that armed is not entered.",
+   "needs": "menu",
+   "write": true,
+   "batches": [
+    [
+     "raid"
+    ],
+    [
+     "raid status"
+    ]
+   ],
+   "assert": [
+    "queued #",
+    "ACCEPTED IS NOT ENTERED",
+    "stage:"
+   ],
+   "deny": [
+    "raid REFUSED"
+   ]
+  },
+  {
+   "name": "raidexit-refuses-when-not-in-a-raid",
+   "why": "raidexit presses DISCONNECT. Outside a raid there is nothing to disconnect from, and it must prove being in one positively (a live GameWorld) rather than inferring it from scene roots -- which is exactly the inference that was measured wrong in a raid.",
+   "needs": "menu",
+   "write": true,
+   "batches": [
+    [
+     "raidexit"
+    ]
+   ],
+   "refuse": [
+    "raidexit REFUSED",
+    "no live GameWorld"
+   ],
+   "deny": [
+    "queued"
+   ]
+  },
+  {
+   "name": "click-refuses-by-klass-not-only-by-field-shape",
+   "why": "click's GameObject-in-m_OnClick and klass-pointer checks are inferences from values at Button's offsets; a UnityEngine.CanvasRenderer has neither at +0x100 and would have passed both. The receiver's klass chain is the direct question.",
+   "needs": "menu",
+   "write": true,
+   "batches": [
+    [
+     "roots",
+     "component $rgo0 CanvasRenderer",
+     "click $comp"
+    ]
+   ],
+   "refuse": [
+    "(WRONG RECEIVER TYPE|TYPE INCONCLUSIVE)"
+   ],
+   "deny": [
+    "Button::Press @0x"
+   ]
+  }
+ ]
+}

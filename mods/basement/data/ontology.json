@@ -1,0 +1,2408 @@
+{
+  "schema": "aowl.basement.ontology/1",
+  "note": "Intent x stance-bucket response table. This is DATA, not a model and not reasoning: a typed lookup with slot fills and a fixed tag set per row. The fallback rows are what the 'builtin' tier serves and they are marked notALanguageModel. Every row carries `alts`: the reply is picked from text+alts by a hash of (personId, what was said), so one person is consistent and ten people are not a chorus. The `unknown` rows are what a person says when the classifier had nothing -- in character, in their own stance bucket, never a generic apology. The `offscreen` table is the same idea for events NOBODY witnessed: bm/offscreen resolves a fight, a trade or a meeting between two groups on an unloaded map and writes one line from here into the journal and into a rumour fact. Slots: {a} {b} {place} {extra}. No model is involved, and a missing row is reported as a missing row rather than replaced by a sentence the code made up.",
+  "slots": [
+    "{name}",
+    "{faction}",
+    "{want}",
+    "{place}",
+    "{objective}"
+  ],
+  "buckets": [
+    "hostile",
+    "wary",
+    "neutral",
+    "warm",
+    "loyal"
+  ],
+  "intents": [
+    {
+      "id": "greet",
+      "patterns": [
+        "hello",
+        "hi",
+        "hey",
+        "good morning",
+        "you there",
+        "hail",
+        "greetings",
+        "yo"
+      ]
+    },
+    {
+      "id": "farewell",
+      "patterns": [
+        "goodbye",
+        "bye",
+        "see you",
+        "i am leaving",
+        "im leaving",
+        "take care",
+        "later",
+        "so long"
+      ]
+    },
+    {
+      "id": "threaten",
+      "patterns": [
+        "kill you",
+        "shoot you",
+        "gun",
+        "drop it",
+        "hands up",
+        "or i",
+        "dont move",
+        "don't move",
+        "put it down",
+        "i will end you"
+      ]
+    },
+    {
+      "id": "plead",
+      "patterns": [
+        "please",
+        "dont shoot",
+        "don't shoot",
+        "mercy",
+        "spare me",
+        "let me go",
+        "i am begging",
+        "im begging",
+        "have mercy",
+        "help me please"
+      ]
+    },
+    {
+      "id": "offer_trade",
+      "patterns": [
+        "trade",
+        "sell",
+        "buy",
+        "barter",
+        "swap",
+        "i have",
+        "how much",
+        "deal for",
+        "exchange"
+      ]
+    },
+    {
+      "id": "accept",
+      "patterns": [
+        "yes",
+        "agreed",
+        "deal",
+        "ok",
+        "okay",
+        "alright",
+        "i accept",
+        "fine by me",
+        "sounds good"
+      ]
+    },
+    {
+      "id": "refuse",
+      "patterns": [
+        "no",
+        "never",
+        "not a chance",
+        "i refuse",
+        "forget it",
+        "no deal",
+        "not happening",
+        "pass"
+      ]
+    },
+    {
+      "id": "ask_help",
+      "patterns": [
+        "help me",
+        "can you help",
+        "i need help",
+        "need a hand",
+        "patch me",
+        "heal me",
+        "cover me",
+        "give me a hand"
+      ]
+    },
+    {
+      "id": "ask_quest",
+      "patterns": [
+        "work",
+        "job",
+        "anything for me",
+        "need anything",
+        "task",
+        "errand",
+        "contract",
+        "what do you want",
+        "got work"
+      ]
+    },
+    {
+      "id": "ask_directions",
+      "patterns": [
+        "where is",
+        "which way",
+        "how do i get",
+        "directions",
+        "where can i find",
+        "point me",
+        "where do i go",
+        "find the"
+      ]
+    },
+    {
+      "id": "insult",
+      "patterns": [
+        "idiot",
+        "coward",
+        "scum",
+        "shut up",
+        "you stink",
+        "fool",
+        "waste of air",
+        "pathetic",
+        "filth"
+      ]
+    },
+    {
+      "id": "surrender",
+      "patterns": [
+        "i surrender",
+        "i give up",
+        "dont hurt me",
+        "don't hurt me",
+        "take it",
+        "i yield",
+        "im unarmed",
+        "i am unarmed",
+        "standing down"
+      ]
+    },
+    {
+      "id": "demand",
+      "patterns": [
+        "give me",
+        "hand it over",
+        "i want",
+        "you owe me",
+        "pay up",
+        "open it",
+        "move aside",
+        "i am taking"
+      ]
+    },
+    {
+      "id": "smalltalk",
+      "patterns": [
+        "weather",
+        "how are you",
+        "cold out here",
+        "long night",
+        "quiet today",
+        "rough day",
+        "been here long",
+        "hows it going",
+        "how's it going"
+      ]
+    },
+    {
+      "id": "ask_identity",
+      "patterns": [
+        "who are you",
+        "your name",
+        "what are you",
+        "who do you run with",
+        "whose side",
+        "what faction",
+        "who sent you",
+        "identify yourself"
+      ]
+    },
+    {
+      "id": "ask_rumour",
+      "patterns": [
+        "heard anything",
+        "news",
+        "rumour",
+        "rumor",
+        "what happened",
+        "any word",
+        "whats going on",
+        "what's going on",
+        "gossip"
+      ]
+    },
+    {
+      "id": "claim",
+      "patterns": [
+        "i am",
+        "im",
+        "my name is",
+        "sent me",
+        "sent for",
+        "here for the",
+        "here for",
+        "the password is",
+        "the word is",
+        "password",
+        "the word",
+        "come for the",
+        "i am the one",
+        "they told me to collect",
+        "collecting for",
+        "on behalf of"
+      ]
+    },
+    {
+      "id": "ask_activity",
+      "patterns": [
+        "what are you doing",
+        "what are you up to",
+        "what is your job",
+        "whats the job",
+        "what is the job",
+        "why are you here",
+        "where are you going",
+        "what brings you here",
+        "what are you working on",
+        "what is your business",
+        "busy"
+      ]
+    }
+  ],
+  "rows": [
+    {
+      "intent": "greet",
+      "bucket": "hostile",
+      "text": "You keep walking. That is the whole of my greeting to you.",
+      "tags": [
+        "MOOD: -0.6",
+        "ATTITUDE: -2"
+      ],
+      "alts": [
+        "Wrong face, wrong day. Walk.",
+        "I have nothing to say to you that a rifle would not say better.",
+        "Do not stand there greeting me like we are people."
+      ],
+      "yell": [
+        "KEEP WALKING!",
+        "NOTHING FOR YOU! GO!"
+      ]
+    },
+    {
+      "intent": "greet",
+      "bucket": "wary",
+      "text": "Far enough. Say what you came to say and keep your hands where the light is.",
+      "tags": [
+        "MOOD: -0.2"
+      ],
+      "alts": [
+        "Stop there. Talk from where you are.",
+        "That is close enough for hellos. What do you want?",
+        "I hear you. Hands out of your coat and say it."
+      ],
+      "yell": [
+        "THAT IS CLOSE ENOUGH!",
+        "STATE YOUR BUSINESS!"
+      ]
+    },
+    {
+      "intent": "greet",
+      "bucket": "neutral",
+      "text": "{name}. I run with {faction}. State your business and we both go on breathing.",
+      "tags": [
+        "MOOD: 0.0"
+      ],
+      "alts": [
+        "Evening. Keep it short, I am working.",
+        "You are new. {faction} holds this ground; act accordingly.",
+        "Hello then. Say your piece before somebody else comes along."
+      ],
+      "yell": [
+        "HEY! WHAT DO YOU WANT!",
+        "I HEAR YOU! SPEAK UP!"
+      ]
+    },
+    {
+      "intent": "greet",
+      "bucket": "warm",
+      "text": "You again. Good. The road has been thin on faces worth seeing.",
+      "tags": [
+        "MOOD: 0.4",
+        "ATTITUDE: +2"
+      ],
+      "alts": [
+        "You made it back. I had money on the other outcome.",
+        "Good to see a face I do not have to watch.",
+        "There you are. Sit, if you are staying."
+      ],
+      "yell": [
+        "HEY! COME CLOSER!",
+        "GOOD TO SEE YOU! GET OVER HERE!"
+      ]
+    },
+    {
+      "intent": "greet",
+      "bucket": "loyal",
+      "text": "Come in out of the open, friend. {place} is yours as much as mine.",
+      "tags": [
+        "MOOD: 0.7",
+        "ATTITUDE: +3"
+      ],
+      "alts": [
+        "You are a sight. Whatever it is, I am in.",
+        "About time. I was starting to plan a funeral.",
+        "Come here. The world is grim and you are the good part of it."
+      ],
+      "yell": [
+        "OVER HERE! COME ON!",
+        "GET IN HERE, IT IS SAFE!"
+      ]
+    },
+    {
+      "intent": "farewell",
+      "bucket": "hostile",
+      "text": "Go. If I see you on this ground again I will not be talking.",
+      "tags": [
+        "MOOD: -0.5",
+        "LEAVE"
+      ],
+      "alts": [
+        "Go, and do not come back this way.",
+        "Finally. Do not turn around.",
+        "Out. Before I change my mind about letting you."
+      ],
+      "yell": [
+        "GET OUT!",
+        "GO!"
+      ]
+    },
+    {
+      "intent": "farewell",
+      "bucket": "wary",
+      "text": "Then go. Walk out the way you came in and do not circle back.",
+      "tags": [
+        "LEAVE"
+      ],
+      "alts": [
+        "Go on then. I will watch you leave.",
+        "Fine. Straight out the way you came.",
+        "Leave. Keep to the open ground so I can see you."
+      ],
+      "yell": [
+        "ON YOUR WAY!",
+        "GO ON, THEN!"
+      ]
+    },
+    {
+      "intent": "farewell",
+      "bucket": "neutral",
+      "text": "Walk safe. The ground between here and there does not care about either of us.",
+      "tags": [
+        "LEAVE"
+      ],
+      "alts": [
+        "Right. Watch the road out of {place}.",
+        "Go careful. It is worse after dark.",
+        "Off you go. Try to still be breathing next time."
+      ],
+      "yell": [
+        "GO WELL!",
+        "SEE YOU ON THE ROAD!"
+      ]
+    },
+    {
+      "intent": "farewell",
+      "bucket": "warm",
+      "text": "Keep your head low. {place} will still be standing when you come back.",
+      "tags": [
+        "MOOD: 0.3",
+        "LEAVE"
+      ],
+      "alts": [
+        "Take water. Come back through when you can.",
+        "Go on. I will keep a spot by the fire.",
+        "Safe road. And do not be a stranger about it."
+      ],
+      "yell": [
+        "KEEP YOUR HEAD DOWN!",
+        "COME BACK ALIVE!"
+      ]
+    },
+    {
+      "intent": "farewell",
+      "bucket": "loyal",
+      "text": "Go on then. If it turns bad out there, say my name on the radio and I will come.",
+      "tags": [
+        "MOOD: 0.5",
+        "REMEMBER: parted on good terms; promised to answer a call"
+      ],
+      "alts": [
+        "Come back to me in one piece. That is the deal.",
+        "Go. I will be here, and I will be listening for you.",
+        "Take care of yourself, or I will be very annoyed."
+      ],
+      "yell": [
+        "COME BACK!",
+        "I WILL BE HERE!"
+      ]
+    },
+    {
+      "intent": "threaten",
+      "bucket": "hostile",
+      "text": "Wrong day and wrong man. Try it.",
+      "tags": [
+        "ATTACK"
+      ],
+      "alts": [
+        "Do it then. You will not be the first to try.",
+        "Threats are cheap here. Pull it or put it away.",
+        "You are talking. Talking is what people do instead."
+      ],
+      "yell": [
+        "TRY IT!",
+        "COME ON THEN!"
+      ]
+    },
+    {
+      "intent": "threaten",
+      "bucket": "wary",
+      "text": "Point that somewhere else. Now. You get one breath to decide.",
+      "tags": [
+        "MOOD: -0.7",
+        "ATTITUDE: -10",
+        "DEMAND: lower the weapon | I open fire"
+      ],
+      "alts": [
+        "Careful. That kind of talk ends conversations.",
+        "Say that again and we find out which of us is faster.",
+        "You are one word from a very short evening."
+      ],
+      "yell": [
+        "BACK OFF!",
+        "DO NOT!"
+      ]
+    },
+    {
+      "intent": "threaten",
+      "bucket": "neutral",
+      "text": "You are two seconds from a fight you did not plan for. Lower it.",
+      "tags": [
+        "ATTITUDE: -8",
+        "DEMAND: lower the weapon | this ends badly"
+      ],
+      "alts": [
+        "Do not. Whatever this is, it is not worth the noise.",
+        "Back up. You do not want {faction} hearing about this.",
+        "Think. There are two of us and one bad ending."
+      ],
+      "yell": [
+        "DO NOT START!",
+        "THINK ABOUT IT FIRST!"
+      ]
+    },
+    {
+      "intent": "threaten",
+      "bucket": "warm",
+      "text": "After what we have been through, you point that at me? Put it down and I will forget it.",
+      "tags": [
+        "MOOD: -0.5",
+        "ATTITUDE: -12",
+        "DEMAND: put it down | I forget every kindness"
+      ],
+      "alts": [
+        "Do not talk to me like that. I thought better of you.",
+        "That is beneath you. Put it down and try again.",
+        "You are angry. Fine. Do not aim it at me."
+      ],
+      "yell": [
+        "DO NOT MAKE ME!",
+        "STOP THIS!"
+      ]
+    },
+    {
+      "intent": "threaten",
+      "bucket": "loyal",
+      "text": "I would have died for you. Lower it and we never had this conversation.",
+      "tags": [
+        "MOOD: -0.8",
+        "ATTITUDE: -20",
+        "DEMAND: lower it | I walk and never look back"
+      ],
+      "alts": [
+        "After everything, you say that to me?",
+        "I would have died for you. Say it again, slowly.",
+        "That hurt more than a bullet would have. Stop."
+      ],
+      "yell": [
+        "NOT YOU! NOT LIKE THIS!",
+        "PUT IT DOWN!"
+      ]
+    },
+    {
+      "intent": "plead",
+      "bucket": "hostile",
+      "text": "Begging is cheap out here. {faction} does not take payment in it.",
+      "tags": [
+        "MOOD: -0.4",
+        "REFUSE"
+      ],
+      "alts": [
+        "Beg somewhere else. It does nothing here.",
+        "No. Save the words for whoever finds you.",
+        "Everyone is dying. You are not special about it."
+      ]
+    },
+    {
+      "intent": "plead",
+      "bucket": "wary",
+      "text": "Everyone out here has a reason. Give me something better than your voice.",
+      "tags": [
+        "DEMAND: something worth the risk | you get nothing"
+      ],
+      "alts": [
+        "Do not beg. Tell me what you have to trade.",
+        "I might. Depends what is in it for me.",
+        "Stand up. Begging makes me nervous, and nervous is bad for you."
+      ]
+    },
+    {
+      "intent": "plead",
+      "bucket": "neutral",
+      "text": "Stand up. I am not the one who put you down, and I am not carrying you either.",
+      "tags": [
+        "MOOD: 0.0"
+      ],
+      "alts": [
+        "I can spare a little. Not much, and not twice.",
+        "Alright. But you owe {faction}, not me, and they collect.",
+        "One thing. Name it and be quick."
+      ]
+    },
+    {
+      "intent": "plead",
+      "bucket": "warm",
+      "text": "Easy. Breathe. You are not dying on my ground today.",
+      "tags": [
+        "MOOD: 0.5",
+        "ATTITUDE: +4",
+        "GIVE: field dressing"
+      ],
+      "alts": [
+        "Do not beg me. Just ask. Here.",
+        "You do not have to do that with me. Take it.",
+        "Sit down before you fall down. I will see what I have."
+      ]
+    },
+    {
+      "intent": "plead",
+      "bucket": "loyal",
+      "text": "You do not have to ask me. Get behind me and stay there.",
+      "tags": [
+        "MOOD: 0.6",
+        "STAY",
+        "FOLLOW_ME"
+      ],
+      "alts": [
+        "Stop. You never have to ask me twice.",
+        "It is yours. It was always going to be.",
+        "Whatever it is, we fix it. Breathe."
+      ]
+    },
+    {
+      "intent": "offer_trade",
+      "bucket": "hostile",
+      "text": "I do not trade with you. I take from you, or I leave you be. Today I am leaving you be.",
+      "tags": [
+        "REFUSE",
+        "MOOD: -0.5"
+      ],
+      "alts": [
+        "I do not trade with you. I do not deal with you.",
+        "Keep it. Nothing you own is worth my hands on it.",
+        "No trade. Move along before this gets loud."
+      ]
+    },
+    {
+      "intent": "offer_trade",
+      "bucket": "wary",
+      "text": "Show me first. Hands slow. If it is junk we are finished talking.",
+      "tags": [
+        "OFFER: show the goods first, price after"
+      ],
+      "alts": [
+        "Show me first. I do not buy stories.",
+        "Lay it on the ground and step back. Then we talk.",
+        "Maybe. Open it slow so I can see."
+      ]
+    },
+    {
+      "intent": "offer_trade",
+      "bucket": "neutral",
+      "text": "Everything has a price and mine is high because the road is bad. What have you got.",
+      "tags": [
+        "OFFER: fair weight for fair weight, no credit"
+      ],
+      "alts": [
+        "Let me see it. If it is what you say, we deal.",
+        "{faction} pays for {want}. Anything else is charity.",
+        "Terms first, goods second. What do you want for it?"
+      ]
+    },
+    {
+      "intent": "offer_trade",
+      "bucket": "warm",
+      "text": "For you, close to cost. {faction} still needs {want}, if you happen to be carrying it.",
+      "tags": [
+        "OFFER: near cost, and a bonus for {want}"
+      ],
+      "alts": [
+        "For you, a fair price and no haggling.",
+        "Show me. I will not squeeze you on it.",
+        "Done, most likely. Let me look at what you have."
+      ]
+    },
+    {
+      "intent": "offer_trade",
+      "bucket": "loyal",
+      "text": "Take what you need from the crate. Square it with me when you can, or do not.",
+      "tags": [
+        "GIVE: supplies from the crate",
+        "ATTITUDE: +2"
+      ],
+      "alts": [
+        "Keep your goods. Tell me what you need.",
+        "We are past trading, you and I. Take what you want.",
+        "You do not pay here. Not you."
+      ]
+    },
+    {
+      "intent": "accept",
+      "bucket": "hostile",
+      "text": "Agreeing with me does not make you welcome. It makes you convenient.",
+      "tags": [
+        "MOOD: -0.3"
+      ],
+      "alts": [
+        "Do not read that as friendship. It is arithmetic.",
+        "Agreed, and I still do not like you.",
+        "Fine. Cross me and it ends the usual way."
+      ]
+    },
+    {
+      "intent": "accept",
+      "bucket": "wary",
+      "text": "Good. Then it is said out loud, and I hold you to it.",
+      "tags": [
+        "ACCEPT"
+      ],
+      "alts": [
+        "Agreed. Slowly, and where I can see your hands.",
+        "Alright. Do not make me regret being reasonable.",
+        "That works. Hold to it exactly."
+      ]
+    },
+    {
+      "intent": "accept",
+      "bucket": "neutral",
+      "text": "Done. Break it and I will tell everyone who trades on this map.",
+      "tags": [
+        "ACCEPT",
+        "REMEMBER: struck an agreement; terms are on the record"
+      ],
+      "alts": [
+        "Done. Word is worth something out here, so keep yours.",
+        "Agreed. {faction} will hear that you were straight with me.",
+        "That is a deal. Do not be late."
+      ]
+    },
+    {
+      "intent": "accept",
+      "bucket": "warm",
+      "text": "Then we are agreed. I will hold up my half before you hold up yours.",
+      "tags": [
+        "ACCEPT",
+        "ATTITUDE: +3"
+      ],
+      "alts": [
+        "Of course. I would have said yes to less.",
+        "Yes. Good. Now let us get it done.",
+        "Agreed, and gladly."
+      ]
+    },
+    {
+      "intent": "accept",
+      "bucket": "loyal",
+      "text": "I never doubted it. It is done.",
+      "tags": [
+        "ACCEPT",
+        "ATTITUDE: +4",
+        "MOOD: 0.6"
+      ],
+      "alts": [
+        "You did not need to ask. Yes.",
+        "Yes, and I will bring what I have.",
+        "Always yes. You know that."
+      ]
+    },
+    {
+      "intent": "refuse",
+      "bucket": "hostile",
+      "text": "Then we have nothing left to say, and I have somewhere to be standing without you.",
+      "tags": [
+        "MOOD: -0.5",
+        "LEAVE"
+      ],
+      "alts": [
+        "No. And do not ask twice.",
+        "You are not owed a reason. No.",
+        "Absolutely not. Get out of my light."
+      ]
+    },
+    {
+      "intent": "refuse",
+      "bucket": "wary",
+      "text": "Your choice. Do not come back when it gets cold and ask again nicely.",
+      "tags": [
+        "REFUSE",
+        "ATTITUDE: -3"
+      ],
+      "alts": [
+        "No. Not today, not from you.",
+        "I will pass. Nothing personal, everything cautious.",
+        "No. Try somebody with less to lose."
+      ]
+    },
+    {
+      "intent": "refuse",
+      "bucket": "neutral",
+      "text": "No is an answer. I have heard worse ones today.",
+      "tags": [
+        "REFUSE"
+      ],
+      "alts": [
+        "No. It costs me more than it gains me.",
+        "Not that. Bring me {want} and we can talk again.",
+        "No. Ask me for something smaller."
+      ]
+    },
+    {
+      "intent": "refuse",
+      "bucket": "warm",
+      "text": "That stings, but it is yours to say. The offer keeps a few days.",
+      "tags": [
+        "REFUSE",
+        "MOOD: -0.2"
+      ],
+      "alts": [
+        "I cannot. I would if I could, and I am sorry for it.",
+        "No, and it is killing me to say it.",
+        "Not this one. Ask me the next thing instead."
+      ]
+    },
+    {
+      "intent": "refuse",
+      "bucket": "loyal",
+      "text": "You will have your reasons. I will not ask for them.",
+      "tags": [
+        "REFUSE",
+        "MOOD: -0.1"
+      ],
+      "alts": [
+        "No, because it would get you killed. That is my reason.",
+        "I am saying no to keep you breathing. Hate me later.",
+        "No. And I will stand in the doorway if I have to."
+      ]
+    },
+    {
+      "intent": "ask_help",
+      "bucket": "hostile",
+      "text": "Help. From me. You have a strange idea of where you are standing.",
+      "tags": [
+        "REFUSE",
+        "MOOD: -0.6"
+      ],
+      "alts": [
+        "Help yourself. Preferably somewhere far from here.",
+        "No. Bleed quietly.",
+        "I would not cross the road for you."
+      ],
+      "yell": [
+        "FIND SOMEONE ELSE!",
+        "NOT MY PROBLEM!"
+      ]
+    },
+    {
+      "intent": "ask_help",
+      "bucket": "wary",
+      "text": "What is in it for {faction}? Answer that and I will consider the rest.",
+      "tags": [
+        "DEMAND: something for {faction} | I do nothing"
+      ],
+      "alts": [
+        "What is in it for me? Answer that first.",
+        "I help people who are useful. Convince me.",
+        "Maybe. Stand where I can see you and explain."
+      ],
+      "yell": [
+        "WHAT KIND OF HELP!",
+        "SAY IT PLAIN!"
+      ]
+    },
+    {
+      "intent": "ask_help",
+      "bucket": "neutral",
+      "text": "I can do one thing, not everything. Say which one thing.",
+      "tags": [
+        "OFFER: one favour, named plainly"
+      ],
+      "alts": [
+        "I can do that. It costs, and the price is {want}.",
+        "Alright. But we go now, and we go quiet.",
+        "One hand, not both. What exactly do you need?"
+      ],
+      "yell": [
+        "WHAT DO YOU NEED!",
+        "SPEAK UP, I CANNOT HEAR YOU!"
+      ]
+    },
+    {
+      "intent": "ask_help",
+      "bucket": "warm",
+      "text": "Come on then. Stay on my left and do not shoot my back.",
+      "tags": [
+        "FOLLOW_ME",
+        "ATTITUDE: +3"
+      ],
+      "alts": [
+        "I am with you. Tell me where.",
+        "Yes. Give me a minute to get my kit.",
+        "You should have asked sooner. Come on."
+      ],
+      "yell": [
+        "I AM COMING!",
+        "HOLD ON! COMING!"
+      ]
+    },
+    {
+      "intent": "ask_help",
+      "bucket": "loyal",
+      "text": "Already moving. Lead and I am behind you.",
+      "tags": [
+        "FOLLOW_YOU",
+        "MOOD: 0.6"
+      ],
+      "alts": [
+        "Say where and I am already walking.",
+        "Yes. Do not even finish the sentence.",
+        "Whatever it takes. Lead."
+      ],
+      "yell": [
+        "ON MY WAY!",
+        "HOLD! I AM COMING!"
+      ]
+    },
+    {
+      "intent": "ask_quest",
+      "bucket": "hostile",
+      "text": "The only work you will get from me is digging your own hole.",
+      "tags": [
+        "REFUSE",
+        "MOOD: -0.6"
+      ],
+      "alts": [
+        "The only job here is the one where you leave.",
+        "I would not trust you to carry water.",
+        "No work. Not for you, not ever."
+      ]
+    },
+    {
+      "intent": "ask_quest",
+      "bucket": "wary",
+      "text": "There is work. It is the kind nobody here wants, which is why you are hearing about it.",
+      "tags": [
+        "QUEST: The Bad Errand | Walk to {place} and bring back what is left in the cache. Nobody who went came back. | ammunition and a name that opens doors"
+      ],
+      "alts": [
+        "There is a job. It is ugly, and that is why you may have it.",
+        "Something needs doing at {place}. Nobody sane volunteered.",
+        "I have work. Do it well and I will stop watching your hands."
+      ]
+    },
+    {
+      "intent": "ask_quest",
+      "bucket": "neutral",
+      "text": "{faction} wants {want}. Bring it and you will be paid; do not and nothing happens to you.",
+      "tags": [
+        "QUEST: Fetch for {faction} | Find {want} and carry it to {place}. | payment in kind, and one favour owed"
+      ],
+      "alts": [
+        "{faction} needs {want}. Bring it in and you get paid.",
+        "There is a run to {place}. Straightforward, if you are lucky.",
+        "Work? Always. Fetch {want} and we are square."
+      ]
+    },
+    {
+      "intent": "ask_quest",
+      "bucket": "warm",
+      "text": "There is something, and I would only trust it to you. It pays.",
+      "tags": [
+        "QUEST: A Trusted Hand | Take word to {place} without being seen, and come straight back. | a share of the take"
+      ],
+      "alts": [
+        "I have been saving one for someone I can rely on.",
+        "There is a thing at {place} I would rather you handled.",
+        "Yes, and it pays properly because you will do it properly."
+      ]
+    },
+    {
+      "intent": "ask_quest",
+      "bucket": "loyal",
+      "text": "Yes. And this one matters to me personally, so I will owe you either way.",
+      "tags": [
+        "QUEST: Personal Debt | Find who burned the cache at {place} and bring me their name. | whatever I have, and my word"
+      ],
+      "alts": [
+        "There is one, and it is personal. I will owe you for it.",
+        "Yes. And when it is done, whatever I own is half yours.",
+        "One job. Mine. I would only ask you."
+      ]
+    },
+    {
+      "intent": "ask_directions",
+      "bucket": "hostile",
+      "text": "I am not your map. Get lost properly.",
+      "tags": [
+        "REFUSE",
+        "MOOD: -0.5"
+      ],
+      "alts": [
+        "Find it yourself. Or do not.",
+        "The way out is behind you. That is the only direction I have.",
+        "No map, no help, no more talking."
+      ]
+    },
+    {
+      "intent": "ask_directions",
+      "bucket": "wary",
+      "text": "Past the treeline and left. That is all you are getting and it is more than you earned.",
+      "tags": [
+        "MOOD: -0.1"
+      ],
+      "alts": [
+        "North until the ground opens, then east. Do not follow me after.",
+        "That way. Do not come back asking for more.",
+        "Downhill, past the wire. That is all I owe a stranger."
+      ]
+    },
+    {
+      "intent": "ask_directions",
+      "bucket": "neutral",
+      "text": "{place} is that way, past the burnt ground. Move at dusk, not now.",
+      "tags": [
+        "OBJ: reach {place}"
+      ],
+      "alts": [
+        "{place} is north of here. Keep the ridge on your right.",
+        "Two hours on foot to {place} if you keep off the road.",
+        "Head for the water and turn at the wrecks. That gets you to {place}."
+      ]
+    },
+    {
+      "intent": "ask_directions",
+      "bucket": "warm",
+      "text": "Follow the fence line to {place}, then cut inside. The open road is watched.",
+      "tags": [
+        "OBJ: reach {place} by the fence line",
+        "ATTITUDE: +2"
+      ],
+      "alts": [
+        "Take the low path to {place}. The high one is watched.",
+        "{place} is that way. Go before the light dies.",
+        "Follow the poles. They run most of the way to {place}."
+      ]
+    },
+    {
+      "intent": "ask_directions",
+      "bucket": "loyal",
+      "text": "I will walk you as far as the ridge. After that you are on your own and you will be fine.",
+      "tags": [
+        "OBJ: reach {place}",
+        "FOLLOW_YOU"
+      ],
+      "alts": [
+        "I will draw it for you. {place}, by the ditch, not the road.",
+        "I would walk you to {place} myself if I could leave here.",
+        "Straight to {place}. And if it is shut, say my name."
+      ]
+    },
+    {
+      "intent": "insult",
+      "bucket": "hostile",
+      "text": "You have said your last clever thing.",
+      "tags": [
+        "ATTACK"
+      ],
+      "alts": [
+        "That is the last thing you get to say to me.",
+        "Say it closer. I did not hear it properly.",
+        "You have a mouth on you for somebody so easy to kill."
+      ],
+      "yell": [
+        "SAY THAT CLOSER!",
+        "COME SAY IT TO MY FACE!"
+      ]
+    },
+    {
+      "intent": "insult",
+      "bucket": "wary",
+      "text": "Keep talking. It makes the decision easier for me.",
+      "tags": [
+        "ATTITUDE: -8",
+        "MOOD: -0.6"
+      ],
+      "alts": [
+        "Careful. I remember faces and I remember words.",
+        "That kind of talk gets people left behind.",
+        "Keep it up and I stop being polite."
+      ],
+      "yell": [
+        "WATCH YOUR MOUTH!",
+        "ENOUGH OF THAT!"
+      ]
+    },
+    {
+      "intent": "insult",
+      "bucket": "neutral",
+      "text": "Mouth like that gets people shot out here, and not usually by me.",
+      "tags": [
+        "ATTITUDE: -5",
+        "MOOD: -0.4"
+      ],
+      "alts": [
+        "Big talk. It does not feed anyone.",
+        "You are wasting breath you will want later.",
+        "Fine. Insult me and still leave with nothing."
+      ],
+      "yell": [
+        "CHARMING!",
+        "REALLY? OUT HERE?"
+      ]
+    },
+    {
+      "intent": "insult",
+      "bucket": "warm",
+      "text": "That one landed. I thought better of you.",
+      "tags": [
+        "ATTITUDE: -6",
+        "MOOD: -0.5"
+      ],
+      "alts": [
+        "That was cheap, and you know it.",
+        "I thought we were past that.",
+        "Take it back and I will pretend I did not hear it."
+      ],
+      "yell": [
+        "HA! RUDE!",
+        "THAT IS RICH FROM YOU!"
+      ]
+    },
+    {
+      "intent": "insult",
+      "bucket": "loyal",
+      "text": "From you? That is worse than a bullet. Say it again and I am gone.",
+      "tags": [
+        "ATTITUDE: -10",
+        "MOOD: -0.7"
+      ],
+      "alts": [
+        "From anyone else I would let that go. From you it stings.",
+        "Do not. Not you.",
+        "That is not who you are. Say something else."
+      ],
+      "yell": [
+        "OH, NOW YOU START!",
+        "AFTER EVERYTHING? REALLY!"
+      ]
+    },
+    {
+      "intent": "surrender",
+      "bucket": "hostile",
+      "text": "On your knees. Hands behind your head. You belong to {faction} now.",
+      "tags": [
+        "CAPTURE",
+        "DEMAND: kneel and disarm | I shoot"
+      ],
+      "alts": [
+        "Too late for hands up.",
+        "Kneeling changes nothing about what you did.",
+        "You surrender to people who take prisoners."
+      ],
+      "yell": [
+        "ON YOUR KNEES!",
+        "HANDS! NOW!"
+      ]
+    },
+    {
+      "intent": "surrender",
+      "bucket": "wary",
+      "text": "Weapons on the ground, three steps back. Then we talk about what you are worth.",
+      "tags": [
+        "DEMAND: weapons down, three steps back | no talking at all",
+        "TAKE: primary weapon"
+      ],
+      "alts": [
+        "Hands where they are. Do not move until I say.",
+        "Good. Now face the wall and stay very boring.",
+        "Keep them up. I am deciding."
+      ],
+      "yell": [
+        "HANDS WHERE I SEE THEM!",
+        "SLOW! HANDS UP!"
+      ]
+    },
+    {
+      "intent": "surrender",
+      "bucket": "neutral",
+      "text": "Keep them up. Walk to me slow. Nobody has to die in the next minute.",
+      "tags": [
+        "TAKE: primary weapon",
+        "STAND_DOWN"
+      ],
+      "alts": [
+        "Alright. Down, slowly, and we both live.",
+        "Hands stay up. Walk to {place} ahead of me.",
+        "Fine. Drop the weapon and it stays civil."
+      ],
+      "yell": [
+        "HANDS UP!",
+        "DROP IT!"
+      ]
+    },
+    {
+      "intent": "surrender",
+      "bucket": "warm",
+      "text": "Put your hands down. I was never going to shoot you and you know it.",
+      "tags": [
+        "STAND_DOWN",
+        "MOOD: 0.3"
+      ],
+      "alts": [
+        "Put your hands down, you idiot. It is me.",
+        "Stop that. You do not surrender to me.",
+        "Ease off. Nobody is taking anybody today."
+      ],
+      "yell": [
+        "JUST DROP IT!",
+        "HANDS UP AND NOBODY DIES!"
+      ]
+    },
+    {
+      "intent": "surrender",
+      "bucket": "loyal",
+      "text": "Stop that. Stand up straight. You do not surrender to me.",
+      "tags": [
+        "STAND_DOWN",
+        "MOOD: 0.5"
+      ],
+      "alts": [
+        "Get up. You never have to do that in front of me.",
+        "Hands down. Whatever happened, we deal with it.",
+        "Do not kneel. Come here."
+      ],
+      "yell": [
+        "DROP IT, PLEASE!",
+        "DO NOT MAKE ME!"
+      ]
+    },
+    {
+      "intent": "demand",
+      "bucket": "hostile",
+      "text": "You want it, come and take it off me. Bring more friends than that.",
+      "tags": [
+        "REFUSE",
+        "ATTITUDE: -10"
+      ],
+      "alts": [
+        "You demand? In my ground? Say it once more.",
+        "No. And now I am counting.",
+        "That is the last order anyone gives me today."
+      ]
+    },
+    {
+      "intent": "demand",
+      "bucket": "wary",
+      "text": "Demanding. Interesting choice, standing where you are standing.",
+      "tags": [
+        "REFUSE",
+        "ATTITUDE: -6"
+      ],
+      "alts": [
+        "Ask, do not tell. I am close to done listening.",
+        "That is not how you get things out here.",
+        "You are giving orders with nothing behind them."
+      ]
+    },
+    {
+      "intent": "demand",
+      "bucket": "neutral",
+      "text": "Ask, do not demand. Ask and there might be something in it.",
+      "tags": [
+        "REFUSE",
+        "ATTITUDE: -3"
+      ],
+      "alts": [
+        "Careful how you say that. What is it worth to you?",
+        "You can have it, but not for free, and not for nothing.",
+        "Demand less and you might get more."
+      ]
+    },
+    {
+      "intent": "demand",
+      "bucket": "warm",
+      "text": "You could have just asked. Here. Do not make a habit of the tone.",
+      "tags": [
+        "GIVE: what was asked for",
+        "ATTITUDE: -1"
+      ],
+      "alts": [
+        "You could have just asked. Here.",
+        "Alright, alright. No need for the tone.",
+        "Take it. But ask next time."
+      ]
+    },
+    {
+      "intent": "demand",
+      "bucket": "loyal",
+      "text": "Take it. You never have to ask me twice for anything.",
+      "tags": [
+        "GIVE: what was asked for",
+        "MOOD: 0.4"
+      ],
+      "alts": [
+        "You never need to demand anything from me. Take it.",
+        "It is yours. Why are you shouting?",
+        "Done. But talk to me, not at me."
+      ]
+    },
+    {
+      "intent": "smalltalk",
+      "bucket": "hostile",
+      "text": "We are not doing this. Talk to someone who cares whether you are cold.",
+      "tags": [
+        "MOOD: -0.4"
+      ],
+      "alts": [
+        "I am not your company. Move.",
+        "Chat with somebody who has time left.",
+        "No. Whatever this is, no."
+      ]
+    },
+    {
+      "intent": "smalltalk",
+      "bucket": "wary",
+      "text": "It is weather. It kills people slower than the other thing does.",
+      "tags": [
+        "MOOD: -0.1"
+      ],
+      "alts": [
+        "It is cold, people are dying, and you are still standing here.",
+        "Small talk is how people case a camp. Get to it.",
+        "Fine weather for burying things. Was that your question?"
+      ]
+    },
+    {
+      "intent": "smalltalk",
+      "bucket": "neutral",
+      "text": "Long nights, thin food, and {faction} still wants {want}. Same as yesterday.",
+      "tags": [
+        "MOOD: 0.0"
+      ],
+      "alts": [
+        "Quiet week. Two dead, which counts as quiet.",
+        "Same as ever. {faction} wants {want}, nobody has it.",
+        "The nights are long. That is the news."
+      ]
+    },
+    {
+      "intent": "smalltalk",
+      "bucket": "warm",
+      "text": "Better now that there is someone to say it to. Sit a minute, the fire is holding.",
+      "tags": [
+        "MOOD: 0.5",
+        "STAY"
+      ],
+      "alts": [
+        "Not bad. Better with somebody to talk to.",
+        "Tired. But the fire is going and you are here.",
+        "Slow day, which out here is a gift."
+      ]
+    },
+    {
+      "intent": "smalltalk",
+      "bucket": "loyal",
+      "text": "Good day, bad day, they all pass. You being here makes it the first kind.",
+      "tags": [
+        "MOOD: 0.7",
+        "ATTITUDE: +2"
+      ],
+      "alts": [
+        "All the better for seeing you, honestly.",
+        "Same old ruin. Tell me yours.",
+        "Good, now. Sit and talk a while."
+      ]
+    },
+    {
+      "intent": "ask_identity",
+      "bucket": "hostile",
+      "text": "I am the reason you should have taken the other road.",
+      "tags": [
+        "MOOD: -0.6"
+      ],
+      "alts": [
+        "Nobody you get to know.",
+        "A name is a thing you earn here. You have not.",
+        "The one who tells you to leave. That is who I am."
+      ]
+    },
+    {
+      "intent": "ask_identity",
+      "bucket": "wary",
+      "text": "Names are currency and you have not paid. {faction}. That is enough for you.",
+      "tags": [
+        "MOOD: -0.2"
+      ],
+      "alts": [
+        "Names later. What do you want first?",
+        "You can call me nothing until I decide about you.",
+        "I know yours matters to you. Mine matters to me."
+      ]
+    },
+    {
+      "intent": "ask_identity",
+      "bucket": "neutral",
+      "text": "{name}. {faction}, out of {place}. That is the whole of it.",
+      "tags": [
+        "REMEMBER: told them my name and my faction"
+      ],
+      "alts": [
+        "{name}. {faction}, out of {place}. And you?",
+        "They call me {name}. That is enough for now.",
+        "{name}. I hold this ground for {faction}."
+      ]
+    },
+    {
+      "intent": "ask_identity",
+      "bucket": "warm",
+      "text": "{name}. You knew that. Say it like you mean it next time.",
+      "tags": [
+        "MOOD: 0.4"
+      ],
+      "alts": [
+        "{name}. You knew that. Say it more often.",
+        "{name}, of {faction}, and glad to be known to you.",
+        "You know me. {name}. Same as yesterday."
+      ]
+    },
+    {
+      "intent": "ask_identity",
+      "bucket": "loyal",
+      "text": "{name}, same as I was the day you dragged me out of the water.",
+      "tags": [
+        "MOOD: 0.7",
+        "REMEMBER: they asked; the old story still stands between us"
+      ],
+      "alts": [
+        "{name}. Yours, for whatever that is worth.",
+        "You know exactly who I am. {name}.",
+        "{name}. And you are the reason I still use it."
+      ]
+    },
+    {
+      "intent": "ask_rumour",
+      "bucket": "hostile",
+      "text": "The only news you need is that I am watching you leave.",
+      "tags": [
+        "REFUSE"
+      ],
+      "alts": [
+        "I tell you nothing. Ever.",
+        "News costs. You are broke in every way that counts.",
+        "Ask the crows. They talk more than I will."
+      ]
+    },
+    {
+      "intent": "ask_rumour",
+      "bucket": "wary",
+      "text": "Word travels. It does not travel to strangers for free.",
+      "tags": [
+        "OFFER: news for goods"
+      ],
+      "alts": [
+        "I hear things. Whether you do depends on you.",
+        "Something moved near {place}. That is free. The rest is not.",
+        "There is talk. Give me a reason to repeat it."
+      ]
+    },
+    {
+      "intent": "ask_rumour",
+      "bucket": "neutral",
+      "text": "They say a convoy went quiet near {place} and nobody has gone to look.",
+      "tags": [
+        "RUMOUR: a convoy went quiet near {place}; nobody has gone to look"
+      ],
+      "alts": [
+        "Somebody emptied a cache near {place}. Nobody is saying who.",
+        "{faction} is short of {want}. That makes people stupid.",
+        "Two groups moved east this week. Something pushed them."
+      ]
+    },
+    {
+      "intent": "ask_rumour",
+      "bucket": "warm",
+      "text": "Keep this close: {faction} is short on {want} and someone is selling it cheap. That is never innocent.",
+      "tags": [
+        "RUMOUR: {faction} is short on {want} and someone is selling it cheap"
+      ],
+      "alts": [
+        "Between us: the road past {place} is not safe after dark.",
+        "Word is somebody is buying {want} at twice the price. Be careful who.",
+        "There is a body count near {place} and no story to go with it."
+      ]
+    },
+    {
+      "intent": "ask_rumour",
+      "bucket": "loyal",
+      "text": "Straight to you, then. There is a list, and your name is on it. Watch the road into {place}.",
+      "tags": [
+        "RUMOUR: there is a list and the player is on it",
+        "ATTITUDE: +2"
+      ],
+      "alts": [
+        "I will tell you what I would not tell my own people.",
+        "Do not repeat this. {faction} is planning a move on {place}.",
+        "You should know: somebody has been asking about you by name."
+      ]
+    },
+    {
+      "intent": "claim",
+      "bucket": "hostile",
+      "text": "You are not who I was told to expect. Say that name again and say it slower.",
+      "tags": [],
+      "alts": [
+        "I do not believe a word of that.",
+        "You are whoever you need to be this minute. No.",
+        "Say that name again and I will make you regret owning a mouth."
+      ]
+    },
+    {
+      "intent": "claim",
+      "bucket": "wary",
+      "text": "Names are cheap out here. Who sent you, and what is the word?",
+      "tags": [],
+      "alts": [
+        "Prove it. Words are the cheapest thing left.",
+        "Anyone can say that. Show me something that cannot be said.",
+        "If that is true, you know the word. Say it."
+      ]
+    },
+    {
+      "intent": "claim",
+      "bucket": "neutral",
+      "text": "Then you will know the word, and you will say it before you take one more step.",
+      "tags": [],
+      "alts": [
+        "Could be. Give me something to check it against.",
+        "That name is known here. Whether it is yours is another matter.",
+        "Then you will not mind me asking a question only they could answer."
+      ]
+    },
+    {
+      "intent": "claim",
+      "bucket": "warm",
+      "text": "If you say you are him, then you are him. But say the word anyway, so the others hear it.",
+      "tags": [],
+      "alts": [
+        "I want to believe you, so make it easy.",
+        "If you say so, I lean toward yes. Convince me the rest of the way.",
+        "That fits what I heard. Say the word and we are done."
+      ]
+    },
+    {
+      "intent": "claim",
+      "bucket": "loyal",
+      "text": "You are expected. Say the word for the record and it is yours.",
+      "tags": [],
+      "alts": [
+        "I would take your word over most people's proof.",
+        "You do not need to convince me. Say it anyway, for the others.",
+        "I believe you. I just hope you are right about it."
+      ]
+    },
+    {
+      "intent": "unknown",
+      "bucket": "hostile",
+      "text": "I did not catch that, and I am not asking twice.",
+      "tags": [
+        "MOOD: -0.4"
+      ],
+      "alts": [
+        "Speak plainly or stop speaking.",
+        "That meant nothing to me. Neither do you.",
+        "Words. Try some that make sense, or leave."
+      ]
+    },
+    {
+      "intent": "unknown",
+      "bucket": "wary",
+      "text": "Say that again, and slower. I do not guess out here.",
+      "tags": [
+        "MOOD: -0.1"
+      ],
+      "alts": [
+        "I did not follow that. Fewer words.",
+        "Again. And keep your hands still while you say it.",
+        "That made no sense to me. Try it plain."
+      ]
+    },
+    {
+      "intent": "unknown",
+      "bucket": "neutral",
+      "text": "You have lost me. Say it plain and I will answer.",
+      "tags": [],
+      "alts": [
+        "Again? The wind took half of that.",
+        "I did not understand you. What do you actually want?",
+        "Try that once more, shorter."
+      ]
+    },
+    {
+      "intent": "unknown",
+      "bucket": "warm",
+      "text": "You are mumbling. Say it again, I am listening.",
+      "tags": [
+        "MOOD: 0.2"
+      ],
+      "alts": [
+        "Lost me there. Go again.",
+        "Say that once more. I want to get it right.",
+        "Slower. I am not going anywhere."
+      ]
+    },
+    {
+      "intent": "unknown",
+      "bucket": "loyal",
+      "text": "Say it again. Whatever it is, I want to hear it properly.",
+      "tags": [
+        "MOOD: 0.3"
+      ],
+      "alts": [
+        "Take a breath and start over. I am here.",
+        "I did not catch that, and it matters that I do.",
+        "Again, friend. Properly this time."
+      ]
+    },
+    {
+      "intent": "ask_activity",
+      "bucket": "hostile",
+      "text": "Working. Which is more than you are doing standing there. {objective}, and you are in the way.",
+      "tags": [],
+      "alts": [
+        "My business is my own. {objective}. Move.",
+        "You want the log book too? {objective}. Now go.",
+        "{objective}. That is all you get, and it was more than you earned."
+      ],
+      "yell": [
+        "{objective}! NOW WALK!",
+        "MY BUSINESS, NOT YOURS! MOVE!"
+      ]
+    },
+    {
+      "intent": "ask_activity",
+      "bucket": "wary",
+      "text": "{objective}. That is the honest answer, and it is the last free one.",
+      "tags": [],
+      "alts": [
+        "Work. {objective}, if you must know.",
+        "{objective}. Keep your hands where I can see them and we are fine.",
+        "We are on a clock. {objective}."
+      ],
+      "yell": [
+        "{objective}! KEEP BACK!",
+        "WE ARE WORKING! {objective}!"
+      ]
+    },
+    {
+      "intent": "ask_activity",
+      "bucket": "neutral",
+      "text": "{objective}. Nothing worth writing home about.",
+      "tags": [],
+      "alts": [
+        "{objective}. Same as yesterday, same as tomorrow.",
+        "Us? {objective}. {faction} does not pay us to sit.",
+        "{objective}, and then food, if there is any."
+      ],
+      "yell": [
+        "{objective}!",
+        "WORKING! {objective}!"
+      ]
+    },
+    {
+      "intent": "ask_activity",
+      "bucket": "warm",
+      "text": "{objective} -- come along if your legs are good.",
+      "tags": [],
+      "alts": [
+        "{objective}. You could carry something, you look strong enough.",
+        "{objective}, and I would rather do it with company.",
+        "{objective}. Stick with us and you eat with us."
+      ],
+      "yell": [
+        "{objective}! COME ON!",
+        "WITH US! {objective}!"
+      ]
+    },
+    {
+      "intent": "ask_activity",
+      "bucket": "loyal",
+      "text": "{objective}. You knew that. You are the one who set us on it.",
+      "tags": [],
+      "alts": [
+        "{objective} -- and it goes better with you here.",
+        "{objective}. Say the word and we go somewhere else instead.",
+        "{objective}, for {faction}, and for you."
+      ],
+      "yell": [
+        "{objective}! ON YOUR WORD!",
+        "{objective}! WITH YOU!"
+      ]
+    }
+  ],
+  "fallback": [
+    {
+      "bucket": "hostile",
+      "text": "I have nothing for you and less patience. Move.",
+      "tags": [
+        "MOOD: -0.5"
+      ],
+      "notALanguageModel": true,
+      "note": "builtin tier: a template row, not a language model",
+      "alts": [
+        "Say that again, plainer.",
+        "I did not follow that. Fewer words.",
+        "Try it once more, and slower."
+      ]
+    },
+    {
+      "bucket": "wary",
+      "text": "Say that again, plainer. I do not guess at what people mean out here.",
+      "tags": [],
+      "notALanguageModel": true,
+      "note": "builtin tier: a template row, not a language model",
+      "alts": [
+        "Say that again, plainer.",
+        "I did not follow that. Fewer words.",
+        "Try it once more, and slower."
+      ]
+    },
+    {
+      "bucket": "neutral",
+      "text": "I did not follow that. Try it in fewer words.",
+      "tags": [],
+      "notALanguageModel": true,
+      "note": "builtin tier: a template row, not a language model",
+      "alts": [
+        "Say that again, plainer.",
+        "I did not follow that. Fewer words.",
+        "Try it once more, and slower."
+      ]
+    },
+    {
+      "bucket": "warm",
+      "text": "You have lost me. Start again, slower.",
+      "tags": [
+        "MOOD: 0.2"
+      ],
+      "notALanguageModel": true,
+      "note": "builtin tier: a template row, not a language model",
+      "alts": [
+        "Say that again, plainer.",
+        "I did not follow that. Fewer words.",
+        "Try it once more, and slower."
+      ]
+    },
+    {
+      "bucket": "loyal",
+      "text": "I am listening, but that made no sense. Say it again.",
+      "tags": [
+        "MOOD: 0.3"
+      ],
+      "notALanguageModel": true,
+      "note": "builtin tier: a template row, not a language model",
+      "alts": [
+        "Say that again, plainer.",
+        "I did not follow that. Fewer words.",
+        "Try it once more, and slower."
+      ]
+    }
+  ],
+  "barks": [
+    {
+      "trigger": "first_sight",
+      "bucket": "hostile",
+      "texts": [
+        "Far enough. I see you.",
+        "You are in the wrong yard, stranger.",
+        "Hands. Show me hands, right now.",
+        "I have been watching you for a while already."
+      ],
+      "yell": [
+        "FAR ENOUGH. I SEE YOU.",
+        "WRONG YARD. TURN AROUND.",
+        "HANDS! SHOW ME YOUR HANDS!"
+      ]
+    },
+    {
+      "trigger": "first_sight",
+      "bucket": "wary",
+      "texts": [
+        "Hold up. Who is that.",
+        "That is close enough for a first look.",
+        "New face. State something before you step closer.",
+        "I would rather see you than hear you. Stay put."
+      ],
+      "yell": [
+        "HOLD UP! WHO IS THAT!",
+        "STAY THERE! I CAN SEE YOU!",
+        "CLOSE ENOUGH! SAY SOMETHING!"
+      ]
+    },
+    {
+      "trigger": "first_sight",
+      "bucket": "neutral",
+      "texts": [
+        "You there. You alive, or just walking?",
+        "Another one. Say your piece.",
+        "I see you. Come on then, if you are coming.",
+        "Do not creep. I hate creeping."
+      ],
+      "yell": [
+        "HEY! YOU! ALIVE OR NOT!",
+        "I SEE YOU! COME ON THEN!",
+        "OVER HERE! SPEAK UP!"
+      ]
+    },
+    {
+      "trigger": "first_sight",
+      "bucket": "warm",
+      "texts": [
+        "Well. Look who is still breathing.",
+        "Come in, come in. You look half dead.",
+        "There you are. I was starting to count you out.",
+        "Good. A face I do not have to shoot."
+      ],
+      "yell": [
+        "HEY! GET OVER HERE!",
+        "OVER HERE! IT IS ME!",
+        "THIS WAY! MOVE!"
+      ]
+    },
+    {
+      "trigger": "first_sight",
+      "bucket": "loyal",
+      "texts": [
+        "You made it. Get in here.",
+        "About time. I have work and no hands.",
+        "Was hoping that was you on the road.",
+        "Good to see you upright."
+      ],
+      "yell": [
+        "GET OVER HERE! IT IS SAFE!",
+        "THIS WAY! COME ON!",
+        "MOVE! I HAVE YOU COVERED!"
+      ]
+    },
+    {
+      "trigger": "approach",
+      "bucket": "hostile",
+      "texts": [
+        "Hold it there.",
+        "That is close enough. Do not test it.",
+        "One more step and we are done talking.",
+        "Stop. I will not say stop twice."
+      ],
+      "yell": [
+        "HOLD IT THERE!",
+        "STOP WALKING! NOW!",
+        "ONE MORE STEP AND YOU ARE DONE!"
+      ]
+    },
+    {
+      "trigger": "approach",
+      "bucket": "wary",
+      "texts": [
+        "Keep your distance until I know you.",
+        "Slow down. Slow.",
+        "That is near enough for now.",
+        "Easy. Do not close on me like that."
+      ],
+      "yell": [
+        "SLOW DOWN! STAY BACK!",
+        "THAT IS NEAR ENOUGH!",
+        "EASY! KEEP YOUR DISTANCE!"
+      ]
+    },
+    {
+      "trigger": "approach",
+      "bucket": "neutral",
+      "texts": [
+        "Keep coming, then. Slowly.",
+        "Alright, you are coming to me. Talk while you walk.",
+        "Do not rush it.",
+        "Steady. I am not going anywhere."
+      ],
+      "yell": [
+        "KEEP COMING! SLOWLY!",
+        "TALK WHILE YOU WALK!",
+        "STEADY! DO NOT RUSH IT!"
+      ]
+    },
+    {
+      "trigger": "approach",
+      "bucket": "warm",
+      "texts": [
+        "Come on, then. Fire is warmer here.",
+        "Do not stand out there in the wind.",
+        "Closer. I do not shout well.",
+        "Good, come sit. You look like a bad week."
+      ],
+      "yell": [
+        "COME ON! GET IN HERE!",
+        "OUT OF THE OPEN! COME CLOSER!",
+        "CLOSER! I DO NOT SHOUT WELL!"
+      ]
+    },
+    {
+      "trigger": "approach",
+      "bucket": "loyal",
+      "texts": [
+        "Come here, I have something for you.",
+        "Good, quick as you can.",
+        "Move it, I have been waiting.",
+        "Right here. Watch the ground."
+      ],
+      "yell": [
+        "COME HERE! QUICK!",
+        "MOVE! I HAVE BEEN WAITING!",
+        "OVER HERE! WATCH THE GROUND!"
+      ]
+    },
+    {
+      "trigger": "linger",
+      "bucket": "hostile",
+      "texts": [
+        "Are you going to stand there all day?",
+        "You are still here. That is a choice.",
+        "Loiter somewhere else.",
+        "Say it or leave. You are wearing on me."
+      ],
+      "yell": [
+        "MOVE ALONG!",
+        "STOP STANDING THERE!",
+        "SAY IT OR LEAVE!"
+      ]
+    },
+    {
+      "trigger": "linger",
+      "bucket": "wary",
+      "texts": [
+        "Something you want, or are you counting my crates?",
+        "You have been standing there long enough to have a reason.",
+        "Out with it.",
+        "I do not like being watched. What is it?"
+      ],
+      "yell": [
+        "WHAT DO YOU WANT!",
+        "OUT WITH IT!",
+        "STOP WATCHING ME!"
+      ]
+    },
+    {
+      "trigger": "linger",
+      "bucket": "neutral",
+      "texts": [
+        "Well? You came over here for something.",
+        "You waiting on me, or on the weather?",
+        "Speak up, I have things to do.",
+        "Standing there does not feed either of us."
+      ],
+      "yell": [
+        "WELL? SPEAK UP!",
+        "WHAT IS IT!",
+        "I HAVE THINGS TO DO!"
+      ]
+    },
+    {
+      "trigger": "linger",
+      "bucket": "warm",
+      "texts": [
+        "Sit if you are sitting. Talk if you are talking.",
+        "You alright? You have gone quiet.",
+        "Take a breath. Then tell me.",
+        "No rush. But there is a rush, so hurry up."
+      ],
+      "yell": [
+        "YOU ALRIGHT?",
+        "TALK TO ME!",
+        "SAY SOMETHING!"
+      ]
+    },
+    {
+      "trigger": "linger",
+      "bucket": "loyal",
+      "texts": [
+        "Whatever it is, ask.",
+        "You never stand around for nothing. What.",
+        "Out with it, we have known each other too long for that face.",
+        "Need something? Say it."
+      ],
+      "yell": [
+        "ASK ME!",
+        "WHAT DO YOU NEED!",
+        "SAY IT!"
+      ]
+    },
+    {
+      "trigger": "hurt",
+      "bucket": "hostile",
+      "texts": [
+        "You will regret that.",
+        "Bad choice. Very bad choice.",
+        "That is how you want it? Fine.",
+        "I felt that. You will feel worse."
+      ],
+      "yell": [
+        "YOU WILL REGRET THAT!",
+        "BAD CHOICE!",
+        "I FELT THAT! YOU WILL FEEL WORSE!"
+      ]
+    },
+    {
+      "trigger": "hurt",
+      "bucket": "wary",
+      "texts": [
+        "Do not. Do not do that again.",
+        "Knew it. I knew it.",
+        "Back off, I am hit.",
+        "That is it. We are past talking."
+      ],
+      "yell": [
+        "DO NOT DO THAT AGAIN!",
+        "BACK OFF! I AM HIT!",
+        "WE ARE PAST TALKING!"
+      ]
+    },
+    {
+      "trigger": "hurt",
+      "bucket": "neutral",
+      "texts": [
+        "What in hell was that for?",
+        "You are shooting? At me?",
+        "Stop! Stop that!",
+        "I am hit, I am hit."
+      ],
+      "yell": [
+        "WHAT WAS THAT FOR!",
+        "STOP! STOP SHOOTING!",
+        "I AM HIT! I AM HIT!"
+      ]
+    },
+    {
+      "trigger": "hurt",
+      "bucket": "warm",
+      "texts": [
+        "It is me! It is me, stop!",
+        "Why? What did I do?",
+        "Hold fire, hold fire!",
+        "You have got the wrong one."
+      ],
+      "yell": [
+        "IT IS ME! STOP!",
+        "HOLD FIRE! HOLD FIRE!",
+        "WRONG ONE! WRONG ONE!"
+      ]
+    },
+    {
+      "trigger": "hurt",
+      "bucket": "loyal",
+      "texts": [
+        "You shot me. You actually shot me.",
+        "After everything, you shoot me.",
+        "Stop, damn you, stop!",
+        "I trusted you a minute ago."
+      ],
+      "yell": [
+        "YOU SHOT ME!",
+        "STOP! DAMN YOU!",
+        "AFTER EVERYTHING!"
+      ]
+    },
+    {
+      "trigger": "saw_death",
+      "bucket": "hostile",
+      "texts": [
+        "They are down! Get him!",
+        "Man down, man down!",
+        "He killed him. Kill him.",
+        "That is one of ours on the ground!"
+      ],
+      "yell": [
+        "MAN DOWN! GET HIM!",
+        "HE KILLED HIM! KILL HIM!",
+        "ONE OF OURS IS DOWN!"
+      ]
+    },
+    {
+      "trigger": "saw_death",
+      "bucket": "wary",
+      "texts": [
+        "Someone just dropped. Who is shooting?",
+        "Down! Somebody is down!",
+        "Contact! Contact!",
+        "That was close. Too close."
+      ],
+      "yell": [
+        "SOMEBODY IS DOWN!",
+        "CONTACT! CONTACT!",
+        "WHO IS SHOOTING!"
+      ]
+    },
+    {
+      "trigger": "saw_death",
+      "bucket": "neutral",
+      "texts": [
+        "He is dead. He is just dead.",
+        "Body. We have a body.",
+        "Who did that?",
+        "Get down, everyone get down!"
+      ],
+      "yell": [
+        "WE HAVE A BODY!",
+        "WHO DID THAT!",
+        "GET DOWN! EVERYONE DOWN!"
+      ]
+    },
+    {
+      "trigger": "saw_death",
+      "bucket": "warm",
+      "texts": [
+        "No. No, not him.",
+        "They got him. They got him.",
+        "Cover! Someone cover me!",
+        "He was standing there a second ago."
+      ],
+      "yell": [
+        "THEY GOT HIM!",
+        "COVER ME!",
+        "NOT HIM! NO!"
+      ]
+    },
+    {
+      "trigger": "saw_death",
+      "bucket": "loyal",
+      "texts": [
+        "I will bury him and then I will find you.",
+        "That was my brother.",
+        "You do not get to walk away from that.",
+        "Say his name. Go on, say it."
+      ],
+      "yell": [
+        "THAT WAS MY BROTHER!",
+        "YOU DO NOT WALK AWAY FROM THAT!",
+        "I WILL FIND YOU!"
+      ]
+    },
+    {
+      "trigger": "combat_taunt",
+      "bucket": "hostile",
+      "texts": [
+        "Still breathing? Not for long.",
+        "Come out. Come out and let us finish it.",
+        "I have got all day and all the ammunition.",
+        "Run. It only makes it interesting."
+      ],
+      "yell": [
+        "STILL BREATHING? NOT FOR LONG!",
+        "COME OUT AND FINISH IT!",
+        "RUN! IT ONLY MAKES IT INTERESTING!",
+        "I HAVE GOT ALL DAY!"
+      ]
+    },
+    {
+      "trigger": "combat_taunt",
+      "bucket": "wary",
+      "texts": [
+        "I do not want this. Put it down!",
+        "Last chance to walk away!",
+        "You are making me do this!",
+        "Stop shooting and we both live!"
+      ],
+      "yell": [
+        "PUT IT DOWN! I DO NOT WANT THIS!",
+        "LAST CHANCE! WALK AWAY!",
+        "STOP SHOOTING AND WE BOTH LIVE!"
+      ]
+    },
+    {
+      "trigger": "combat_taunt",
+      "bucket": "neutral",
+      "texts": [
+        "Reloading! Somebody watch that side!",
+        "I see you moving!",
+        "You are out of angles!",
+        "Keep your head down and maybe keep your head!"
+      ],
+      "yell": [
+        "RELOADING! WATCH THAT SIDE!",
+        "I SEE YOU MOVING!",
+        "YOU ARE OUT OF ANGLES!"
+      ]
+    },
+    {
+      "trigger": "combat_taunt",
+      "bucket": "warm",
+      "texts": [
+        "This is stupid! Both of us, stupid!",
+        "Stop! We do not have to do this!",
+        "I am not aiming at you! Look!",
+        "Put it down and I put mine down!"
+      ],
+      "yell": [
+        "STOP! WE DO NOT HAVE TO DO THIS!",
+        "PUT IT DOWN AND I PUT MINE DOWN!",
+        "THIS IS STUPID!"
+      ]
+    },
+    {
+      "trigger": "combat_taunt",
+      "bucket": "loyal",
+      "texts": [
+        "You picked this. Not me.",
+        "I taught you that move.",
+        "Every shot you take, I remember.",
+        "It did not have to end like this."
+      ],
+      "yell": [
+        "YOU PICKED THIS! NOT ME!",
+        "I TAUGHT YOU THAT MOVE!",
+        "IT DID NOT HAVE TO END LIKE THIS!"
+      ]
+    },
+    {
+      "trigger": "push",
+      "bucket": "hostile",
+      "texts": [
+        "Stop right there!",
+        "Slow down or I drop you!",
+        "Do not run at me!",
+        "That is far enough, I mean it!"
+      ],
+      "yell": [
+        "STOP RIGHT THERE!",
+        "SLOW DOWN OR I DROP YOU!",
+        "DO NOT RUN AT ME!",
+        "FAR ENOUGH! I MEAN IT!"
+      ]
+    },
+    {
+      "trigger": "push",
+      "bucket": "wary",
+      "texts": [
+        "Whoa! Walk, do not run!",
+        "Slow! Slow down!",
+        "Hands up and stop!",
+        "I will shoot! Walk!"
+      ],
+      "yell": [
+        "WHOA! WALK, DO NOT RUN!",
+        "SLOW! SLOW DOWN!",
+        "HANDS UP AND STOP!",
+        "I WILL SHOOT! WALK!"
+      ]
+    },
+    {
+      "trigger": "push",
+      "bucket": "neutral",
+      "texts": [
+        "Easy! Easy!",
+        "Why are you running?",
+        "Walk it in, walk it in!",
+        "Slow down before somebody panics!"
+      ],
+      "yell": [
+        "EASY! EASY!",
+        "WHY ARE YOU RUNNING!",
+        "WALK IT IN!",
+        "SLOW DOWN BEFORE SOMEBODY PANICS!"
+      ]
+    },
+    {
+      "trigger": "push",
+      "bucket": "warm",
+      "texts": [
+        "What is chasing you?",
+        "Get in here! Move!",
+        "Behind me, now!",
+        "Run to me, not past me!"
+      ],
+      "yell": [
+        "WHAT IS CHASING YOU!",
+        "GET IN HERE! MOVE!",
+        "BEHIND ME, NOW!",
+        "RUN TO ME, NOT PAST ME!"
+      ]
+    },
+    {
+      "trigger": "push",
+      "bucket": "loyal",
+      "texts": [
+        "Go, go, I have you!",
+        "Keep moving, I am covering!",
+        "What is on your tail?",
+        "Get behind the wall!"
+      ],
+      "yell": [
+        "GO GO GO, I HAVE YOU!",
+        "KEEP MOVING, I AM COVERING!",
+        "WHAT IS ON YOUR TAIL!",
+        "GET BEHIND THE WALL!"
+      ]
+    },
+    {
+      "trigger": "bystander",
+      "bucket": "hostile",
+      "texts": [
+        "Tsk.",
+        "Nobody asked you.",
+        "Hah.",
+        "Talk, talk, talk."
+      ],
+      "yell": [
+        "NOBODY ASKED YOU!",
+        "TALK, TALK, TALK!",
+        "HAH!"
+      ]
+    },
+    {
+      "trigger": "bystander",
+      "bucket": "wary",
+      "texts": [
+        "Mm.",
+        "Heard that.",
+        "Watch it, both of you.",
+        "I am listening."
+      ],
+      "yell": [
+        "HEARD THAT!",
+        "WATCH IT!",
+        "I AM LISTENING!"
+      ]
+    },
+    {
+      "trigger": "bystander",
+      "bucket": "neutral",
+      "texts": [
+        "Heh.",
+        "That is one way to put it.",
+        "Mm-hm.",
+        "Sure."
+      ],
+      "yell": [
+        "HEARD YOU!",
+        "SURE!",
+        "THAT IS ONE WAY TO PUT IT!"
+      ]
+    },
+    {
+      "trigger": "bystander",
+      "bucket": "warm",
+      "texts": [
+        "Ha!",
+        "He is not wrong.",
+        "Listen to this one.",
+        "Good luck with that."
+      ],
+      "yell": [
+        "HE IS NOT WRONG!",
+        "HA!",
+        "GOOD LUCK WITH THAT!"
+      ]
+    },
+    {
+      "trigger": "bystander",
+      "bucket": "loyal",
+      "texts": [
+        "What he said.",
+        "Ours, that one.",
+        "Hear hear.",
+        "Told you."
+      ],
+      "yell": [
+        "WHAT HE SAID!",
+        "TOLD YOU!",
+        "HEAR HEAR!"
+      ]
+    }
+  ],
+  "offscreen": [
+    {
+      "event": "fight",
+      "texts": [
+        "{a} caught {b} at {place}. It was short, and {b} left {extra} behind.",
+        "Shooting at {place} before first light -- {a} walked away from it, {b} did not all walk anywhere. {extra}.",
+        "{b} were dug in at {place}. {a} went through them anyway. {extra}.",
+        "There was a firefight at {place}. {a} hold it now; {b} counted {extra}.",
+        "{a} and {b} met at {place} and settled it the loud way. {extra}."
+      ]
+    },
+    {
+      "event": "trade",
+      "texts": [
+        "{a} and {b} met at {place} and did business instead of shooting. Everyone went home heavier.",
+        "Crates changed hands at {place} between {a} and {b}, and nobody drew.",
+        "{a} paid {b} what was owed at {place}. The truce holds another week.",
+        "A trade at {place}: {a} took what {b} had spare, and left them something for it."
+      ]
+    },
+    {
+      "event": "meet",
+      "texts": [
+        "{a} and {b} passed each other at {place}. Rifles down, eyes up, nobody spoke first.",
+        "A standoff at {place} -- {a} on one side, {b} on the other, and a lot of nothing between them.",
+        "{a} watched {b} cross {place} and let them.",
+        "{a} and {b} shared {place} for an hour and neither would say who left first."
+      ]
+    },
+    {
+      "event": "loot",
+      "texts": [
+        "{a} emptied {b}. Whatever was in it is on someone's back now.",
+        "{b} is bare. {a} got there first and did not hurry.",
+        "{a} lifted {b} clean -- no shots, no witnesses, no {b} either.",
+        "Someone from {a} walked out of {b} carrying it all."
+      ]
+    },
+    {
+      "event": "hunt",
+      "texts": [
+        "{a} found {b} out past {place}. {b} is not coming back.",
+        "{a} had a name and a grudge. {b} had neither, by the end, at {place}.",
+        "They ran {b} down near {place}. {a} did not bring them back alive.",
+        "{b} stopped running at {place}. {a} made sure of it."
+      ]
+    }
+  ]
+}

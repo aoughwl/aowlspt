@@ -1,0 +1,833 @@
+{
+  "schema": "aowlspt.registry/1",
+  "registry": {
+    "id": "aowl.registry.official",
+    "name": "aowlspt official registry",
+    "description": "Every mod built in this repository, plus the lists that name them. One file with one git history, so a mod list is a document you can send someone.",
+    "revision": 17,
+    "updated": "2026-08-31"
+  },
+  "mods": [
+    {
+      "id": "aowl.manager",
+      "name": "Mod Manager",
+      "author": "aowlspt",
+      "version": "1.0.0",
+      "description": "Reads this file, resolves it against your selection, and serves the result under /aowlspt/mods so the mod list can be read and changed while the game runs. It is in the registry so that it appears on its own panel and so that nothing reports it as an unmanaged stray; it is in aowl.list.core so that no list can leave it out.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "server",
+        "sim"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/manager",
+        "url": null
+      },
+      "artifact": {
+        "dir": "manager",
+        "library": "manager.dll"
+      },
+      "upstream": null,
+      "license": "see repository",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [
+        "aowl.capability.modmanager"
+      ],
+      "loadAfter": [],
+      "tags": [
+        "core",
+        "manager"
+      ]
+    },
+    {
+      "id": "aowl.tarkov",
+      "name": "Singleplayer",
+      "author": "aowlspt",
+      "version": "0.1.0",
+      "description": "The game server: profiles, static tables, traders, flea market, quests, hideout, raids. Written entirely on the public mod API, which is the only honest test that the API is enough to build a game server with.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "server",
+        "sim"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/tarkov",
+        "url": null
+      },
+      "artifact": {
+        "dir": "tarkov",
+        "library": "tarkov.dll"
+      },
+      "upstream": null,
+      "license": "see repository",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [
+        "aowl.capability.gameserver",
+        "aowl.items"
+      ],
+      "loadAfter": [],
+      "tags": [
+        "server",
+        "core"
+      ]
+    },
+    {
+      "id": "aowl.morebots",
+      "parent": "aowl.sain",
+      "name": "Bot AI \u00e2\u20ac\u201d Population",
+      "internal": true,
+      "author": "aowlspt",
+      "version": "1.0.0",
+      "description": "The population and bot-type/faction half of Bot AI. Raises how many AI a map runs (cap, per-zone limit and scav wave slots, computed from a stock baseline) and is the bot-type and faction API other mods register against. Hidden from the mod list on purpose: it is not a separate mod to the player, its settings render inside the Bot AI page tree under Population, and its guid, path, dll and routes are internal identifiers kept unchanged.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "server",
+        "client",
+        "sim"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/morebots",
+        "url": null
+      },
+      "artifact": {
+        "dir": "morebots",
+        "library": "morebots.dll"
+      },
+      "upstream": {
+        "name": "MoreBotsAPI",
+        "author": "TacticalToaster",
+        "url": "https://discord.gg/nxa3W7w4rJ"
+      },
+      "license": "CC-BY-NC-SA-4.0",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [
+        "aowl.capability.bottypes"
+      ],
+      "loadAfter": [],
+      "tags": [
+        "bots",
+        "api"
+      ]
+    },
+    {
+      "id": "aowl.sain",
+      "name": "Bot AI",
+      "author": "aowlspt",
+      "version": "0.1.0",
+      "description": "Bot AI: layered decisions, per-bot personalities, cover use, searching that looks like searching, squads that behave like squads. A port of the design, not of the C#. Boots clean as of 2026-08-25 but runs in OBSERVER MODE -- see fact #145; it declines every by-name route rather than dying on one.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "server",
+        "client",
+        "sim"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/sain",
+        "url": null
+      },
+      "artifact": {
+        "dir": "sain",
+        "library": "sain.dll"
+      },
+      "upstream": {
+        "name": "Bot AI",
+        "author": "aowlspt",
+        "url": null
+      },
+      "license": null,
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [
+        "aowl.capability.botbrains"
+      ],
+      "loadAfter": [
+        "aowl.morebots"
+      ],
+      "tags": [
+        "bots",
+        "ai"
+      ]
+    },
+    {
+      "id": "aowl.fovfix",
+      "name": "FOV",
+      "author": "aowlspt",
+      "version": "4.1.0",
+      "description": "Field of view that stays where you put it, including while aiming and while scoped.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "client",
+        "sim"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/fov",
+        "url": null
+      },
+      "artifact": {
+        "dir": "fov",
+        "library": "fov.dll"
+      },
+      "upstream": {
+        "name": "Fontaine-FOVFix",
+        "author": "Fontaine (space-commits)",
+        "url": "https://github.com/space-commits"
+      },
+      "license": "CC-BY-NC-SA-3.0",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [
+        "aowl.capability.fov"
+      ],
+      "loadAfter": [],
+      "tags": [
+        "client",
+        "quality-of-life"
+      ]
+    },
+    {
+      "id": "aowl.settingshub",
+      "name": "SPT Settings Surface",
+      "internal": true,
+      "author": "savannt",
+      "version": "4.1.0",
+      "description": "Collects every mod's schema from /aowlspt/settings/<guid> and serves one index, so a UI does not need to know which mods exist. The settings surface that ships in 1.0 is built on this; without it no settings page has anything to list.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "server"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/settingshub",
+        "url": null
+      },
+      "artifact": {
+        "dir": "settingshub",
+        "library": "settingshub.dll"
+      },
+      "upstream": null,
+      "license": "see repository",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [
+        "aowl.capability.settingsindex"
+      ],
+      "loadAfter": [],
+      "tags": [
+        "core",
+        "settings"
+      ]
+    },
+    {
+      "id": "aowl.uihub",
+      "name": "Browser Settings Page",
+      "internal": true,
+      "author": "savannt",
+      "version": "2.0.0",
+      "description": "The settings screen served in your web browser, at /aowlspt/ui/page/settings -- the alternative to the in-game F12 panel, and the one that still works when the game is fullscreen or on another machine. It reads and writes the exact same /aowlspt/settings/* routes any other UI would, including the per-row and page-level reset buttons, so it is the reference implementation as well as the shipping surface.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "server"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/uihub",
+        "url": null
+      },
+      "artifact": {
+        "dir": "uihub",
+        "library": "uihub.dll"
+      },
+      "upstream": null,
+      "license": "see repository",
+      "download": null,
+      "requires": [
+        {
+          "id": "aowl.settingshub",
+          "version": ">=1.0.0"
+        }
+      ],
+      "conflicts": [],
+      "provides": [],
+      "loadAfter": [
+        "aowl.settingshub"
+      ],
+      "tags": [
+        "core",
+        "settings",
+        "ui"
+      ]
+    },
+    {
+      "id": "aowl.admin",
+      "name": "Admin Menu",
+      "author": "savannt",
+      "version": "1.0.0",
+      "shipped": true,
+      "description": "The cheat/admin panel: its controls are served as a settings schema like any other mod's, so it renders in whatever settings UI is installed. Registered but OFF in every shipped list -- it is opt-in on purpose. It is in no shipped list on purpose: it is meant to be switched on by hand.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "client",
+        "server",
+        "sim"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/admin",
+        "url": null
+      },
+      "artifact": {
+        "dir": "admin",
+        "library": "admin.dll"
+      },
+      "upstream": null,
+      "license": "see repository",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [],
+      "loadAfter": [],
+      "tags": [
+        "client",
+        "admin",
+        "cheats"
+      ]
+    },
+    {
+      "id": "aowl.graphics",
+      "name": "Graphics",
+      "author": "savannt",
+      "version": "1.0.0",
+      "shipped": true,
+      "description": "Client graphics knobs served as a settings schema. Independent of the shelved native in-game settings work (see docs/SHELVED-NATIVE-SETTINGS.md); registered but not enabled in a shipped list until it has been exercised on a tester install. It is in no shipped list on purpose: it is meant to be switched on by hand.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "client"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/graphics",
+        "url": null
+      },
+      "artifact": {
+        "dir": "graphics",
+        "library": "graphics.dll"
+      },
+      "upstream": null,
+      "license": "see repository",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [],
+      "loadAfter": [],
+      "tags": [
+        "client",
+        "graphics"
+      ]
+    },
+    {
+      "id": "aowl.textures",
+      "name": "Textures",
+      "author": "savannt",
+      "version": "1.0.0",
+      "shipped": false,
+      "description": "Texture replacement: swaps client textures from a pack under its own data/ directory. In no shipped list on purpose -- it does nothing until a pack is installed, so it is meant to be switched on by hand.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "client",
+        "sim"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/textures",
+        "url": null
+      },
+      "artifact": {
+        "dir": "textures",
+        "library": "textures.dll"
+      },
+      "upstream": null,
+      "license": "see repository",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [],
+      "loadAfter": [],
+      "tags": [
+        "client",
+        "textures"
+      ]
+    },
+    {
+      "id": "aowl.callproof",
+      "name": "Call Proof",
+      "internal": true,
+      "author": "aowlspt",
+      "version": "1.0.0",
+      "shipped": false,
+      "description": "A one-shot experiment that settles how this build passes by-value aggregates to a managed call. Default off; it makes four calls whose correct answers are known offline and reports PASS/FAIL/INCONCLUSIVE. NOT SHIPPABLE, deliberately: its source lives at examples/callproof, outside the mods/* tree that `aowl payload` stages, so no install can ever receive it. It is marked \"shipped\": false to say that in a field tools read, instead of leaving the manager to offer a mod that can never arrive.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "client",
+        "sim"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "examples/callproof",
+        "url": null
+      },
+      "artifact": {
+        "dir": "callproof",
+        "library": "callproof.dll"
+      },
+      "upstream": null,
+      "license": null,
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [],
+      "loadAfter": [],
+      "tags": [
+        "client",
+        "diagnostic"
+      ]
+    },
+    {
+      "id": "aowl.maps",
+      "name": "Maps",
+      "author": "aowlspt",
+      "version": "0.1.0",
+      "description": "Map, radar and direction indicators over one guarded position feed. The client half reads positions at measured static field offsets off the GameWorld the host's already-armed RegisterPlayer detour caches -- it resolves no IL2CPP name, installs no detour and calls no game method, because every by-name route is fatal on this build (fact #145). The server half serves 11 maps of real terrain SVG plus their calibration, and the three views are drawn in a browser at /aowlspt/ui/page/spatial. SHIPS DISABLED: the live feed is off until config.json `enabled` is set, and with it off nothing here touches game memory. The map browser works either way.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "server",
+        "client"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/maps",
+        "url": null
+      },
+      "artifact": {
+        "dir": "maps",
+        "library": "maps.dll"
+      },
+      "upstream": {
+        "note": "Behaviour specified from three pre-1.0 BepInEx/Mono mods; no code is carried over and none could be. The map terrain art and calibration under data/maps/ ARE reused -- they are data. Provenance and refs: mods/maps/data/maps/README.md"
+      },
+      "license": "see mods/maps/data/maps/README.md for asset provenance",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [
+        "aowl.capability.spatialfeed"
+      ],
+      "loadAfter": [],
+      "tags": [
+        "client",
+        "server",
+        "ui",
+        "map",
+        "radar"
+      ]
+    },
+    {
+      "id": "aowl.debug",
+      "name": "Debug",
+      "author": "savannt",
+      "version": "1.0.0",
+      "description": "The F3 debug overlay's configuration surface, and the per-mod profiler. The overlay itself is drawn Unity-natively by the host; this mod turns 'which lines, in what order, where, and on which key' into settings, so the panel is customisable without a rebuild or a restart. The profiler is the aowlspt-shaped ModProfiler: it times every mod's per-frame work and every host rider on the shared PreloaderUI Update chain, in absolute ms and as a share of measured frame wall time, over a rolling window. It installs NO detour and resolves NO IL2CPP name -- its whole native surface is a shared page and a QueryPerformanceCounter. Both halves default OFF.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "client",
+        "sim"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/debug",
+        "url": null
+      },
+      "artifact": {
+        "dir": "debug",
+        "library": "debug.dll"
+      },
+      "upstream": null,
+      "license": "see repository",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [
+        "aowl.capability.profiler"
+      ],
+      "loadAfter": [],
+      "tags": [
+        "client",
+        "debug",
+        "profiling",
+        "diagnostics"
+      ]
+    },
+    {
+      "id": "aowl.waypoints",
+      "internal": true,
+      "parent": "aowl.sain",
+      "name": "Bot AI \u00e2\u20ac\u201d Patrols",
+      "author": "savannt",
+      "version": "1.0.0",
+      "description": "Bot patrol waypoint data for ten maps, served from the backend: 87 zones, 197 patrols, 8556 points, into schema aowlspt.waypoints/1. Routes: /waypoints/status, /waypoints/maps, /waypoints/points/<map>. Also applies the parts of upstream's server-side patrol pacing tweak that this database actually carries, probing each key first and reporting the ones post-1.0 dropped. The data is inert until something consumes it: the only live consumption path on this build is aowlspt/botnav's advisory sendBotTo, and upstream's own navmesh-bundle injection is out of reach here. It is in no shipped list on purpose: the data is inert until a consumer is wired to it, so it is meant to be switched on by hand.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "server"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/waypoints",
+        "url": null
+      },
+      "artifact": {
+        "dir": "waypoints",
+        "library": "waypoints.dll"
+      },
+      "upstream": {
+        "name": "SPT-Waypoints",
+        "author": "DrakiaXYZ",
+        "version": "1.3.4",
+        "url": "https://github.com/DrakiaXYZ/SPT-Waypoints"
+      },
+      "license": "MIT (data and upstream design); see mods/waypoints/LICENSE.txt",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [],
+      "loadAfter": [
+        "aowl.tarkov"
+      ],
+      "tags": [
+        "server",
+        "bots",
+        "data"
+      ]
+    },
+    {
+      "id": "aowl.ammoloading",
+      "name": "Ammo Loading",
+      "author": "aowlspt (port of Manimal's ManimalAmmoLoadingAnimations, MIT)",
+      "version": "0.1.0",
+      "description": "Everything about putting rounds into a magazine and taking them out again. TWO features. (1) THE ANIMATION: first-person animation of hands thumbing rounds into a magazine while it loads, at a speed tied to your Mag Drills skill. A port of Manimal's ManimalAmmoLoadingAnimations (MIT), whose animation bundle is reused verbatim. This is a host-native approximation, not a 1:1 port: the upstream mod injects a managed UsableItemController subclass, which IL2CPP does not allow, so we instantiate the bundle prefab directly and drive its Animator by verified static RVA. Lost relative to upstream: Fika co-op sync and ContinuousLoadAmmo compatibility. Default OFF, with a five-rung escalation ladder, because it detours the live magazine-loading flow. As of 2026-08-31 the animation is ARMED but NEVER FIRED -- installed and waiting, never observed on a live magazine load -- and its spawn/animate rungs additionally need a bundle riding a vanilla key via aowl.textures (redirectMode=full + bundleRoot), which is not set up. (2) THE SPEED of loading and unloading, which this mod deliberately does NOT own: it is globals.config.BaseLoadTime / BaseUnloadTime / LoadTimeSpeedProgress, already three rows of aowl.tarkov's Globals tuning page.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "client"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/ammoloading",
+        "url": null
+      },
+      "artifact": {
+        "dir": "ammoloading",
+        "library": "ammoloading.dll"
+      },
+      "upstream": "https://github.com/danauraborealis/ManimalAmmoLoadingAnimations",
+      "license": "MIT (upstream assets and design); see LICENSE.upstream.txt",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [],
+      "loadAfter": [
+        "aowl.textures"
+      ],
+      "tags": [
+        "client",
+        "animation",
+        "weapons"
+      ]
+    },
+    {
+      "id": "aowl.admintrader",
+      "name": "Admin Trader",
+      "author": "aowlspt",
+      "version": "1.0.0",
+      "description": "The canonical 'how to write an aowlspt mod' example, and a working test mod. Adds a brand new trader who stocks every tradeable item in the handbook for nothing, and gives out one complete example quest. It demonstrates the only server-side mechanism there is: the emulator serves traders and quests straight out of the loaded database, so a mod that wants a new one writes JSON at traders.<id> and templates.quests.<id> with dbWrite. Read it alongside its README, which is a tutorial rather than a reference. SHIPPED (the artifact is staged into every install, because it lives under mods/* and a user who wants to see it must be able to enable it without a rebuild) but on NO default list -- a free-everything trader is a debugging tool, not a game. Turn it on with GET /aowlspt/mods/enable/aowl.admintrader; see docs/MOD-ENABLE-PATH.md.",
+      "pipeline": ">=0.1.0",
+      "shipped": true,
+      "sides": [
+        "server",
+        "sim"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/admintrader",
+        "url": null
+      },
+      "artifact": {
+        "dir": "admintrader",
+        "library": "admintrader.dll"
+      },
+      "upstream": null,
+      "license": "see repository",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [],
+      "loadAfter": [
+        "aowl.tarkov"
+      ],
+      "tags": [
+        "server",
+        "example",
+        "trader",
+        "quest",
+        "cheat"
+      ]
+    },
+    {
+      "id": "aowl.voice",
+      "name": "Voice Agents",
+      "author": "savannt",
+      "version": "0.1.0",
+      "description": "Server-side conversational agents with voice: a STT (whisper.cpp) -> LLM -> TTS (piper) pipeline served from the backend under /aowlspt/voice/*, plus a response+line cache that returns previously generated replies and their wav without re-running the LLM or TTS. An agent is an identity (a raid scav and your personal assistant are two rows of one table); a radio routes utterances to whichever agent can answer. Default OFF because turning it on spawns subprocesses and loads large models. There is no local .gguf on this machine, so the default reasoning engine is 'builtin', a template responder that says so in every reply; llamacpp/openai are wired and probed honestly. In no shipped list on purpose: it is meant to be switched on by hand.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "server",
+        "sim"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/voice",
+        "url": null
+      },
+      "artifact": {
+        "dir": "voice",
+        "library": "voice.dll"
+      },
+      "upstream": {
+        "name": "EscapeFromMyBasement",
+        "author": "savannt",
+        "url": null
+      },
+      "license": "see repository",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [
+        "aowl.capability.voiceagents"
+      ],
+      "loadAfter": [
+        "aowl.tarkov"
+      ],
+      "tags": [
+        "server",
+        "voice",
+        "ai"
+      ]
+    },
+    {
+      "id": "aowl.basement",
+      "name": "Escape From My Basement",
+      "author": "savannt",
+      "version": "0.1.0",
+      "description": "The always-in-raid RPG backend: a seeded, persistent world of factions and people generated from a world prompt (five shipped presets), a three-tier BRAIN (persisted line cache -> ontology rules -> LLM with a byte-stable cached prefix) that speaks through per-sentence cached TTS, progressive STT sessions, an encounter state machine (hail, deal, threat, robbery, captivity and escort, escape, ambush) and a cursor-based directive stream that any client (aowlspt host bridge or an SPT 4.1.5 BepInEx plugin) consumes. Engine-agnostic by construction: the client reports facts and executes directives; everything else lives here. Default OFF (spawns subprocesses). No LLM key or local model on this machine, so the builtin tier answers and says so. Nothing client-side exists yet; see mods/basement/CLIENT-CONTRACT.md.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "server",
+        "client",
+        "sim"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/basement",
+        "url": null
+      },
+      "artifact": {
+        "dir": "basement",
+        "library": "basement.dll"
+      },
+      "upstream": {
+        "name": "EscapeFromMyBasement",
+        "author": "savannt",
+        "url": null
+      },
+      "license": "see repository",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [
+        "aowl.capability.livingworld"
+      ],
+      "loadAfter": [
+        "aowl.tarkov"
+      ],
+      "tags": [
+        "server",
+        "rpg",
+        "ai",
+        "voice"
+      ]
+    },
+    {
+      "id": "aowl.autoraid",
+      "name": "AutoRaid",
+      "author": "aowlspt",
+      "version": "0.1.0",
+      "description": "Enter (and leave) a raid without touching the mouse. Three features: a COMMAND-LINE raid (aowlspt-launch --raid=\"Woods\" becomes -aowl.raid=Woods, and the mod drives the main menu into an offline raid on that map once the host's main-thread drain has fired), a MAP MENU on a key (F8 by default, drawn on the host's shared region; gated behind `hotkeys`, which ships OFF), and an optional SPAWNED default loadout (server side: a kit from loadout.json is created for the raid, the gear you were wearing is moved to the stash first and never destroyed, and every created item is stripped at match end so none of it reaches the stash). The client half installs NO detour, resolves NO IL2CPP name and writes NOTHING into game memory -- every state change is a call to the method the game itself calls, at an RVA byte-verified against the sixteen bytes it is declared to begin with, and every screen is taken from its own ::Show receiver over the host's `ui.show` bus rather than searched for by name. SHIPS INERT: with no command-line argument and `hotkeys` off it does nothing at all.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "client",
+        "server"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/autoraid",
+        "url": null
+      },
+      "artifact": {
+        "dir": "autoraid",
+        "library": "autoraid.dll"
+      },
+      "args": [
+        {
+          "name": "raid",
+          "description": "Enter an offline raid on this map as soon as the main menu is up. The value is the map's DISPLAYED name on the location screen, matched case-insensitively -- that displayed text is the only thing that identifies a map on this build, because every tile GameObject is called `Location Template(Clone)`. Absent = the mod does nothing at launch. A map that is not currently on offer is REFUSED, and the refusal names every map that WAS on offer.",
+          "example": "-aowl.raid=\"Ground Zero\"   (launcher: aowlspt-launch --raid=\"Ground Zero\")"
+        },
+        {
+          "name": "raidside",
+          "description": "Which side to choose on the PMC/SCAV selector before the map list: `pmc` or `scav`. Default `pmc`. Only consulted when -aowl.raid is present.",
+          "example": "-aowl.raidside=scav"
+        }
+      ],
+      "upstream": {
+        "note": "No upstream. The state machine is a port of host/Aowlspt.Host.Il2Cpp/autoraid.nim into a mod: same states, same bounds, same readback lines and the same measured refusals, with the scene-root enumeration removed (it allocates, and in a raid it enumerates the LOCATION scene where the menu is not) and the three superseded all-roots NextButton steps deleted rather than left disabled. docs/AUTORAID-MAP.md records what changed and why."
+      },
+      "license": "see repository",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [
+        "aowl.capability.raidentry"
+      ],
+      "loadAfter": [
+        "aowl.tarkov"
+      ],
+      "tags": [
+        "client",
+        "server",
+        "automation",
+        "raid"
+      ]
+    }
+  ],
+  "lists": [
+    {
+      "id": "aowl.list.core",
+      "name": "Core",
+      "author": "aowlspt",
+      "version": "1.0.0",
+      "description": "The mod manager and the game server, and nothing else. What an install needs to be a game rather than a pipeline. Every other list inherits this one, which is how aowl.manager stays in every selection without the schema needing a flag for it.",
+      "inherits": [],
+      "entries": [
+        {
+          "id": "aowl.manager",
+          "enabled": true,
+          "note": "the thing reading this file; see registry/README.md on why it is here and never off"
+        },
+        {
+          "id": "aowl.tarkov",
+          "enabled": true
+        },
+        {
+          "id": "aowl.settingshub",
+          "enabled": true,
+          "note": "every settings UI reads its index; without it a settings page has nothing to list"
+        },
+        {
+          "id": "aowl.uihub",
+          "enabled": true,
+          "note": "the settings surface that ships in 1.0 (browser page); native in-game settings are shelved, see docs/SHELVED-NATIVE-SETTINGS.md"
+        }
+      ]
+    },
+    {
+      "id": "aowl.list.vanillaplus",
+      "name": "Default",
+      "author": "savannt",
+      "version": "1.0.0",
+      "description": "The Singleplayer mod and Bot AI. Bot AI was measured on 2026-08-25 to boot clean (client alive 1:55.828, Unity thread live confirmed, arming complete) after every by-name route was made to refuse. It is in OBSERVER MODE: its ~70 members are LazyCalls whose `ensure` calls il2cpp_object_get_class, which faults on this build, so the read path is blocked and both detours decline. It is safe to ship and it does not yet drive bots.",
+      "inherits": [
+        "aowl.list.core"
+      ],
+      "entries": [
+        {
+          "id": "aowl.sain",
+          "enabled": true,
+          "note": "drives bot MoveSpeed from the difficulty band via botnav (easy 0.49 .. deathwish 1.0); the band difference is UNVERIFIED in a live raid"
+        }
+      ]
+    },
+    {
+      "id": "aowl.list.beta",
+      "name": "aowlspt beta",
+      "author": "aowlspt",
+      "version": "1.0.0",
+      "description": "What the public beta ships. Inherits vanillaplus (manager, tarkov, settingshub, uihub, sain) and adds the player-facing mods. Anything absent here is absent from the beta -- a mod in the registry but in no list can never be selected.",
+      "inherits": [
+        "aowl.list.vanillaplus"
+      ],
+      "entries": [
+        {
+          "id": "aowl.morebots",
+          "enabled": true,
+          "note": "bot population/types; folded into the Bot AI mod branding"
+        },
+        {
+          "id": "aowl.fovfix",
+          "enabled": true,
+          "note": "FOV + aiming/scope sensitivity; zoom-toggle and camera-offset keys are declared unimplemented"
+        },
+        {
+          "id": "aowl.admin",
+          "enabled": true,
+          "note": "F6 admin overlay + item spawner; ESP/godmode/stamina are the bound writes"
+        },
+        {
+          "id": "aowl.graphics",
+          "enabled": true,
+          "note": "20 settings, all read and acted on -- but see the client-side settings surfacing fix, without which they are invisible in F12"
+        },
+        {
+          "id": "aowl.maps",
+          "enabled": true,
+          "note": "selected so the map browser and its routes are served; the LIVE FEED is still off by its own config.json `enabled` flag, so selecting it cannot make anything touch game memory"
+        },
+        {
+          "id": "aowl.autoraid",
+          "enabled": true,
+          "note": "selected so the --raid launcher flag and the F8 map menu are available. Selecting it changes NOTHING on its own: with no -aowl.raid token and `hotkeys` false in its config.json, the mod polls no key, draws nothing and makes no call into the game at all."
+        },
+        {
+          "id": "aowl.debug",
+          "enabled": false,
+          "note": "registered and present but NOT enabled: it has never run against the live client. Flip this to true (or select it in the manager) to load it; both of its features are still individually default-OFF after that, so loading it changes nothing on screen until a setting is turned on."
+        },
+        {
+          "id": "aowl.ammoloading",
+          "enabled": true,
+          "note": "selected so the mod stays loaded long enough to reach its own arming ladder; before this it was resolved not-selected, served enabled:false, and unloaded by the client host seconds after loading -- long before its 12s armDelayMs -- which read as the mod being broken. Its animation detour is still default-OFF behind its own config, so selecting it installs no hook."
+        }
+      ]
+    }
+  ]
+}

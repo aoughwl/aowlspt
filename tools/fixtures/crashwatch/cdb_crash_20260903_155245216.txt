@@ -1,0 +1,29 @@
+Unable to load image D:\Aowlspt\aowlspt\aowlspt-host-il2cpp.dll, Win32 error 0n2
+*** WARNING: Unable to verify timestamp for aowlspt-host-il2cpp.dll
+rax=0000021270097e00 rbx=0000021270000480 rcx=000000000000000a
+rdx=0000000000000019 rsi=0000000000000000 rdi=00007ffb1df2f640
+rip=00007ffb1db980c4 rsp=000000306f7ff120 rbp=0000000000000000
+ r8=0000000000000019  r9=0000000000000280 r10=0000021270092580
+r11=0000021270092598 r12=0000021270092580 r13=0000021270092580
+r14=0000021270092598 r15=0000000000000031
+iopl=0         nv up ei pl nz na po nc
+cs=0033  ss=002b  ds=002b  es=002b  fs=0053  gs=002b             efl=00010206
+aowlspt_host_il2cpp+0x80c4:
+00007ffb`1db980c4 4c8b02          mov     r8,qword ptr [rdx] ds:00000000`00000019=????????????????
+Child-SP          RetAddr               Call Site
+00000030`6f7ff120 00000212`700702c0     aowlspt_host_il2cpp+0x80c4
+00000030`6f7ff128 00000000`00000084     0x00000212`700702c0
+00000030`6f7ff130 0000f15a`e5756155     0x84
+00000030`6f7ff138 00000000`00000001     0x0000f15a`e5756155
+00000030`6f7ff140 00000000`00000000     0x1
+start             end                 module name
+00007ffb`1db90000 00007ffb`205a6000   aowlspt_host_il2cpp T (no symbols)
+    Loaded symbol image file: aowlspt-host-il2cpp.dll
+    Image path: D:\Aowlspt\aowlspt\aowlspt-host-il2cpp.dll
+    Image name: aowlspt-host-il2cpp.dll
+    Timestamp:        Thu Sep  3 11:22:30 2026 (6A9990B6)
+    CheckSum:         00000000
+    ImageSize:        02A16000
+    Index Key:        (GUID) 6C3BA38B05B045244C4C44205044422E
+    Translations:     0000.04b0 0000.04e4 0409.04b0 0409.04e4
+    Information from resource tables:

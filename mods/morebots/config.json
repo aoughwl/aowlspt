@@ -1,0 +1,63 @@
+{
+  "_comment": "aowl.morebots -- the population half of Bot AI. To the player this is not a separate mod: it is hidden from the mod list and its settings render under Bot AI > Population. Two jobs: it is the bot-type and faction API other mods register against (mods/blackdivision is the first customer), and it is the half that raises how many bots a map runs. Every key is documented on the line above it. README.md says which upstream features survived post-1.0 and which cannot exist at all.",
+
+  "//enableDebugLogs": "One line per registration, per overlay and per relation. Off by default: it is 30+ lines at every load on a normal install and says nothing a working one needs to hear.",
+  "enableDebugLogs": false,
+
+  "//population": "How busy a raid is. This is the half of the mod its name is about. It writes BotMax, BotMaxPvE, MaxBotPerZone and every scav wave's slots_min/slots_max into locations.<map>.base -- which /client/locations serves to the client verbatim, so it is the client that acts on it. Every number is computed from data/vanilla.json, a stock-database baseline shipped beside this file, and NEVER from the live value: multiplying the live value would compound on every server restart and the only symptom would be a server that gets slower every week.",
+  "population": {
+    "//enabled": "Off by default, deliberately. A server quietly running more AI than the player asked for is not a feature, and this is the setting that costs frames.",
+    "enabled": false,
+
+    "//preset": "vanilla | more | lots | horde | custom. `vanilla` puts every number back to the stock value, which is how you turn this off after having turned it on -- the database persists, so `enabled: false` alone leaves the last run's numbers in place. `more` is 1.35x cap and waves, 1.5x per-zone. `lots` is 1.75x / 2x. `horde` is 2.5x / 3x and is past the point where any of it is balanced. Anything else means `custom`, which means the three multipliers below as written -- and they ship as `null`, so `custom` on its own is 1.0x and changes nothing until you put numbers there.",
+    "preset": "vanilla",
+
+    "//botCapMultiplier": "Multiplier on BotMax and BotMaxPvE -- the alive-AI ceiling for the map. `null` means \"whatever the preset above says\", which is what it has to ship as: a number here WINS over the preset, so a shipped 1.0 would have made `preset` a switch that does nothing and there would have been no sign of it. Put a number here only to override a preset, or with preset `custom`. Raising this alone does very little; see maxBotPerZoneMultiplier.",
+    "botCapMultiplier": null,
+
+    "//maxBotPerZoneMultiplier": "Multiplier on MaxBotPerZone. `null` means \"whatever the preset says\"; a number wins over the preset. This is the one people forget. The spawner will not put a fifth bot in a zone that allows four, so a raised BotMax with an unchanged per-zone limit is headroom that never gets used, and the mod reads as broken. Move both or neither.",
+    "maxBotPerZoneMultiplier": null,
+
+    "//waveSlotMultiplier": "Multiplier on every scav wave's slots_min and slots_max. `null` means \"whatever the preset says\"; a number wins over the preset. This is what actually changes how a raid feels; the cap only sets the ceiling. 154 waves across 19 maps are covered by the baseline, and a map mod may donate one for its own map.",
+    "waveSlotMultiplier": null,
+
+    "//capFloor": "No map's cap is ever written below this, whatever the multiplier says. Guards against a fractional multiplier rounding a small map down to nothing.",
+    "capFloor": 4,
+
+    "//capCeiling": "No map's cap is ever written above this. A map has a fixed number of spawn points; asking for more bots than it has places to put them gives half-built bots and stuttering rather than more bots. A clamp is logged, not silent -- 'I asked for 3x and got 1.9x' is a fact you need.",
+    "capCeiling": 60,
+
+    "//perZoneCeiling": "The same ceiling for MaxBotPerZone. Lighthouse ships at 8, which is the highest any stock map uses.",
+    "perZoneCeiling": 12,
+
+    "//waveSlotCeiling": "The largest slots_max any single wave may reach. A wave asking for more bots at once than the zone can place is a wave that arrives partly.",
+    "waveSlotCeiling": 12,
+
+    "//onlyMaps": "Restrict the whole population pass to these map keys. Empty means every map the baseline covers that this database also has. Useful for raising Factory and leaving Streets alone, which is where the frames actually go.",
+    "onlyMaps": []
+  },
+
+  "//wildSpawnTypes": "Overrides for the compiled WildSpawnType table, as {\"pmcUSEC\": 52}. BSG renumbers that enum between wipes; an entry here wins over the built-in table, which is how a deployment survives a renumbering without a rebuild. Empty on a build that agrees with bots/spawntypes.nim, which is all of them so far.",
+  "wildSpawnTypes": {},
+
+  "//increaseBotCapAmount": "DEPRECATED and 0. Upstream's flat per-map cap bump. It writes bots.config.maxBotCap, which is not a path anything on this stack reads -- a stock SPT 4.x database has no `bots.config` at all and the emulator never looks there. It was doing nothing, silently. Kept so an install that set it does not change behaviour without saying so; it now logs a line pointing at `population` above, which writes somewhere the client can see.",
+  "increaseBotCapAmount": 0,
+
+  "//clientCensus": "The CLIENT half, and it is OFF. It opens GameAssembly.dll inside the client process to count the bots that arrived. This mod was quarantined as morebots.dll.off for killing the client ~30ms after HOST RUNNING; the gates that caused that are replaced (see bots/gate.nim) but the fix has never been run in a live raid. Raising bot counts is the SERVER half (`population`) and needs none of this.",
+  "clientCensus": false,
+
+  "//deferUntilUnityThread": "Hold every client-side open/bind/patch until the host reports its main-thread drain has FIRED. ON. Turning it off arms on the host's own thread, which is the crash.",
+  "deferUntilUnityThread": true,
+
+  "//deathLedger": "OFF. Installs a by-name host detour on EFT.BaseStatisticsManager::OnDeath -- a WRITE into game code against a pre-1.0 C# name. The census is read-only; this is not, and it is not needed for bot counts.",
+  "deathLedger": false,
+
+  "//censusIntervalMs": "How often the client half counts the bots that actually arrived. Read-only; it changes nothing in the game. Floored at 500.",
+  "censusIntervalMs": 5000,
+
+  "//expectedBotCap": "The alive-bot cap the server was told to use. The census says OVER when it sees more. 0 means report the count without judging it.",
+  "expectedBotCap": 0,
+
+  "//selfTestRuntime": "A GameAssembly.dll for `aowl run` to bind the census against, so the binding report is a real answer offline. Empty means the process, which under aowlspt-sim has no runtime at all.",
+  "selfTestRuntime": ""
+}

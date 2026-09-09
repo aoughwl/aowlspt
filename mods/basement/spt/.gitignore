@@ -1,0 +1,7 @@
+# build outputs of the SPT 4.1.5 client plugin and the member checker
+bin/
+obj/
+*/bin/
+*/obj/
+**/bin/
+**/obj/

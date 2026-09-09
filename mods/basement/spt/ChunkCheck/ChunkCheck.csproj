@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Offline proof of the plugin's speech-in path, without the game.
+       Compiles the plugin's OWN Pcm.cs (linked, not copied), so the resampler
+       it measures is the one that ships. Two verbs:
+         dotnet run -c Release -\- resample
+             self-check: a 48 kHz sine through Resampler in 250 ms pushes -> 16 kHz;
+             reports output length and peak error against the ideal tone
+         dotnet run -c Release -\- stream <wav> [url] [chunkMs] [srcRate]
+             reads a 16 kHz mono PCM16 wav, optionally upsamples it to srcRate (to
+             imitate a 48 kHz microphone), then streams it through Resampler in
+             chunkMs pieces, in real time, to POST <url>/aowlspt/basement/speech/chunk
+             exactly as Hear.cs does (session, seq, wavBase64, final, personId@0),
+             printing every reply's partial/final/note with wall-clock times.
+       Exit 1 = a refusal, an empty final, or a self-check failure. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\Aowl.Api\Pcm.cs" Link="Pcm.cs" />
+  </ItemGroup>
+</Project>

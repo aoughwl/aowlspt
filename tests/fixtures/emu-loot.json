@@ -1,0 +1,312 @@
+{
+  "locations": {
+    "testmap": {
+      "base": {
+        "_Id": "testmap",
+        "Name": "Test Map",
+        "EscapeTimeLimit": 35,
+        "GlobalLootChanceModifier": 1.0,
+        "GlobalContainerChanceModifier": 1.0
+      },
+      "staticContainers": {
+        "staticContainers": [
+          {
+            "probability": 1.0,
+            "template": {
+              "Id": "crate_1",
+              "IsStatic": true,
+              "useGravity": false,
+              "randomRotation": false,
+              "Position": {
+                "x": 1.0,
+                "y": 2.0,
+                "z": 3.0
+              },
+              "Rotation": {
+                "x": 0.0,
+                "y": 90.0,
+                "z": 0.0
+              },
+              "IsGroupPosition": false,
+              "GroupPositions": [],
+              "Root": "cccccccccccccccccccccccc",
+              "Items": [
+                {
+                  "_id": "cccccccccccccccccccccccc",
+                  "_tpl": "ccccbox00000000000000001"
+                }
+              ]
+            }
+          },
+          {
+            "probability": 0.0,
+            "template": {
+              "Id": "crate_never",
+              "IsStatic": true,
+              "Position": {
+                "x": 9.0,
+                "y": 0.0,
+                "z": 9.0
+              },
+              "Root": "dddddddddddddddddddddddd",
+              "Items": [
+                {
+                  "_id": "dddddddddddddddddddddddd",
+                  "_tpl": "ccccbox00000000000000001"
+                }
+              ]
+            }
+          }
+        ],
+        "staticForced": [
+          {
+            "containerId": "crate_1",
+            "itemTpl": "qqqquest0000000000000001"
+          }
+        ]
+      },
+      "looseLoot": {
+        "spawnpointCount": {
+          "mean": 2,
+          "std": 0
+        },
+        "spawnpointsForced": [
+          {
+            "locationId": "forced_1",
+            "probability": 1.0,
+            "template": {
+              "Id": "forced_1",
+              "IsStatic": false,
+              "useGravity": true,
+              "Position": {
+                "x": 4.0,
+                "y": 0.0,
+                "z": 4.0
+              },
+              "Root": "eeeeeeeeeeeeeeeeeeeeeeee",
+              "Items": [
+                {
+                  "_id": "eeeeeeeeeeeeeeeeeeeeeeee",
+                  "_tpl": "qqqquest0000000000000001"
+                }
+              ]
+            }
+          }
+        ],
+        "spawnpoints": [
+          {
+            "locationId": "loose_1",
+            "probability": 1.0,
+            "template": {
+              "Id": "loose_1",
+              "IsStatic": false,
+              "useGravity": true,
+              "Position": {
+                "x": 5.0,
+                "y": 0.0,
+                "z": 6.0
+              },
+              "Root": "ffffffffffffffffffffffff",
+              "Items": [
+                {
+                  "_id": "ffffffffffffffffffffffff",
+                  "_tpl": "wwwwgun00000000000000001"
+                },
+                {
+                  "_id": "ffffffffffffffffffffff02",
+                  "_tpl": "aaaaammo0000000000000001"
+                }
+              ]
+            },
+            "itemDistribution": [
+              {
+                "composedKey": {
+                  "key": "ffffffffffffffffffffffff"
+                },
+                "relativeProbability": 1
+              }
+            ]
+          },
+          {
+            "locationId": "loose_never",
+            "probability": 0.0,
+            "template": {
+              "Id": "loose_never",
+              "Position": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "Root": "1111111111111111111111ff",
+              "Items": [
+                {
+                  "_id": "1111111111111111111111ff",
+                  "_tpl": "aaaaammo0000000000000001"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  },
+  "loot": {
+    "staticLoot": {
+      "ccccbox00000000000000001": {
+        "itemcountDistribution": [
+          {
+            "count": 2,
+            "relativeProbability": 1
+          }
+        ],
+        "itemDistribution": [
+          {
+            "tpl": "aaaaammo0000000000000001",
+            "relativeProbability": 5
+          },
+          {
+            "tpl": "bbbbbox00000000000000002",
+            "relativeProbability": 5
+          }
+        ]
+      }
+    }
+  },
+  "globals": {
+    "ItemPresets": {
+      "pppppppppppppppppppppppp": {
+        "_id": "pppppppppppppppppppppppp",
+        "_encyclopedia": "wwwwgun00000000000000001",
+        "_items": [
+          {
+            "_id": "r0000000000000000000000r",
+            "_tpl": "wwwwgun00000000000000001"
+          },
+          {
+            "_id": "m0000000000000000000000m",
+            "_tpl": "mmmmmag00000000000000001",
+            "parentId": "r0000000000000000000000r",
+            "slotId": "mod_magazine"
+          }
+        ]
+      }
+    }
+  },
+  "templates": {
+    "items": {
+      "ccccbox00000000000000001": {
+        "_id": "ccccbox00000000000000001",
+        "_props": {
+          "Name": "Test crate",
+          "Width": 2,
+          "Height": 2,
+          "Grids": [
+            {
+              "_name": "main",
+              "_props": {
+                "cellsH": 3,
+                "cellsV": 3
+              }
+            }
+          ]
+        }
+      },
+      "aaaaammo0000000000000001": {
+        "_id": "aaaaammo0000000000000001",
+        "_props": {
+          "Name": "Test cartridge",
+          "Width": 1,
+          "Height": 1,
+          "StackMaxSize": 60,
+          "StackMinRandom": 2,
+          "StackMaxRandom": 4,
+          "RarityPvE": "Common"
+        },
+        "_parent": "pppparent000000000000ammo"
+      },
+      "bbbbbox00000000000000002": {
+        "_id": "bbbbbox00000000000000002",
+        "_props": {
+          "Name": "Test ammo box",
+          "Width": 1,
+          "Height": 1,
+          "StackMaxSize": 1,
+          "StackSlots": [
+            {
+              "_name": "cartridges",
+              "_max_count": 100,
+              "_props": {
+                "filters": [
+                  {
+                    "Filter": [
+                      "aaaaammo0000000000000001"
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "_parent": "pppparent000000000000ammo"
+      },
+      "qqqquest0000000000000001": {
+        "_id": "qqqquest0000000000000001",
+        "_props": {
+          "Name": "Test quest item",
+          "Width": 1,
+          "Height": 1,
+          "StackMaxSize": 1
+        }
+      },
+      "wwwwgun00000000000000001": {
+        "_id": "wwwwgun00000000000000001",
+        "_props": {
+          "Name": "Test rifle",
+          "Width": 4,
+          "Height": 2,
+          "StackMaxSize": 1,
+          "RarityPvE": "Superrare"
+        }
+      },
+      "mmmmmag00000000000000001": {
+        "_id": "mmmmmag00000000000000001",
+        "_props": {
+          "Name": "Test magazine",
+          "Width": 1,
+          "Height": 1,
+          "StackMaxSize": 1
+        }
+      },
+      "pppparent000000000000ammo": {
+        "_id": "pppparent000000000000ammo",
+        "_props": {
+          "Name": "Test ammo base class"
+        }
+      }
+    },
+    "handbook": {
+      "Items": [
+        {
+          "Id": "aaaaammo0000000000000001",
+          "ParentId": "hb_ammo",
+          "Price": 100
+        },
+        {
+          "Id": "bbbbbox00000000000000002",
+          "ParentId": "hb_ammo",
+          "Price": 2000
+        },
+        {
+          "Id": "wwwwgun00000000000000001",
+          "ParentId": "hb_guns",
+          "Price": 50000
+        },
+        {
+          "Id": "qqqquest0000000000000001",
+          "ParentId": "hb_quest",
+          "Price": 1
+        }
+      ]
+    }
+  }
+}

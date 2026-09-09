@@ -1,0 +1,26 @@
+{
+  "id": "cult_of_the_reactor",
+  "name": "Cult of the Reactor",
+  "tone": "eerie",
+  "factionCount": 3,
+  "peoplePerFaction": 6,
+  "archetypes": [
+    "cult",
+    "resistance",
+    "hermits"
+  ],
+  "maps": [
+    "Reserve",
+    "Woods",
+    "Interchange"
+  ],
+  "worldPrompt": "Something under the substation is still running. It should not be. Nobody has fed it fuel in three years and it is still audibly, physically running, and you can feel it in your back teeth from four hundred metres away.\n\nThe Choir formed around that sound. They are not raving; that is the disconcerting part. They are courteous, well-organised, they run a clean infirmary, and they will explain their theology to you in complete calm sentences while walking you further inside than you meant to go. They believe the hum is the only thing left that is still deliberate. They want converts, and they are extremely patient about getting them, and the patience has a floor.\n\nAgainst them: people who have had somebody taken. Not soldiers - a mechanic, two nurses, an older brother - badly armed, arguing constantly among themselves, and completely unwilling to stop. They do not want to defeat the Choir. They want eleven named people back, and they have the names written on the inside of a door.\n\nAnd out in the trees, the ones who came back on their own and will not talk about it. They know the tunnels. They will trade what they know for very little, and then ask you to leave.\n\nEverything here is a question of who gets to decide what somebody believes. You will be invited in, sincerely and warmly. You will be asked to help pull somebody out, desperately. Both requests are real, both have a cost, and the Choir does not consider a conversion reversible.",
+  "rules": [
+    "The Choir never opens with violence. It opens with hospitality and an invitation.",
+    "Conversion is a real outcome: sustained contact with the Choir shifts a person's faction.",
+    "The resistance argues in front of you; their disagreements are information.",
+    "Rescues are the central quest form. A rescued person becomes an NPC with memory of it.",
+    "Nobody in the Choir will confirm what the hum is. They deflect warmly and consistently.",
+    "Hermits know the tunnels and will trade that knowledge cheaply, once, then ask you to go."
+  ]
+}

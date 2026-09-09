@@ -1,0 +1,99 @@
+# MEASURED HOST-LOG lines, NOT inspector batches.
+#
+# The leading `_` is load-bearing: `inspectfixtures.lint` requires every OTHER
+# fixture file to carry a batch header, a batch trailer and at least one `>`
+# echo, so that an echo-trap test is always constructible. These entries are
+# single host-log lines and have none of those; they are exempt BY NAME, not by
+# a special case someone can quietly widen.
+#
+# Every OUTPUT block is verbatim from a real capture on 2026-09-01/02. The
+# `client  [t]warn` / `client  [t]ok  ` prefix is the form `aowl`'s stdout
+# capture writes; the host's own aowlspt-host.log writes the same message with
+# a `[t] warn   ` prefix instead. Consumers here match on the MESSAGE, not the
+# prefix, so both forms feed the same parser -- but do not "normalise" these
+# lines to one form, because then they would no longer be evidence of either.
+#
+# Entry format:  === ENTRY <id> / --- SOURCE / --- SHAPE / --- COMMAND /
+#                --- OUTPUT <verbatim ...> / --- END
+# COMMAND on a hostlog entry is the pseudo-command `hostlog <pattern>`: it is
+# what the loader keys on, and it is NOT something the inspector accepts.
+
+=== ENTRY hostlog-batch-abandoned
+--- SOURCE scratchpad bootT.out (aowl stdout capture)
+--- SHAPE the batch WEDGED and was ABANDONED: an answer for it will never
+--- SHAPE arrive, and the reader must not treat the previous batch's text as
+--- SHAPE this batch's answer
+--- COMMAND hostlog ABANDONED
+--- OUTPUT
+client  [0:09:37.922]warnlive inspector: batch 11 ABANDONED after 34s held on Unity's thread (901 rider dispatches since it was claimed, so the thread is alive and this batch is not finishing). It was in command 6 of 6: find MatchmakerOfflineRaidScreen. Abandons this session: 1
+client  [0:09:37.922]ok  inspect| aowlspt live inspector -- batch 11 was ABANDONED after 34s.
+--- END
+
+=== ENTRY hostlog-nativetabs-fault-ceiling
+--- SOURCE scratchpad bootU.out (aowl stdout capture)
+--- SHAPE the native-tabs tick faulted 4 of 4 and switched itself off. THIS IS
+--- SHAPE THE VACUOUS-PASS CASE: nothing was ever added, so the stock geometry
+--- SHAPE could not have moved, and an unchanged-geometry PASS would be a check
+--- SHAPE that cannot fail.
+--- COMMAND hostlog native tabs FAULTED
+--- OUTPUT
+client  [0:02:07.219]warnnative tabs: the native-tabs tick FAULTED and was caught; the game survived. Nothing stock was left changed (fault 1 of 4)
+client  [0:02:07.282]warnnative tabs: the native-tabs tick FAULTED and was caught; the game survived. Nothing stock was left changed (fault 2 of 4)
+client  [0:02:07.344]warnnative tabs: the native-tabs tick FAULTED and was caught; the game survived. Nothing stock was left changed (fault 3 of 4)
+client  [0:02:07.391]warnnative tabs: the native-tabs tick FAULTED and was caught; the game survived. Nothing stock was left changed (fault 4 of 4)
+--- END
+
+=== ENTRY hostlog-nativetabs-never-built
+--- SOURCE scratchpad bootAF.out (aowl stdout capture)
+--- SHAPE the tick is live but has NEVER built: no fault, and no `native tabs
+--- SHAPE VERDICT` line anywhere. Measured 2026-09-02: no capture on this
+--- SHAPE machine contains a VERDICT line at all, so this is the state the
+--- SHAPE check really meets, and it is INCONCLUSIVE, never a pass.
+--- COMMAND hostlog native tabs not building
+--- OUTPUT
+client  [0:00:14.406]ok  native tabs: the tick is LIVE and entered for the first time (flag on, detour bound). From here every frame either builds, or says why it is not building. If you never see this line again and never see a 'not building yet' line, the tick stopped being called.
+client  [0:00:14.406]ok  native tabs: not building yet -- no settings tab is known yet (gModsLastTabPtr is nil). The settingsUiProbe ShowScreen postfix is what learns it, so this clears the moment a settings tab is actually shown.
+client  [0:01:19.375]ok  native tabs: not building yet -- attempting the build now (attempt 1 of 8)
+--- END
+
+=== ENTRY hostlog-menu-epoch-actions
+--- SOURCE scratchpad bootAF.out (aowl stdout capture) -- ONE session, all
+--- SOURCE three migrated features, menu epoch 1
+--- SHAPE the SUCCESS case for uihooks_check.py: exactly one action line per
+--- SHAPE feature for one menu epoch. ONE SESSION ONLY, deliberately. Splicing
+--- SHAPE two runs' lines together gives two actions for one epoch and the
+--- SHAPE check FAILS -- correctly, since that is what per-frame behaviour
+--- SHAPE looks like. (Measured while writing this: the first version of this
+--- SHAPE fixture did exactly that and failed the tool it was meant to
+--- SHAPE certify. The fixture was wrong, not the tool.)
+--- COMMAND hostlog menu epoch
+--- OUTPUT
+client  [0:00:39.719]ok  hide mode button: menu epoch 1 -- one bounded resolve pass (1 this run). Between menu rebuilds this costs one integer compare.
+client  [0:00:39.766]ok  version brand: menu epoch 1 -- one bounded pass. label=RESOLVED, applies so far=1 of at most 8. A clobber happens on a menu rebuild, which is exactly this event.
+client  [0:00:39.766]ok  hide seasons: menu epoch 1 -- one bounded pass from the MenuScreen the Show postfix handed us. seasons banner hides so far=0, mode-button hides so far=0. Event-driven: exactly one pass per menu rebuild.
+--- END
+
+=== ENTRY hostlog-menu-epoch-risky-prose
+--- SOURCE scratchpad bootAC.out (aowl stdout capture) -- one session, the
+--- SOURCE EARLIER wording of the same two action lines
+--- SHAPE THE LINES THAT ONCE FAILED THE CHECK. Both describe what the
+--- SHAPE migration REMOVED -- "No walk, no throttle, no per-frame polling"
+--- SHAPE and "The 120-frame clobber re-check is gone" -- so a banned-idiom
+--- SHAPE regex on `throttle` or `[0-9]+-frame` fires on exactly the evidence
+--- SHAPE that the migration worked. The prose was later softened; this fixture
+--- SHAPE keeps the dangerous wording so the check cannot start depending on
+--- SHAPE the prose staying careful.
+--- COMMAND hostlog menu epoch risky
+--- OUTPUT
+client  [0:00:39.203]ok  version brand: menu epoch 1 -- one bounded pass. label=RESOLVED, applies so far=1 of at most 8. The 120-frame clobber re-check is gone: a clobber happens on a menu rebuild, and that is this event.
+client  [0:00:39.203]ok  hide seasons: menu epoch 1 -- one bounded pass from the MenuScreen the Show postfix handed us. seasons banner hides so far=0, mode-button hides so far=0. No walk, no throttle, no per-frame polling.
+--- END
+
+=== ENTRY hostlog-nativetabs-declined
+--- SOURCE scratchpad bootS.out (aowl stdout capture)
+--- SHAPE the prologue snapshot did not verify, so nothing was patched and the
+--- SHAPE feature declined. Also not a pass.
+--- COMMAND hostlog native tabs declines
+--- OUTPUT
+client  [0:00:00.000]warnnative tabs: UnityEngine.UI.Toggle::Set did not verify against the startup prologue snapshot, so the toggle event cannot be bound and this feature declines. Nothing was patched.
+--- END

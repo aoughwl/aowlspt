@@ -1,0 +1,79 @@
+{
+  "_comment": "AutoRaid's DEFAULT SPAWNED LOADOUT. This file is read ONLY when the mod's `loadoutMode` setting is `spawned`; with the shipped value `current` the mod does nothing at all to your gear and this file is not even opened. When it IS used, every item listed here is CREATED for the raid, the gear the character was wearing is moved to the STASH first (never destroyed), and every created item is stripped from the profile at match end so that none of it can ever reach the stash. See mods/autoraid/README.md for the whole handshake.",
+
+  "_shape": "The keys are mods/tarkov/emu/loadout.nim's, unchanged, so this file is exactly what /aowlspt/tarkov/autoscript/loadout already accepts. Each `gear` entry names ONE of `query` (an item's English name, matched as a case-insensitive SUBSTRING) or `tpl` (a 24-hex template id). `slot` = worn in that equipment slot; `inside` = placed in that worn container's grid; NEITHER = the stash; BOTH = refused by name rather than one of them silently winning.",
+
+  "_ambiguity": "A `query` that matches MORE THAN ONE item is REFUSED, not resolved to the first hit -- emu/spawn.nim's searchItemsCounted counts every match and loadout.nim declines with the list. That is correct behaviour and it is why three entries below carry a `tpl` instead: `5.45x39mm BT gs` also matches three ammo packs, `PACA Soft Armor` also matches the Rivals Edition, `9x18mm PM PS gs PPO` also matches two packs, and `PM 9x18PM 90-93 8-round magazine` exists under TWO template ids. Every query and every id in this file was checked against D:/Aowlspt/aowlspt/db.json on 2026-09-04 with the same matching rule the server uses.",
+
+  "_clear": "`clear` false means the character's existing equipment is left alone by the BUILDER; the move-to-stash step in mods/tarkov is what actually empties the slots, and it refuses with a verdict when it cannot (no stash room, unreadable profile) rather than destroying anything.",
+  "clear": false,
+
+  "gear": [
+    {
+      "_": "Primary: AK-74N with a loaded 6L20 magazine. `AK-74N` is unambiguous (the only item whose name contains it is the rifle); the BT gs round is not, so it is named by id.",
+      "query": "AK-74N",
+      "slot": "FirstPrimaryWeapon",
+      "magazine": "6L20 30-round magazine",
+      "ammo": "56dff061d2720bb5668b4567",
+      "condition": 100
+    },
+    {
+      "_": "Sidearm: Makarov PM with its 8-round magazine. Both the magazine and the round are ambiguous by name, so both are ids.",
+      "query": "Makarov PM 9x18PM pistol",
+      "slot": "Holster",
+      "magazine": "5448c12b4bdc2d02308b456f",
+      "ammo": "57371f2b24597761224311f1",
+      "condition": 100
+    },
+    {
+      "_": "Melee. Every PMC needs the Scabbard filled or the slot reads empty in the raid UI.",
+      "query": "Kiba Arms Tactical Tomahawk",
+      "slot": "Scabbard"
+    },
+    {
+      "_": "Head. ZSh-1-2M is deliberately a cheap, common helmet: a default loadout that hands out end-game armour makes every test meaningless.",
+      "query": "ZSh-1-2M helmet (Olive Drab)",
+      "slot": "Headwear",
+      "condition": 100
+    },
+    {
+      "_": "Body. PACA by ID, because the name also matches the Rivals Edition.",
+      "tpl": "5648a7494bdc2d9d488b4583",
+      "slot": "ArmorVest",
+      "condition": 100
+    },
+    {
+      "_": "Rig. The Scav Vest has six 1x1 cells, which is enough for the meds below and nothing more -- deliberately, so the grid-placement step is actually exercised rather than always succeeding into a huge container.",
+      "query": "Scav Vest",
+      "slot": "TacticalVest"
+    },
+    {
+      "query": "WARTECH Berkut BB-102 backpack (A-TACS FG)",
+      "slot": "Backpack"
+    },
+
+    {
+      "_": "Meds, in the rig. `inside` puts them in that worn container's grid; findSpace refuses rather than overlapping if they do not fit, and the report counts them as `rejected` so a full rig is visible in the verdict instead of silently losing items.",
+      "query": "Salewa first aid kit",
+      "inside": "TacticalVest",
+      "count": 2
+    },
+    {
+      "query": "Aseptic bandage",
+      "inside": "TacticalVest",
+      "count": 2
+    },
+    {
+      "query": "Immobilizing splint",
+      "inside": "Backpack",
+      "count": 1
+    },
+
+    {
+      "_": "Two spare rifle magazines in the BACKPACK rather than the rig, so the rig's six cells are not the constraint on whether the meds land.",
+      "query": "6L20 30-round magazine",
+      "inside": "Backpack",
+      "count": 2
+    }
+  ]
+}

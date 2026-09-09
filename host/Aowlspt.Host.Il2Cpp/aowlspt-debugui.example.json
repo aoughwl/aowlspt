@@ -1,0 +1,26 @@
+{
+  "panelEnabled":    true,
+  "panelAnchor":     "topleft",
+  "panelX":          16,
+  "panelY":          -16,
+  "panelFontSize":   18,
+  "panelLineHeight": 22,
+  "panelThrottle":   10,
+  "panelColor":      "1,1,0.62",
+  "panelFields":     "fps,frame,build,map,raid,bots,pos,rot,botlist",
+
+  "espEnabled":      true,
+  "espFontSize":     14,
+  "espMaxMarkers":   24,
+  "espMaxDistance":  400,
+  "espYOffset":      24,
+  "espColor":        "1,0.35,0.3",
+  "espFields":       "role,nick,dist",
+
+  "toggleKey":       114,
+  "espToggleKey":    0,
+
+  "note1": "",
+  "note2": "",
+  "note3": ""
+}

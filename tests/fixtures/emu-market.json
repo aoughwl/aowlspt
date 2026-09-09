@@ -1,0 +1,181 @@
+{
+  "_comment": "A small database for the flea market, in the shape of tests/fixtures/emu-db.json and a superset of it. It has what a market needs and nothing else: a trader whose assort is priced in a currency (so it becomes an offer) and one that is a barter (so it does not), a handbook with a two-level category tree and prices in it, and a locale with names to search. The stash template is here because a purchase has to land in a real cell.",
+
+  "traders": {
+    "54cb50c76803fa8b248b4571": {
+      "base": {
+        "_id": "54cb50c76803fa8b248b4571",
+        "nickname": "Prapor",
+        "currency": "RUB",
+        "unlockedByDefault": true
+      },
+      "assort": {
+        "items": [
+          {
+            "_id": "aaaaaaaaaaaaaaaaaaaaaaa1",
+            "_tpl": "5644bd2b4bdc2d3b4c8b4572",
+            "parentId": "hideout",
+            "slotId": "hideout",
+            "upd": { "StackObjectsCount": 10 }
+          },
+          {
+            "_id": "aaaaaaaaaaaaaaaaaaaaaaa2",
+            "_tpl": "544fb45d4bdc2dee738b4568",
+            "parentId": "hideout",
+            "slotId": "hideout",
+            "upd": { "StackObjectsCount": 40 }
+          },
+          {
+            "_comment": "A barter. It must NOT become a flea offer: it has no price, and an offer with no price sorts to the top of every cheapest-first search and cannot be paid for with money.",
+            "_id": "aaaaaaaaaaaaaaaaaaaaaaa3",
+            "_tpl": "590c657e86f77412b013051d",
+            "parentId": "hideout",
+            "slotId": "hideout"
+          },
+          {
+            "_comment": "A part of a rifle in the assort, not a separate offer. slotId is not 'hideout', so the generator skips it.",
+            "_id": "aaaaaaaaaaaaaaaaaaaaaaa4",
+            "_tpl": "57ac965c24597706be5f975c",
+            "parentId": "aaaaaaaaaaaaaaaaaaaaaaa1",
+            "slotId": "mod_scope"
+          }
+        ],
+        "barter_scheme": {
+          "aaaaaaaaaaaaaaaaaaaaaaa1": [
+            [{ "_tpl": "5449016a4bdc2d6f028b456f", "count": 25000 }]
+          ],
+          "aaaaaaaaaaaaaaaaaaaaaaa2": [
+            [{ "_tpl": "5449016a4bdc2d6f028b456f", "count": 1200 }]
+          ],
+          "aaaaaaaaaaaaaaaaaaaaaaa3": [
+            [{ "_tpl": "544fb45d4bdc2dee738b4568", "count": 3 }]
+          ]
+        },
+        "loyal_level_items": {
+          "aaaaaaaaaaaaaaaaaaaaaaa1": 2,
+          "aaaaaaaaaaaaaaaaaaaaaaa2": 1,
+          "aaaaaaaaaaaaaaaaaaaaaaa3": 1
+        }
+      }
+    },
+    "5ac3b934156ae10c4430e83c": {
+      "base": {
+        "_id": "5ac3b934156ae10c4430e83c",
+        "nickname": "Ragman",
+        "currency": "USD",
+        "unlockedByDefault": true
+      },
+      "assort": {
+        "items": [
+          {
+            "_id": "bbbbbbbbbbbbbbbbbbbbbbb1",
+            "_tpl": "5648a7494bdc2d9d488b4583",
+            "parentId": "hideout",
+            "slotId": "hideout"
+          }
+        ],
+        "barter_scheme": {
+          "bbbbbbbbbbbbbbbbbbbbbbb1": [
+            [{ "_tpl": "5696686a4bdc2da3298b456a", "count": 180 }]
+          ]
+        },
+        "loyal_level_items": { "bbbbbbbbbbbbbbbbbbbbbbb1": 1 }
+      }
+    }
+  },
+
+  "templates": {
+    "items": {
+      "5449016a4bdc2d6f028b456f": {
+        "_id": "5449016a4bdc2d6f028b456f",
+        "_props": { "Name": "Roubles", "Width": 1, "Height": 1, "StackMaxSize": 500000 }
+      },
+      "5696686a4bdc2da3298b456a": {
+        "_id": "5696686a4bdc2da3298b456a",
+        "_props": { "Name": "Dollars", "Width": 1, "Height": 1, "StackMaxSize": 50000 }
+      },
+      "5644bd2b4bdc2d3b4c8b4572": {
+        "_id": "5644bd2b4bdc2d3b4c8b4572",
+        "_props": { "Name": "AK-74N", "Width": 4, "Height": 2, "StackMaxSize": 1 }
+      },
+      "544fb45d4bdc2dee738b4568": {
+        "_id": "544fb45d4bdc2dee738b4568",
+        "_props": { "Name": "Salewa", "Width": 1, "Height": 2, "StackMaxSize": 1 }
+      },
+      "590c657e86f77412b013051d": {
+        "_id": "590c657e86f77412b013051d",
+        "_props": { "Name": "Grizzly", "Width": 2, "Height": 2, "StackMaxSize": 1 }
+      },
+      "57ac965c24597706be5f975c": {
+        "_id": "57ac965c24597706be5f975c",
+        "_props": { "Name": "PSO-1", "Width": 2, "Height": 1, "StackMaxSize": 1 }
+      },
+      "5648a7494bdc2d9d488b4583": {
+        "_id": "5648a7494bdc2d9d488b4583",
+        "_props": { "Name": "6B47", "Width": 2, "Height": 2, "StackMaxSize": 1 }
+      },
+      "5710c24ad2720bc3458b45a3": {
+        "_id": "5710c24ad2720bc3458b45a3",
+        "_props": { "Name": "Bolts", "Width": 1, "Height": 1, "StackMaxSize": 30 }
+      },
+      "5811ce572459770cba1a34ea": {
+        "_id": "5811ce572459770cba1a34ea",
+        "_props": {
+          "Name": "Stash 10x68",
+          "Grids": [{ "_props": { "cellsH": 10, "cellsV": 68 } }]
+        }
+      }
+    },
+
+    "handbook": {
+      "_comment": "Two levels deep, so a search for the parent category has to walk the tree to find the offers under it. Matching only the exact id gives a tree whose branches are all empty.",
+      "Categories": [
+        { "Id": "5b5f78dc86f77409407a7f8e", "ParentId": null, "Icon": "", "Color": "", "Order": "0" },
+        { "Id": "5b5f78b786f77447ed5636b1", "ParentId": "5b5f78dc86f77409407a7f8e", "Icon": "", "Color": "", "Order": "1" },
+        { "Id": "5b47574386f77428ca22b33e", "ParentId": null, "Icon": "", "Color": "", "Order": "2" },
+        { "Id": "5b47574386f77428ca22b340", "ParentId": "5b47574386f77428ca22b33e", "Icon": "", "Color": "", "Order": "3" },
+        { "Id": "5b5f701386f774093f2ecf0f", "ParentId": null, "Icon": "", "Color": "", "Order": "4" }
+      ],
+      "Items": [
+        { "Id": "5644bd2b4bdc2d3b4c8b4572", "ParentId": "5b5f78b786f77447ed5636b1", "Price": 22000 },
+        { "Id": "57ac965c24597706be5f975c", "ParentId": "5b5f78b786f77447ed5636b1", "Price": 9500 },
+        { "Id": "544fb45d4bdc2dee738b4568", "ParentId": "5b47574386f77428ca22b340", "Price": 1100 },
+        { "Id": "590c657e86f77412b013051d", "ParentId": "5b47574386f77428ca22b340", "Price": 24000 },
+        { "Id": "5648a7494bdc2d9d488b4583", "ParentId": "5b5f701386f774093f2ecf0f", "Price": 18000 },
+        { "Id": "5710c24ad2720bc3458b45a3", "ParentId": "5b5f701386f774093f2ecf0f", "Price": 350 },
+        {
+          "_comment": "Currency is in the real handbook too. An offer selling roubles for roubles matches every search and is skipped by the generator.",
+          "Id": "5449016a4bdc2d6f028b456f", "ParentId": "5b5f701386f774093f2ecf0f", "Price": 1
+        },
+        {
+          "_comment": "Priced at zero: no offer, and no sale to a trader either. 'I do not know what this is worth' is a different answer from 'it is worth nothing'.",
+          "Id": "5648a7494bdc2d9d488b4584", "ParentId": "5b5f701386f774093f2ecf0f", "Price": 0
+        }
+      ]
+    }
+  },
+
+  "locales": {
+    "global": {
+      "en": {
+        "5644bd2b4bdc2d3b4c8b4572 Name": "AK-74N 5.45x39 assault rifle",
+        "544fb45d4bdc2dee738b4568 Name": "Salewa first aid kit",
+        "590c657e86f77412b013051d Name": "Grizzly first aid kit",
+        "57ac965c24597706be5f975c Name": "PSO-1 4x24 scope",
+        "5648a7494bdc2d9d488b4583 Name": "6B47 helmet",
+        "5710c24ad2720bc3458b45a3 Name": "Bolts"
+      }
+    },
+    "menu": { "en": { "MainMenu": "Main menu" } }
+  },
+
+  "hideout": {
+    "areas": [
+      {
+        "type": 3,
+        "enabled": true,
+        "stages": { "1": { "constructionTime": 0, "requirements": [] } }
+      }
+    ]
+  }
+}

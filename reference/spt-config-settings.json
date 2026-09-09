@@ -1,0 +1,4119 @@
+{
+  "source": "reference/spt-4.1-surface.json (SPT 4.1 server)",
+  "note": "The full SPT server config surface. Every scalar is a declared setting; nested objects/lists are listed under `nested` for completeness. All implemented=false until aowlspt grows a backing feature (see tools/genspt_settings.py IMPLEMENTED).",
+  "configFiles": 28,
+  "settingCount": 323,
+  "nestedCount": 197,
+  "pages": [
+    {
+      "id": "spt.airdrop",
+      "label": "SPT / airdrop",
+      "configFile": "configs/airdrop.json",
+      "className": "AirdropConfig",
+      "settings": [],
+      "nested": [
+        {
+          "key": "spt.airdrop.CustomAirdropMapping",
+          "label": "CustomAirdropMapping",
+          "type": "Dictionary<MongoId, SptAirdropTypeEnum>",
+          "implemented": false
+        },
+        {
+          "key": "spt.airdrop.AirdropTypeWeightings",
+          "label": "AirdropTypeWeightings",
+          "type": "Dictionary<SptAirdropTypeEnum, Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.airdrop.Loot",
+          "label": "Loot",
+          "type": "Dictionary<String, AirdropLoot>",
+          "implemented": false
+        }
+      ]
+    },
+    {
+      "id": "spt.backup",
+      "label": "SPT / backup",
+      "configFile": "configs/backup.json",
+      "className": "BackupConfig",
+      "settings": [
+        {
+          "key": "spt.backup.BackupInterval.Enabled",
+          "label": "Enabled",
+          "type": "bool",
+          "implemented": false,
+          "category": "BackupConfig / BackupInterval",
+          "description": "SPT backup.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.backup.BackupInterval.IntervalMinutes",
+          "label": "IntervalMinutes",
+          "type": "int",
+          "implemented": false,
+          "category": "BackupConfig / BackupInterval",
+          "description": "SPT backup.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.backup.Enabled",
+          "label": "Enabled",
+          "type": "bool",
+          "implemented": false,
+          "category": "BackupConfig",
+          "description": "SPT backup.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.backup.BackupCooldown",
+          "label": "BackupCooldown",
+          "type": "int",
+          "implemented": false,
+          "category": "BackupConfig",
+          "description": "SPT backup.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.backup.MaxBackups",
+          "label": "MaxBackups",
+          "type": "int",
+          "implemented": false,
+          "category": "BackupConfig",
+          "description": "SPT backup.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.backup.Directory",
+          "label": "Directory",
+          "type": "string",
+          "implemented": false,
+          "category": "BackupConfig",
+          "description": "SPT backup.json value \u2014 not implemented in aowlspt yet."
+        }
+      ],
+      "nested": []
+    },
+    {
+      "id": "spt.bot",
+      "label": "SPT / bot",
+      "configFile": "configs/bot.json",
+      "className": "BotConfig",
+      "settings": [
+        {
+          "key": "spt.bot.ShowTypeInNickname",
+          "label": "ShowTypeInNickname",
+          "type": "bool",
+          "implemented": false,
+          "category": "BotConfig",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.Durability.Default.Armor.MaxDelta",
+          "label": "MaxDelta",
+          "type": "int",
+          "implemented": false,
+          "category": "BotConfig / Durability / Default / Armor",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.Durability.Default.Armor.MinDelta",
+          "label": "MinDelta",
+          "type": "int",
+          "implemented": false,
+          "category": "BotConfig / Durability / Default / Armor",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.Durability.Default.Armor.MinLimitPercent",
+          "label": "MinLimitPercent",
+          "type": "int",
+          "implemented": false,
+          "category": "BotConfig / Durability / Default / Armor",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.Durability.Default.Armor.HighestMaxPercent",
+          "label": "HighestMaxPercent",
+          "type": "int",
+          "implemented": false,
+          "category": "BotConfig / Durability / Default / Armor",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.Durability.Default.Armor.LowestMaxPercent",
+          "label": "LowestMaxPercent",
+          "type": "int",
+          "implemented": false,
+          "category": "BotConfig / Durability / Default / Armor",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.Durability.Default.Weapon.MinLimitPercent",
+          "label": "MinLimitPercent",
+          "type": "float",
+          "implemented": false,
+          "category": "BotConfig / Durability / Default / Weapon",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.Durability.Default.Weapon.HighestMax",
+          "label": "HighestMax",
+          "type": "int",
+          "implemented": false,
+          "category": "BotConfig / Durability / Default / Weapon",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.Durability.Default.Weapon.LowestMax",
+          "label": "LowestMax",
+          "type": "int",
+          "implemented": false,
+          "category": "BotConfig / Durability / Default / Weapon",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.Durability.Default.Weapon.MaxDelta",
+          "label": "MaxDelta",
+          "type": "int",
+          "implemented": false,
+          "category": "BotConfig / Durability / Default / Weapon",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.Durability.Default.Weapon.MinDelta",
+          "label": "MinDelta",
+          "type": "int",
+          "implemented": false,
+          "category": "BotConfig / Durability / Default / Weapon",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.Durability.Pmc.Armor.HighestMaxPercent",
+          "label": "HighestMaxPercent",
+          "type": "int",
+          "implemented": false,
+          "category": "BotConfig / Durability / Pmc / Armor",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.Durability.Pmc.Armor.LowestMaxPercent",
+          "label": "LowestMaxPercent",
+          "type": "int",
+          "implemented": false,
+          "category": "BotConfig / Durability / Pmc / Armor",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.Durability.Pmc.Armor.MaxDelta",
+          "label": "MaxDelta",
+          "type": "int",
+          "implemented": false,
+          "category": "BotConfig / Durability / Pmc / Armor",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.Durability.Pmc.Armor.MinDelta",
+          "label": "MinDelta",
+          "type": "int",
+          "implemented": false,
+          "category": "BotConfig / Durability / Pmc / Armor",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.Durability.Pmc.Armor.MinLimitPercent",
+          "label": "MinLimitPercent",
+          "type": "int",
+          "implemented": false,
+          "category": "BotConfig / Durability / Pmc / Armor",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.Durability.Pmc.Weapon.MinLimitPercent",
+          "label": "MinLimitPercent",
+          "type": "float",
+          "implemented": false,
+          "category": "BotConfig / Durability / Pmc / Weapon",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.Durability.Pmc.Weapon.HighestMax",
+          "label": "HighestMax",
+          "type": "int",
+          "implemented": false,
+          "category": "BotConfig / Durability / Pmc / Weapon",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.Durability.Pmc.Weapon.LowestMax",
+          "label": "LowestMax",
+          "type": "int",
+          "implemented": false,
+          "category": "BotConfig / Durability / Pmc / Weapon",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.Durability.Pmc.Weapon.MaxDelta",
+          "label": "MaxDelta",
+          "type": "int",
+          "implemented": false,
+          "category": "BotConfig / Durability / Pmc / Weapon",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.Durability.Pmc.Weapon.MinDelta",
+          "label": "MinDelta",
+          "type": "int",
+          "implemented": false,
+          "category": "BotConfig / Durability / Pmc / Weapon",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.GoonSpawnSystem.Enabled",
+          "label": "Enabled",
+          "type": "bool",
+          "implemented": false,
+          "category": "BotConfig / GoonSpawnSystem",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.GoonSpawnSystem.SpawnChance",
+          "label": "SpawnChance",
+          "type": "float",
+          "implemented": false,
+          "category": "BotConfig / GoonSpawnSystem",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.GoonSpawnSystem.RotationIntervalHours",
+          "label": "RotationIntervalHours",
+          "type": "int",
+          "implemented": false,
+          "category": "BotConfig / GoonSpawnSystem",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.BotNameLengthLimit",
+          "label": "BotNameLengthLimit",
+          "type": "int",
+          "implemented": false,
+          "category": "BotConfig",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.ChanceAssaultScavHasPlayerScavName",
+          "label": "ChanceAssaultScavHasPlayerScavName",
+          "type": "int",
+          "implemented": false,
+          "category": "BotConfig",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.SecureContainerAmmoStackCount",
+          "label": "SecureContainerAmmoStackCount",
+          "type": "int",
+          "implemented": false,
+          "category": "BotConfig",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.WalletLoot.ChancePercent",
+          "label": "ChancePercent",
+          "type": "float",
+          "implemented": false,
+          "category": "BotConfig / WalletLoot",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.WeeklyBoss.Enabled",
+          "label": "Enabled",
+          "type": "bool",
+          "implemented": false,
+          "category": "BotConfig / WeeklyBoss",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.bot.ReplaceScavWith",
+          "label": "ReplaceScavWith",
+          "type": "enum",
+          "options": [
+            "arenaFighter",
+            "arenaFighterEvent",
+            "assault",
+            "assaultGroup",
+            "bossBoar",
+            "bossBoarSniper",
+            "bossBully",
+            "bossGluhar",
+            "bossKilla",
+            "bossKillaAgro",
+            "bossKnight",
+            "bossKojaniy",
+            "bossKolontay",
+            "bossPartisan",
+            "bossSanitar",
+            "bossTagilla",
+            "bossTagillaAgro",
+            "bossTest",
+            "bossZryachiy",
+            "crazyAssaultEvent",
+            "cursedAssault",
+            "exUsec",
+            "followerBigPipe",
+            "followerBirdEye",
+            "followerBoar",
+            "followerBoarClose1",
+            "followerBoarClose2",
+            "followerBully",
+            "followerGluharAssault",
+            "followerGluharScout",
+            "followerGluharSecurity",
+            "followerGluharSnipe",
+            "followerKojaniy",
+            "followerKolontayAssault",
+            "followerKolontaySecurity",
+            "followerSanitar",
+            "followerTagilla",
+            "followerTest",
+            "followerZryachiy",
+            "gifter",
+            "infectedAssault",
+            "infectedCivil",
+            "infectedLaborant",
+            "infectedPmc",
+            "infectedTagilla",
+            "marksman",
+            "peacefullZryachiyEvent",
+            "peacemaker",
+            "pmcBEAR",
+            "pmcBot",
+            "pmcUSEC",
+            "ravangeZryachiyEvent",
+            "sectactPriestEvent",
+            "sectantOni",
+            "sectantPredvestnik",
+            "sectantPriest",
+            "sectantPrizrak",
+            "sectantWarrior",
+            "shooterBTR",
+            "skier",
+            "spiritSpring",
+            "spiritWinter",
+            "tagillaHelperAgro",
+            "test"
+          ],
+          "implemented": false,
+          "category": "BotConfig",
+          "description": "SPT bot.json value \u2014 not implemented in aowlspt yet."
+        }
+      ],
+      "nested": [
+        {
+          "key": "spt.bot.Durability.BotDurabilities",
+          "label": "BotDurabilities",
+          "type": "Dictionary<String, DefaultDurability>",
+          "implemented": false
+        },
+        {
+          "key": "spt.bot.ItemSpawnLimits",
+          "label": "ItemSpawnLimits",
+          "type": "Dictionary<String, Dictionary<MongoId, Double>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.bot.CurrencyStackSize",
+          "label": "CurrencyStackSize",
+          "type": "Dictionary<String, Dictionary<String, Dictionary<String, Double>>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.bot.AssaultBrainType",
+          "label": "AssaultBrainType",
+          "type": "Dictionary<String, Dictionary<String, Int32>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.bot.PlayerScavBrainType",
+          "label": "PlayerScavBrainType",
+          "type": "Dictionary<String, Dictionary<String, Int32>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.bot.Equipment",
+          "label": "Equipment",
+          "type": "Dictionary<String, EquipmentFilters>",
+          "implemented": false
+        },
+        {
+          "key": "spt.bot.MaxBotCap",
+          "label": "MaxBotCap",
+          "type": "Dictionary<String, Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.bot.PresetBatch",
+          "label": "PresetBatch",
+          "type": "Dictionary<String, Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.bot.LootItemResourceRandomization",
+          "label": "LootItemResourceRandomization",
+          "type": "Dictionary<String, RandomisedResourceDetails>",
+          "implemented": false
+        },
+        {
+          "key": "spt.bot.GoonSpawnSystem.LocationPool",
+          "label": "LocationPool",
+          "type": "IEnumerable<String>",
+          "implemented": false
+        },
+        {
+          "key": "spt.bot.LowProfileGasBlockTpls",
+          "label": "LowProfileGasBlockTpls",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.bot.BotRolesThatMustHaveUniqueName",
+          "label": "BotRolesThatMustHaveUniqueName",
+          "type": "HashSet<String>",
+          "implemented": false
+        },
+        {
+          "key": "spt.bot.BotRolesWithDogTags",
+          "label": "BotRolesWithDogTags",
+          "type": "HashSet<String>",
+          "implemented": false
+        },
+        {
+          "key": "spt.bot.DisableLootOnBotTypes",
+          "label": "DisableLootOnBotTypes",
+          "type": "HashSet<String>",
+          "implemented": false
+        },
+        {
+          "key": "spt.bot.Bosses",
+          "label": "Bosses",
+          "type": "List<String>",
+          "implemented": false
+        },
+        {
+          "key": "spt.bot.WalletLoot.CurrencyWeight",
+          "label": "CurrencyWeight",
+          "type": "Dictionary<MongoId, Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.bot.WalletLoot.StackSizeWeight",
+          "label": "StackSizeWeight",
+          "type": "Dictionary<String, Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.bot.WalletLoot.WalletTplPool",
+          "label": "WalletTplPool",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.bot.WalletLoot.ItemCount",
+          "label": "ItemCount",
+          "type": "MinMax<Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.bot.WeeklyBoss.ResetDay",
+          "label": "ResetDay",
+          "type": "DayOfWeek",
+          "implemented": false
+        },
+        {
+          "key": "spt.bot.WeeklyBoss.BossPool",
+          "label": "BossPool",
+          "type": "List<WildSpawnType>",
+          "implemented": false
+        }
+      ]
+    },
+    {
+      "id": "spt.btr",
+      "label": "SPT / btr",
+      "configFile": "configs/btr.json",
+      "className": "BtrDeliveryConfig",
+      "settings": [
+        {
+          "key": "spt.btr.ReturnTimeOverrideSeconds",
+          "label": "ReturnTimeOverrideSeconds",
+          "type": "float",
+          "implemented": false,
+          "category": "BtrDeliveryConfig",
+          "description": "SPT btr.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.btr.RunIntervalSeconds",
+          "label": "RunIntervalSeconds",
+          "type": "float",
+          "implemented": false,
+          "category": "BtrDeliveryConfig",
+          "description": "SPT btr.json value \u2014 not implemented in aowlspt yet."
+        }
+      ],
+      "nested": []
+    },
+    {
+      "id": "spt.core",
+      "label": "SPT / core",
+      "configFile": "configs/core.json",
+      "className": "CoreConfig",
+      "settings": [
+        {
+          "key": "spt.core.AllowProfileWipe",
+          "label": "AllowProfileWipe",
+          "type": "bool",
+          "implemented": false,
+          "category": "CoreConfig",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.BsgLogging.SendToServer",
+          "label": "SendToServer",
+          "type": "bool",
+          "implemented": false,
+          "category": "CoreConfig / BsgLogging",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.BsgLogging.Verbosity",
+          "label": "Verbosity",
+          "type": "int",
+          "implemented": false,
+          "category": "CoreConfig / BsgLogging",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Fixes.FixProfileBreakingInventoryItemIssues",
+          "label": "FixProfileBreakingInventoryItemIssues",
+          "type": "bool",
+          "implemented": false,
+          "category": "CoreConfig / Fixes",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Fixes.FixShotgunDispersion",
+          "label": "FixShotgunDispersion",
+          "type": "bool",
+          "implemented": false,
+          "category": "CoreConfig / Fixes",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Fixes.RemoveInvalidTradersFromProfile",
+          "label": "RemoveInvalidTradersFromProfile",
+          "type": "bool",
+          "implemented": false,
+          "category": "CoreConfig / Fixes",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Fixes.RemoveModItemsFromProfile",
+          "label": "RemoveModItemsFromProfile",
+          "type": "bool",
+          "implemented": false,
+          "category": "CoreConfig / Fixes",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Fixes.RenamePreRaidLocales",
+          "label": "RenamePreRaidLocales",
+          "type": "bool",
+          "implemented": false,
+          "category": "CoreConfig / Fixes",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.ProfileSaveIntervalInSeconds",
+          "label": "ProfileSaveIntervalInSeconds",
+          "type": "int",
+          "implemented": false,
+          "category": "CoreConfig",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.ServerStartTime",
+          "label": "ServerStartTime",
+          "type": "int",
+          "implemented": false,
+          "category": "CoreConfig",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Release.IsModded",
+          "label": "IsModded",
+          "type": "bool",
+          "implemented": false,
+          "category": "CoreConfig / Release",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Release.BetaDisclaimerTimeoutDelay",
+          "label": "BetaDisclaimerTimeoutDelay",
+          "type": "int",
+          "implemented": false,
+          "category": "CoreConfig / Release",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Release.IsBeta",
+          "label": "IsBeta",
+          "type": "bool",
+          "implemented": false,
+          "category": "CoreConfig / Release",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Release.IsModdable",
+          "label": "IsModdable",
+          "type": "bool",
+          "implemented": false,
+          "category": "CoreConfig / Release",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Release.BetaDisclaimerAcceptText",
+          "label": "BetaDisclaimerAcceptText",
+          "type": "string",
+          "implemented": false,
+          "category": "CoreConfig / Release",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Release.BetaDisclaimerText",
+          "label": "BetaDisclaimerText",
+          "type": "string",
+          "implemented": false,
+          "category": "CoreConfig / Release",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Release.ClientModsLoadedDebugText",
+          "label": "ClientModsLoadedDebugText",
+          "type": "string",
+          "implemented": false,
+          "category": "CoreConfig / Release",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Release.ClientModsLoadedText",
+          "label": "ClientModsLoadedText",
+          "type": "string",
+          "implemented": false,
+          "category": "CoreConfig / Release",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Release.IllegalPluginsExceptionText",
+          "label": "IllegalPluginsExceptionText",
+          "type": "string",
+          "implemented": false,
+          "category": "CoreConfig / Release",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Release.IllegalPluginsLoadedText",
+          "label": "IllegalPluginsLoadedText",
+          "type": "string",
+          "implemented": false,
+          "category": "CoreConfig / Release",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Release.ReleaseSummaryText",
+          "label": "ReleaseSummaryText",
+          "type": "string",
+          "implemented": false,
+          "category": "CoreConfig / Release",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Release.ServerModsLoadedDebugText",
+          "label": "ServerModsLoadedDebugText",
+          "type": "string",
+          "implemented": false,
+          "category": "CoreConfig / Release",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Release.ServerModsLoadedText",
+          "label": "ServerModsLoadedText",
+          "type": "string",
+          "implemented": false,
+          "category": "CoreConfig / Release",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Features.CompressProfile",
+          "label": "CompressProfile",
+          "type": "bool",
+          "implemented": false,
+          "category": "CoreConfig / Features",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Features.ChatbotFeatures.SptFriendGiftsEnabled",
+          "label": "SptFriendGiftsEnabled",
+          "type": "bool",
+          "implemented": false,
+          "category": "CoreConfig / Features / ChatbotFeatures",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Features.ChatbotFeatures.CommandoFeatures.GiveCommandEnabled",
+          "label": "GiveCommandEnabled",
+          "type": "bool",
+          "implemented": false,
+          "category": "CoreConfig / Features / ChatbotFeatures / CommandoFeatures",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.CompatibleTarkovVersion",
+          "label": "CompatibleTarkovVersion",
+          "type": "string",
+          "implemented": false,
+          "category": "CoreConfig",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.ProjectName",
+          "label": "ProjectName",
+          "type": "string",
+          "implemented": false,
+          "category": "CoreConfig",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.ServerName",
+          "label": "ServerName",
+          "type": "string",
+          "implemented": false,
+          "category": "CoreConfig",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.SptFriendNickname",
+          "label": "SptFriendNickname",
+          "type": "string",
+          "implemented": false,
+          "category": "CoreConfig",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Survey.Survey.FarewellPageData.TextLocaleKey",
+          "label": "TextLocaleKey",
+          "type": "string",
+          "implemented": false,
+          "category": "CoreConfig / Survey / Survey / FarewellPageData",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Survey.Survey.IsNew",
+          "label": "IsNew",
+          "type": "bool",
+          "implemented": false,
+          "category": "CoreConfig / Survey / Survey",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Survey.Survey.Id",
+          "label": "Id",
+          "type": "int",
+          "implemented": false,
+          "category": "CoreConfig / Survey / Survey",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Survey.Survey.WelcomePageData.DescriptionLocaleKey",
+          "label": "DescriptionLocaleKey",
+          "type": "string",
+          "implemented": false,
+          "category": "CoreConfig / Survey / Survey / WelcomePageData",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Survey.Survey.WelcomePageData.TimeLocaleKey",
+          "label": "TimeLocaleKey",
+          "type": "string",
+          "implemented": false,
+          "category": "CoreConfig / Survey / Survey / WelcomePageData",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.core.Survey.Survey.WelcomePageData.TitleLocaleKey",
+          "label": "TitleLocaleKey",
+          "type": "string",
+          "implemented": false,
+          "category": "CoreConfig / Survey / Survey / WelcomePageData",
+          "description": "SPT core.json value \u2014 not implemented in aowlspt yet."
+        }
+      ],
+      "nested": [
+        {
+          "key": "spt.core.Fixes.ShotgunIdsToFix",
+          "label": "ShotgunIdsToFix",
+          "type": "IEnumerable<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.core.CustomWatermarkLocaleKeys",
+          "label": "CustomWatermarkLocaleKeys",
+          "type": "List<String>",
+          "implemented": false
+        },
+        {
+          "key": "spt.core.Features.ChatbotFeatures.EnabledBots",
+          "label": "EnabledBots",
+          "type": "Dictionary<MongoId, Boolean>",
+          "implemented": false
+        },
+        {
+          "key": "spt.core.Features.ChatbotFeatures.Aids",
+          "label": "Aids",
+          "type": "Dictionary<String, Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.core.Features.ChatbotFeatures.Ids",
+          "label": "Ids",
+          "type": "Dictionary<String, MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.core.Features.ChatbotFeatures.CommandUseLimits",
+          "label": "CommandUseLimits",
+          "type": "Dictionary<String, Nullable<Int32>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.core.Features.AchievementProfileIdBlacklist",
+          "label": "AchievementProfileIdBlacklist",
+          "type": "HashSet<String>",
+          "implemented": false
+        },
+        {
+          "key": "spt.core.Features.CreateNewProfileTypesBlacklist",
+          "label": "CreateNewProfileTypesBlacklist",
+          "type": "HashSet<String>",
+          "implemented": false
+        },
+        {
+          "key": "spt.core.Survey.Locale",
+          "label": "Locale",
+          "type": "Dictionary<String, Dictionary<String, String>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.core.Survey.Survey.Pages",
+          "label": "Pages",
+          "type": "List<List<Int32>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.core.Survey.Survey.Questions",
+          "label": "Questions",
+          "type": "List<SurveyQuestion>",
+          "implemented": false
+        }
+      ]
+    },
+    {
+      "id": "spt.gifts",
+      "label": "SPT / gifts",
+      "configFile": "configs/gifts.json",
+      "className": "GiftsConfig",
+      "settings": [],
+      "nested": [
+        {
+          "key": "spt.gifts.Gifts",
+          "label": "Gifts",
+          "type": "Dictionary<String, Gift>",
+          "implemented": false
+        }
+      ]
+    },
+    {
+      "id": "spt.health",
+      "label": "SPT / health",
+      "configFile": "configs/health.json",
+      "className": "HealthConfig",
+      "settings": [
+        {
+          "key": "spt.health.HealthMultipliers.Blacked",
+          "label": "Blacked",
+          "type": "float",
+          "implemented": false,
+          "category": "HealthConfig / HealthMultipliers",
+          "description": "SPT health.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.health.HealthMultipliers.Death",
+          "label": "Death",
+          "type": "float",
+          "implemented": false,
+          "category": "HealthConfig / HealthMultipliers",
+          "description": "SPT health.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.health.Save.Health",
+          "label": "Health",
+          "type": "bool",
+          "implemented": false,
+          "category": "HealthConfig / Save",
+          "description": "SPT health.json value \u2014 not implemented in aowlspt yet."
+        }
+      ],
+      "nested": []
+    },
+    {
+      "id": "spt.hideout",
+      "label": "SPT / hideout",
+      "configFile": "configs/hideout.json",
+      "className": "HideoutConfig",
+      "settings": [
+        {
+          "key": "spt.hideout.CultistCircle.BonusChanceMultiplier",
+          "label": "BonusChanceMultiplier",
+          "type": "float",
+          "implemented": false,
+          "category": "HideoutConfig / CultistCircle",
+          "description": "SPT hideout.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.hideout.CultistCircle.CraftTimeOverride",
+          "label": "CraftTimeOverride",
+          "type": "int",
+          "implemented": false,
+          "category": "HideoutConfig / CultistCircle",
+          "description": "SPT hideout.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.hideout.CultistCircle.HideoutCraftSacrificeThresholdRub",
+          "label": "HideoutCraftSacrificeThresholdRub",
+          "type": "int",
+          "implemented": false,
+          "category": "HideoutConfig / CultistCircle",
+          "description": "SPT hideout.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.hideout.CultistCircle.HideoutTaskRewardTimeSeconds",
+          "label": "HideoutTaskRewardTimeSeconds",
+          "type": "int",
+          "implemented": false,
+          "category": "HideoutConfig / CultistCircle",
+          "description": "SPT hideout.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.hideout.CultistCircle.HighValueThresholdRub",
+          "label": "HighValueThresholdRub",
+          "type": "int",
+          "implemented": false,
+          "category": "HideoutConfig / CultistCircle",
+          "description": "SPT hideout.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.hideout.CultistCircle.MaxAttemptsToPickRewardsWithinBudget",
+          "label": "MaxAttemptsToPickRewardsWithinBudget",
+          "type": "int",
+          "implemented": false,
+          "category": "HideoutConfig / CultistCircle",
+          "description": "SPT hideout.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.hideout.CultistCircle.MaxRewardItemCount",
+          "label": "MaxRewardItemCount",
+          "type": "int",
+          "implemented": false,
+          "category": "HideoutConfig / CultistCircle",
+          "description": "SPT hideout.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.hideout.CraftingExpAmount",
+          "label": "CraftingExpAmount",
+          "type": "float",
+          "implemented": false,
+          "category": "HideoutConfig",
+          "description": "SPT hideout.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.hideout.CraftingExpForHoursOfCrafting",
+          "label": "CraftingExpForHoursOfCrafting",
+          "type": "float",
+          "implemented": false,
+          "category": "HideoutConfig",
+          "description": "SPT hideout.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.hideout.HoursForSkillCrafting",
+          "label": "HoursForSkillCrafting",
+          "type": "int",
+          "implemented": false,
+          "category": "HideoutConfig",
+          "description": "SPT hideout.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.hideout.OverrideBuildTimeSeconds",
+          "label": "OverrideBuildTimeSeconds",
+          "type": "int",
+          "implemented": false,
+          "category": "HideoutConfig",
+          "description": "SPT hideout.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.hideout.OverrideCraftTimeSeconds",
+          "label": "OverrideCraftTimeSeconds",
+          "type": "int",
+          "implemented": false,
+          "category": "HideoutConfig",
+          "description": "SPT hideout.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.hideout.RunIntervalSeconds",
+          "label": "RunIntervalSeconds",
+          "type": "int",
+          "implemented": false,
+          "category": "HideoutConfig",
+          "description": "SPT hideout.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.hideout.UpdateProfileHideoutWhenActiveWithinMinutes",
+          "label": "UpdateProfileHideoutWhenActiveWithinMinutes",
+          "type": "int",
+          "implemented": false,
+          "category": "HideoutConfig",
+          "description": "SPT hideout.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.hideout.RunIntervalValues.InRaid",
+          "label": "InRaid",
+          "type": "int",
+          "implemented": false,
+          "category": "HideoutConfig / RunIntervalValues",
+          "description": "SPT hideout.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.hideout.RunIntervalValues.OutOfRaid",
+          "label": "OutOfRaid",
+          "type": "int",
+          "implemented": false,
+          "category": "HideoutConfig / RunIntervalValues",
+          "description": "SPT hideout.json value \u2014 not implemented in aowlspt yet."
+        }
+      ],
+      "nested": [
+        {
+          "key": "spt.hideout.CultistCircle.CurrencyRewards",
+          "label": "CurrencyRewards",
+          "type": "Dictionary<MongoId, MinMax<Int32>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.hideout.CultistCircle.DirectRewardStackSize",
+          "label": "DirectRewardStackSize",
+          "type": "Dictionary<String, MinMax<Int32>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.hideout.CultistCircle.CraftTimeThresholds",
+          "label": "CraftTimeThresholds",
+          "type": "List<CraftTimeThreshold>",
+          "implemented": false
+        },
+        {
+          "key": "spt.hideout.CultistCircle.DirectRewards",
+          "label": "DirectRewards",
+          "type": "List<DirectRewardSettings>",
+          "implemented": false
+        },
+        {
+          "key": "spt.hideout.CultistCircle.AdditionalRewardItemPool",
+          "label": "AdditionalRewardItemPool",
+          "type": "List<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.hideout.CultistCircle.RewardItemBlacklist",
+          "label": "RewardItemBlacklist",
+          "type": "List<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.hideout.CultistCircle.RewardPriceMultiplierMinMax",
+          "label": "RewardPriceMultiplierMinMax",
+          "type": "MinMax<Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.hideout.HideoutLootCrateCraftIdsToUnlockInHideout",
+          "label": "HideoutLootCrateCraftIdsToUnlockInHideout",
+          "type": "IEnumerable<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.hideout.HideoutCraftsToAdd",
+          "label": "HideoutCraftsToAdd",
+          "type": "List<HideoutCraftToAdd>",
+          "implemented": false
+        }
+      ]
+    },
+    {
+      "id": "spt.http",
+      "label": "SPT / http",
+      "configFile": "configs/http.json",
+      "className": "HttpConfig",
+      "settings": [
+        {
+          "key": "spt.http.LogRequests",
+          "label": "LogRequests",
+          "type": "bool",
+          "implemented": false,
+          "category": "HttpConfig",
+          "description": "SPT http.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.http.BackendPort",
+          "label": "BackendPort",
+          "type": "int",
+          "implemented": false,
+          "category": "HttpConfig",
+          "description": "SPT http.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.http.Port",
+          "label": "Port",
+          "type": "int",
+          "implemented": false,
+          "category": "HttpConfig",
+          "description": "SPT http.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.http.BackendIp",
+          "label": "BackendIp",
+          "type": "string",
+          "implemented": false,
+          "category": "HttpConfig",
+          "description": "SPT http.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.http.Ip",
+          "label": "Ip",
+          "type": "string",
+          "implemented": false,
+          "category": "HttpConfig",
+          "description": "SPT http.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.http.WebAuthenticationConfig.DefaultUser.IsAdministrator",
+          "label": "IsAdministrator",
+          "type": "bool",
+          "implemented": false,
+          "category": "HttpConfig / WebAuthenticationConfig / DefaultUser",
+          "description": "SPT http.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.http.WebAuthenticationConfig.DefaultUser.Password",
+          "label": "Password",
+          "type": "string",
+          "implemented": false,
+          "category": "HttpConfig / WebAuthenticationConfig / DefaultUser",
+          "description": "SPT http.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.http.WebAuthenticationConfig.DefaultUser.Username",
+          "label": "Username",
+          "type": "string",
+          "implemented": false,
+          "category": "HttpConfig / WebAuthenticationConfig / DefaultUser",
+          "description": "SPT http.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.http.WebAuthenticationConfig.AllowDefaultUserFromAnyIp",
+          "label": "AllowDefaultUserFromAnyIp",
+          "type": "bool",
+          "implemented": false,
+          "category": "HttpConfig / WebAuthenticationConfig",
+          "description": "SPT http.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.http.WebAuthenticationConfig.EnableDefaultUser",
+          "label": "EnableDefaultUser",
+          "type": "bool",
+          "implemented": false,
+          "category": "HttpConfig / WebAuthenticationConfig",
+          "description": "SPT http.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.http.WebAuthenticationConfig.Enabled",
+          "label": "Enabled",
+          "type": "bool",
+          "implemented": false,
+          "category": "HttpConfig / WebAuthenticationConfig",
+          "description": "SPT http.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.http.WebAuthenticationConfig.RequireCredentialsOnLocalhost",
+          "label": "RequireCredentialsOnLocalhost",
+          "type": "bool",
+          "implemented": false,
+          "category": "HttpConfig / WebAuthenticationConfig",
+          "description": "SPT http.json value \u2014 not implemented in aowlspt yet."
+        }
+      ],
+      "nested": [
+        {
+          "key": "spt.http.ServerImagePathOverride",
+          "label": "ServerImagePathOverride",
+          "type": "Dictionary<String, String>",
+          "implemented": false
+        }
+      ]
+    },
+    {
+      "id": "spt.inraid",
+      "label": "SPT / inraid",
+      "configFile": "configs/inraid.json",
+      "className": "InRaidConfig",
+      "settings": [
+        {
+          "key": "spt.inraid.AlwaysKeepFoundInRaidOnRaidEnd",
+          "label": "AlwaysKeepFoundInRaidOnRaidEnd",
+          "type": "bool",
+          "implemented": false,
+          "category": "InRaidConfig",
+          "description": "SPT inraid.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.inraid.KeepFiRSecureContainerOnDeath",
+          "label": "KeepFiRSecureContainerOnDeath",
+          "type": "bool",
+          "implemented": false,
+          "category": "InRaidConfig",
+          "description": "SPT inraid.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.inraid.CarExtractBaseStandingGain",
+          "label": "CarExtractBaseStandingGain",
+          "type": "float",
+          "implemented": false,
+          "category": "InRaidConfig",
+          "description": "SPT inraid.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.inraid.CoopExtractBaseStandingGain",
+          "label": "CoopExtractBaseStandingGain",
+          "type": "float",
+          "implemented": false,
+          "category": "InRaidConfig",
+          "description": "SPT inraid.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.inraid.PlayerScavHostileChancePercent",
+          "label": "PlayerScavHostileChancePercent",
+          "type": "float",
+          "implemented": false,
+          "category": "InRaidConfig",
+          "description": "SPT inraid.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.inraid.ScavExtractStandingGain",
+          "label": "ScavExtractStandingGain",
+          "type": "float",
+          "implemented": false,
+          "category": "InRaidConfig",
+          "description": "SPT inraid.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.inraid.RaidMenuSettings.BossEnabled",
+          "label": "BossEnabled",
+          "type": "bool",
+          "implemented": false,
+          "category": "InRaidConfig / RaidMenuSettings",
+          "description": "SPT inraid.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.inraid.RaidMenuSettings.EnablePve",
+          "label": "EnablePve",
+          "type": "bool",
+          "implemented": false,
+          "category": "InRaidConfig / RaidMenuSettings",
+          "description": "SPT inraid.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.inraid.RaidMenuSettings.RandomTime",
+          "label": "RandomTime",
+          "type": "bool",
+          "implemented": false,
+          "category": "InRaidConfig / RaidMenuSettings",
+          "description": "SPT inraid.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.inraid.RaidMenuSettings.RandomWeather",
+          "label": "RandomWeather",
+          "type": "bool",
+          "implemented": false,
+          "category": "InRaidConfig / RaidMenuSettings",
+          "description": "SPT inraid.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.inraid.RaidMenuSettings.ScavWars",
+          "label": "ScavWars",
+          "type": "bool",
+          "implemented": false,
+          "category": "InRaidConfig / RaidMenuSettings",
+          "description": "SPT inraid.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.inraid.RaidMenuSettings.TaggedAndCursed",
+          "label": "TaggedAndCursed",
+          "type": "bool",
+          "implemented": false,
+          "category": "InRaidConfig / RaidMenuSettings",
+          "description": "SPT inraid.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.inraid.RaidMenuSettings.AiAmount",
+          "label": "AiAmount",
+          "type": "string",
+          "implemented": false,
+          "category": "InRaidConfig / RaidMenuSettings",
+          "description": "SPT inraid.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.inraid.RaidMenuSettings.AiDifficulty",
+          "label": "AiDifficulty",
+          "type": "string",
+          "implemented": false,
+          "category": "InRaidConfig / RaidMenuSettings",
+          "description": "SPT inraid.json value \u2014 not implemented in aowlspt yet."
+        }
+      ],
+      "nested": [
+        {
+          "key": "spt.inraid.CarExtracts",
+          "label": "CarExtracts",
+          "type": "HashSet<String>",
+          "implemented": false
+        },
+        {
+          "key": "spt.inraid.CoopExtracts",
+          "label": "CoopExtracts",
+          "type": "HashSet<String>",
+          "implemented": false
+        }
+      ]
+    },
+    {
+      "id": "spt.insurance",
+      "label": "SPT / insurance",
+      "configFile": "configs/insurance.json",
+      "className": "InsuranceConfig",
+      "settings": [
+        {
+          "key": "spt.insurance.SimulateItemsBeingTaken",
+          "label": "SimulateItemsBeingTaken",
+          "type": "bool",
+          "implemented": false,
+          "category": "InsuranceConfig",
+          "description": "SPT insurance.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.insurance.ChanceNoAttachmentsTakenPercent",
+          "label": "ChanceNoAttachmentsTakenPercent",
+          "type": "float",
+          "implemented": false,
+          "category": "InsuranceConfig",
+          "description": "SPT insurance.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.insurance.MinAttachmentRoublePriceToBeTaken",
+          "label": "MinAttachmentRoublePriceToBeTaken",
+          "type": "float",
+          "implemented": false,
+          "category": "InsuranceConfig",
+          "description": "SPT insurance.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.insurance.ReturnTimeOverrideSeconds",
+          "label": "ReturnTimeOverrideSeconds",
+          "type": "float",
+          "implemented": false,
+          "category": "InsuranceConfig",
+          "description": "SPT insurance.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.insurance.RunIntervalSeconds",
+          "label": "RunIntervalSeconds",
+          "type": "float",
+          "implemented": false,
+          "category": "InsuranceConfig",
+          "description": "SPT insurance.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.insurance.StorageTimeOverrideSeconds",
+          "label": "StorageTimeOverrideSeconds",
+          "type": "float",
+          "implemented": false,
+          "category": "InsuranceConfig",
+          "description": "SPT insurance.json value \u2014 not implemented in aowlspt yet."
+        }
+      ],
+      "nested": [
+        {
+          "key": "spt.insurance.ReturnChancePercent",
+          "label": "ReturnChancePercent",
+          "type": "Dictionary<MongoId, Double>",
+          "implemented": false
+        }
+      ]
+    },
+    {
+      "id": "spt.inventory",
+      "label": "SPT / inventory",
+      "configFile": "configs/inventory.json",
+      "className": "InventoryConfig",
+      "settings": [
+        {
+          "key": "spt.inventory.SealedAirdropContainer.AllowBossItems",
+          "label": "AllowBossItems",
+          "type": "bool",
+          "implemented": false,
+          "category": "InventoryConfig / SealedAirdropContainer",
+          "description": "SPT inventory.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.inventory.SealedAirdropContainer.DefaultPresetsOnly",
+          "label": "DefaultPresetsOnly",
+          "type": "bool",
+          "implemented": false,
+          "category": "InventoryConfig / SealedAirdropContainer",
+          "description": "SPT inventory.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.inventory.SealedAirdropContainer.FoundInRaid",
+          "label": "FoundInRaid",
+          "type": "bool",
+          "implemented": false,
+          "category": "InventoryConfig / SealedAirdropContainer",
+          "description": "SPT inventory.json value \u2014 not implemented in aowlspt yet."
+        }
+      ],
+      "nested": [
+        {
+          "key": "spt.inventory.RandomLootContainers",
+          "label": "RandomLootContainers",
+          "type": "Dictionary<MongoId, RewardDetails>",
+          "implemented": false
+        },
+        {
+          "key": "spt.inventory.SkillGainMultipliers",
+          "label": "SkillGainMultipliers",
+          "type": "Dictionary<String, Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.inventory.DeprioritisedMoneyContainers",
+          "label": "DeprioritisedMoneyContainers",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.inventory.CustomMoneyTpls",
+          "label": "CustomMoneyTpls",
+          "type": "List<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.inventory.SealedAirdropContainer.WeaponRewardWeight",
+          "label": "WeaponRewardWeight",
+          "type": "Dictionary<MongoId, Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.inventory.SealedAirdropContainer.RewardTypeLimits",
+          "label": "RewardTypeLimits",
+          "type": "Dictionary<MongoId, MinMax<Int32>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.inventory.SealedAirdropContainer.WeaponModRewardLimits",
+          "label": "WeaponModRewardLimits",
+          "type": "Dictionary<MongoId, MinMax<Int32>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.inventory.SealedAirdropContainer.AmmoBoxWhitelist",
+          "label": "AmmoBoxWhitelist",
+          "type": "List<MongoId>",
+          "implemented": false
+        }
+      ]
+    },
+    {
+      "id": "spt.item",
+      "label": "SPT / item",
+      "configFile": "configs/item.json",
+      "className": "ItemConfig",
+      "settings": [],
+      "nested": [
+        {
+          "key": "spt.item.HandbookPriceOverride",
+          "label": "HandbookPriceOverride",
+          "type": "Dictionary<MongoId, HandbookPriceOverride>",
+          "implemented": false
+        },
+        {
+          "key": "spt.item.Blacklist",
+          "label": "Blacklist",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.item.BossItems",
+          "label": "BossItems",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.item.LootableItemBlacklist",
+          "label": "LootableItemBlacklist",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.item.RewardItemBlacklist",
+          "label": "RewardItemBlacklist",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.item.RewardItemTypeBlacklist",
+          "label": "RewardItemTypeBlacklist",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.item.CustomItemGlobalPresets",
+          "label": "CustomItemGlobalPresets",
+          "type": "List<Preset>",
+          "implemented": false
+        }
+      ]
+    },
+    {
+      "id": "spt.locale",
+      "label": "SPT / locale",
+      "configFile": "configs/locale.json",
+      "className": "LocaleConfig",
+      "settings": [
+        {
+          "key": "spt.locale.GameLocale",
+          "label": "GameLocale",
+          "type": "string",
+          "implemented": false,
+          "category": "LocaleConfig",
+          "description": "SPT locale.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.locale.ServerLocale",
+          "label": "ServerLocale",
+          "type": "string",
+          "implemented": false,
+          "category": "LocaleConfig",
+          "description": "SPT locale.json value \u2014 not implemented in aowlspt yet."
+        }
+      ],
+      "nested": [
+        {
+          "key": "spt.locale.Fallbacks",
+          "label": "Fallbacks",
+          "type": "Dictionary<String, String>",
+          "implemented": false
+        },
+        {
+          "key": "spt.locale.ServerSupportedLocales",
+          "label": "ServerSupportedLocales",
+          "type": "HashSet<String>",
+          "implemented": false
+        }
+      ]
+    },
+    {
+      "id": "spt.location",
+      "label": "SPT / location",
+      "configFile": "configs/location.json",
+      "className": "LocationConfig",
+      "settings": [
+        {
+          "key": "spt.location.AddCustomBotWavesToMaps",
+          "label": "AddCustomBotWavesToMaps",
+          "type": "bool",
+          "implemented": false,
+          "category": "LocationConfig",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.AddOpenZonesToAllMaps",
+          "label": "AddOpenZonesToAllMaps",
+          "type": "bool",
+          "implemented": false,
+          "category": "LocationConfig",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.AllowDuplicateItemsInStaticContainers",
+          "label": "AllowDuplicateItemsInStaticContainers",
+          "type": "bool",
+          "implemented": false,
+          "category": "LocationConfig",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.EnableBotTypeLimits",
+          "label": "EnableBotTypeLimits",
+          "type": "bool",
+          "implemented": false,
+          "category": "LocationConfig",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.ContainerRandomisationSettings.Enabled",
+          "label": "Enabled",
+          "type": "bool",
+          "implemented": false,
+          "category": "LocationConfig / ContainerRandomisationSettings",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.ContainerRandomisationSettings.ContainerGroupMaxSizeMultiplier",
+          "label": "ContainerGroupMaxSizeMultiplier",
+          "type": "float",
+          "implemented": false,
+          "category": "LocationConfig / ContainerRandomisationSettings",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.ContainerRandomisationSettings.ContainerGroupMinSizeMultiplier",
+          "label": "ContainerGroupMinSizeMultiplier",
+          "type": "float",
+          "implemented": false,
+          "category": "LocationConfig / ContainerRandomisationSettings",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.FitLootIntoContainerAttempts",
+          "label": "FitLootIntoContainerAttempts",
+          "type": "int",
+          "implemented": false,
+          "category": "LocationConfig",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.MagazineLootHasAmmoChancePercent",
+          "label": "MagazineLootHasAmmoChancePercent",
+          "type": "int",
+          "implemented": false,
+          "category": "LocationConfig",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.MinFillLooseMagazinePercent",
+          "label": "MinFillLooseMagazinePercent",
+          "type": "int",
+          "implemented": false,
+          "category": "LocationConfig",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.MinFillStaticMagazinePercent",
+          "label": "MinFillStaticMagazinePercent",
+          "type": "int",
+          "implemented": false,
+          "category": "LocationConfig",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.StaticMagazineLootHasAmmoChancePercent",
+          "label": "StaticMagazineLootHasAmmoChancePercent",
+          "type": "int",
+          "implemented": false,
+          "category": "LocationConfig",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.ReserveRaiderSpawnChanceOverrides.NonTriggered",
+          "label": "NonTriggered",
+          "type": "int",
+          "implemented": false,
+          "category": "LocationConfig / ReserveRaiderSpawnChanceOverrides",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.ReserveRaiderSpawnChanceOverrides.Triggered",
+          "label": "Triggered",
+          "type": "int",
+          "implemented": false,
+          "category": "LocationConfig / ReserveRaiderSpawnChanceOverrides",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.RogueLighthouseSpawnTimeSettings.Enabled",
+          "label": "Enabled",
+          "type": "bool",
+          "implemented": false,
+          "category": "LocationConfig / RogueLighthouseSpawnTimeSettings",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.RogueLighthouseSpawnTimeSettings.WaitTimeSeconds",
+          "label": "WaitTimeSeconds",
+          "type": "int",
+          "implemented": false,
+          "category": "LocationConfig / RogueLighthouseSpawnTimeSettings",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.ScavRaidTimeSettings.Settings.TrainArrivalDelayObservedSeconds",
+          "label": "TrainArrivalDelayObservedSeconds",
+          "type": "int",
+          "implemented": false,
+          "category": "LocationConfig / ScavRaidTimeSettings / Settings",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.TransitSettings.Active",
+          "label": "Active",
+          "type": "bool",
+          "implemented": false,
+          "category": "LocationConfig / TransitSettings",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.TransitSettings.ClearAllPlayerEffectsOnTransit",
+          "label": "ClearAllPlayerEffectsOnTransit",
+          "type": "bool",
+          "implemented": false,
+          "category": "LocationConfig / TransitSettings",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.TransitSettings.RestoreHealthOnDestroyedParts",
+          "label": "RestoreHealthOnDestroyedParts",
+          "type": "bool",
+          "implemented": false,
+          "category": "LocationConfig / TransitSettings",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.TransitSettings.BearPriceMod",
+          "label": "BearPriceMod",
+          "type": "float",
+          "implemented": false,
+          "category": "LocationConfig / TransitSettings",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.TransitSettings.CoefficientDiscountCharisma",
+          "label": "CoefficientDiscountCharisma",
+          "type": "float",
+          "implemented": false,
+          "category": "LocationConfig / TransitSettings",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.TransitSettings.DeliveryMinPrice",
+          "label": "DeliveryMinPrice",
+          "type": "float",
+          "implemented": false,
+          "category": "LocationConfig / TransitSettings",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.TransitSettings.DeliveryPrice",
+          "label": "DeliveryPrice",
+          "type": "float",
+          "implemented": false,
+          "category": "LocationConfig / TransitSettings",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.TransitSettings.ModDeliveryCost",
+          "label": "ModDeliveryCost",
+          "type": "float",
+          "implemented": false,
+          "category": "LocationConfig / TransitSettings",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.TransitSettings.PercentageOfMissingEnergyRestore",
+          "label": "PercentageOfMissingEnergyRestore",
+          "type": "float",
+          "implemented": false,
+          "category": "LocationConfig / TransitSettings",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.TransitSettings.PercentageOfMissingHealthRestore",
+          "label": "PercentageOfMissingHealthRestore",
+          "type": "float",
+          "implemented": false,
+          "category": "LocationConfig / TransitSettings",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.TransitSettings.PercentageOfMissingWaterRestore",
+          "label": "PercentageOfMissingWaterRestore",
+          "type": "float",
+          "implemented": false,
+          "category": "LocationConfig / TransitSettings",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.TransitSettings.ScavPriceMod",
+          "label": "ScavPriceMod",
+          "type": "float",
+          "implemented": false,
+          "category": "LocationConfig / TransitSettings",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.location.TransitSettings.UsecPriceMod",
+          "label": "UsecPriceMod",
+          "type": "float",
+          "implemented": false,
+          "category": "LocationConfig / TransitSettings",
+          "description": "SPT location.json value \u2014 not implemented in aowlspt yet."
+        }
+      ],
+      "nested": [
+        {
+          "key": "spt.location.ContainerRandomisationSettings.Maps",
+          "label": "Maps",
+          "type": "Dictionary<String, Boolean>",
+          "implemented": false
+        },
+        {
+          "key": "spt.location.ContainerRandomisationSettings.ContainerTypesToNotRandomise",
+          "label": "ContainerTypesToNotRandomise",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.location.CustomWaves.Boss",
+          "label": "Boss",
+          "type": "Dictionary<String, List<BossLocationSpawn>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.location.CustomWaves.Normal",
+          "label": "Normal",
+          "type": "Dictionary<String, List<Wave>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.location.LootMaxSpawnLimits",
+          "label": "LootMaxSpawnLimits",
+          "type": "Dictionary<String, Dictionary<MongoId, Int32>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.location.LooseLootMultiplier",
+          "label": "LooseLootMultiplier",
+          "type": "Dictionary<String, Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.location.StaticLootMultiplier",
+          "label": "StaticLootMultiplier",
+          "type": "Dictionary<String, Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.location.LooseLootBlacklist",
+          "label": "LooseLootBlacklist",
+          "type": "Dictionary<String, HashSet<String>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.location.OpenZones",
+          "label": "OpenZones",
+          "type": "Dictionary<String, HashSet<String>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.location.BotTypeLimits",
+          "label": "BotTypeLimits",
+          "type": "Dictionary<String, List<BotTypeLimit>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.location.EquipmentLootSettings.ModSpawnChancePercent",
+          "label": "ModSpawnChancePercent",
+          "type": "Dictionary<String, Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.location.TplsToStripChildItemsFrom",
+          "label": "TplsToStripChildItemsFrom",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.location.NonMaps",
+          "label": "NonMaps",
+          "type": "HashSet<String>",
+          "implemented": false
+        },
+        {
+          "key": "spt.location.ScavRaidTimeSettings.Maps",
+          "label": "Maps",
+          "type": "Dictionary<String, ScavRaidTimeLocationSettings>",
+          "implemented": false
+        }
+      ]
+    },
+    {
+      "id": "spt.loot",
+      "label": "SPT / loot",
+      "configFile": "configs/loot.json",
+      "className": "LootConfig",
+      "settings": [],
+      "nested": [
+        {
+          "key": "spt.loot.StaticItemWeightAdjustment",
+          "label": "StaticItemWeightAdjustment",
+          "type": "Dictionary<String, Dictionary<MongoId, Double>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.loot.LooseLootSpawnPointAdjustments",
+          "label": "LooseLootSpawnPointAdjustments",
+          "type": "Dictionary<String, Dictionary<String, Double>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.loot.LooseLoot",
+          "label": "LooseLoot",
+          "type": "Dictionary<String, Spawnpoint[]>",
+          "implemented": false
+        }
+      ]
+    },
+    {
+      "id": "spt.lostondeath",
+      "label": "SPT / lostondeath",
+      "configFile": "configs/lostondeath.json",
+      "className": "LostOnDeathConfig",
+      "settings": [
+        {
+          "key": "spt.lostondeath.QuestItems",
+          "label": "QuestItems",
+          "type": "bool",
+          "implemented": false,
+          "category": "LostOnDeathConfig",
+          "description": "SPT lostondeath.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.lostondeath.SpecialSlotItems",
+          "label": "SpecialSlotItems",
+          "type": "bool",
+          "implemented": false,
+          "category": "LostOnDeathConfig",
+          "description": "SPT lostondeath.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.lostondeath.WipeOnRaidStart",
+          "label": "WipeOnRaidStart",
+          "type": "bool",
+          "implemented": false,
+          "category": "LostOnDeathConfig",
+          "description": "SPT lostondeath.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.lostondeath.Equipment.ArmBand",
+          "label": "ArmBand",
+          "type": "bool",
+          "implemented": false,
+          "category": "LostOnDeathConfig / Equipment",
+          "description": "SPT lostondeath.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.lostondeath.Equipment.ArmorVest",
+          "label": "ArmorVest",
+          "type": "bool",
+          "implemented": false,
+          "category": "LostOnDeathConfig / Equipment",
+          "description": "SPT lostondeath.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.lostondeath.Equipment.Backpack",
+          "label": "Backpack",
+          "type": "bool",
+          "implemented": false,
+          "category": "LostOnDeathConfig / Equipment",
+          "description": "SPT lostondeath.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.lostondeath.Equipment.Compass",
+          "label": "Compass",
+          "type": "bool",
+          "implemented": false,
+          "category": "LostOnDeathConfig / Equipment",
+          "description": "SPT lostondeath.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.lostondeath.Equipment.Earpiece",
+          "label": "Earpiece",
+          "type": "bool",
+          "implemented": false,
+          "category": "LostOnDeathConfig / Equipment",
+          "description": "SPT lostondeath.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.lostondeath.Equipment.Eyewear",
+          "label": "Eyewear",
+          "type": "bool",
+          "implemented": false,
+          "category": "LostOnDeathConfig / Equipment",
+          "description": "SPT lostondeath.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.lostondeath.Equipment.FaceCover",
+          "label": "FaceCover",
+          "type": "bool",
+          "implemented": false,
+          "category": "LostOnDeathConfig / Equipment",
+          "description": "SPT lostondeath.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.lostondeath.Equipment.FirstPrimaryWeapon",
+          "label": "FirstPrimaryWeapon",
+          "type": "bool",
+          "implemented": false,
+          "category": "LostOnDeathConfig / Equipment",
+          "description": "SPT lostondeath.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.lostondeath.Equipment.Headwear",
+          "label": "Headwear",
+          "type": "bool",
+          "implemented": false,
+          "category": "LostOnDeathConfig / Equipment",
+          "description": "SPT lostondeath.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.lostondeath.Equipment.Holster",
+          "label": "Holster",
+          "type": "bool",
+          "implemented": false,
+          "category": "LostOnDeathConfig / Equipment",
+          "description": "SPT lostondeath.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.lostondeath.Equipment.PocketItems",
+          "label": "PocketItems",
+          "type": "bool",
+          "implemented": false,
+          "category": "LostOnDeathConfig / Equipment",
+          "description": "SPT lostondeath.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.lostondeath.Equipment.Scabbard",
+          "label": "Scabbard",
+          "type": "bool",
+          "implemented": false,
+          "category": "LostOnDeathConfig / Equipment",
+          "description": "SPT lostondeath.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.lostondeath.Equipment.SecondPrimaryWeapon",
+          "label": "SecondPrimaryWeapon",
+          "type": "bool",
+          "implemented": false,
+          "category": "LostOnDeathConfig / Equipment",
+          "description": "SPT lostondeath.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.lostondeath.Equipment.SecuredContainer",
+          "label": "SecuredContainer",
+          "type": "bool",
+          "implemented": false,
+          "category": "LostOnDeathConfig / Equipment",
+          "description": "SPT lostondeath.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.lostondeath.Equipment.TacticalVest",
+          "label": "TacticalVest",
+          "type": "bool",
+          "implemented": false,
+          "category": "LostOnDeathConfig / Equipment",
+          "description": "SPT lostondeath.json value \u2014 not implemented in aowlspt yet."
+        }
+      ],
+      "nested": []
+    },
+    {
+      "id": "spt.match",
+      "label": "SPT / match",
+      "configFile": "configs/match.json",
+      "className": "MatchConfig",
+      "settings": [
+        {
+          "key": "spt.match.Enabled",
+          "label": "Enabled",
+          "type": "bool",
+          "implemented": false,
+          "category": "MatchConfig",
+          "description": "SPT match.json value \u2014 not implemented in aowlspt yet."
+        }
+      ],
+      "nested": []
+    },
+    {
+      "id": "spt.playerscav",
+      "label": "SPT / playerscav",
+      "configFile": "configs/playerscav.json",
+      "className": "PlayerScavConfig",
+      "settings": [],
+      "nested": [
+        {
+          "key": "spt.playerscav.KarmaLevel",
+          "label": "KarmaLevel",
+          "type": "Dictionary<String, KarmaLevel>",
+          "implemented": false
+        }
+      ]
+    },
+    {
+      "id": "spt.pmcchatresponse",
+      "label": "SPT / pmcchatresponse",
+      "configFile": "configs/pmcchatresponse.json",
+      "className": "PmcChatResponseConfig",
+      "settings": [
+        {
+          "key": "spt.pmcchatresponse.Killer.AllCapsChancePercent",
+          "label": "AllCapsChancePercent",
+          "type": "float",
+          "implemented": false,
+          "category": "PmcChatResponseConfig / Killer",
+          "description": "SPT pmcchatresponse.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.pmcchatresponse.Killer.AppendBroToMessageEndChancePercent",
+          "label": "AppendBroToMessageEndChancePercent",
+          "type": "float",
+          "implemented": false,
+          "category": "PmcChatResponseConfig / Killer",
+          "description": "SPT pmcchatresponse.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.pmcchatresponse.Killer.ResponseChancePercent",
+          "label": "ResponseChancePercent",
+          "type": "float",
+          "implemented": false,
+          "category": "PmcChatResponseConfig / Killer",
+          "description": "SPT pmcchatresponse.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.pmcchatresponse.Killer.StripCapitalisationChancePercent",
+          "label": "StripCapitalisationChancePercent",
+          "type": "float",
+          "implemented": false,
+          "category": "PmcChatResponseConfig / Killer",
+          "description": "SPT pmcchatresponse.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.pmcchatresponse.Victim.AllCapsChancePercent",
+          "label": "AllCapsChancePercent",
+          "type": "float",
+          "implemented": false,
+          "category": "PmcChatResponseConfig / Victim",
+          "description": "SPT pmcchatresponse.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.pmcchatresponse.Victim.AppendBroToMessageEndChancePercent",
+          "label": "AppendBroToMessageEndChancePercent",
+          "type": "float",
+          "implemented": false,
+          "category": "PmcChatResponseConfig / Victim",
+          "description": "SPT pmcchatresponse.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.pmcchatresponse.Victim.ResponseChancePercent",
+          "label": "ResponseChancePercent",
+          "type": "float",
+          "implemented": false,
+          "category": "PmcChatResponseConfig / Victim",
+          "description": "SPT pmcchatresponse.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.pmcchatresponse.Victim.StripCapitalisationChancePercent",
+          "label": "StripCapitalisationChancePercent",
+          "type": "float",
+          "implemented": false,
+          "category": "PmcChatResponseConfig / Victim",
+          "description": "SPT pmcchatresponse.json value \u2014 not implemented in aowlspt yet."
+        }
+      ],
+      "nested": [
+        {
+          "key": "spt.pmcchatresponse.Killer.ResponseTypeWeights",
+          "label": "ResponseTypeWeights",
+          "type": "Dictionary<String, Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.pmcchatresponse.Victim.ResponseTypeWeights",
+          "label": "ResponseTypeWeights",
+          "type": "Dictionary<String, Double>",
+          "implemented": false
+        }
+      ]
+    },
+    {
+      "id": "spt.pmc",
+      "label": "SPT / pmc",
+      "configFile": "configs/pmc.json",
+      "className": "PmcConfig",
+      "settings": [
+        {
+          "key": "spt.pmc.AddSecureContainerLootFromBotConfig",
+          "label": "AddSecureContainerLootFromBotConfig",
+          "type": "bool",
+          "implemented": false,
+          "category": "PmcConfig",
+          "description": "SPT pmc.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.pmc.ForceHealingItemsIntoSecure",
+          "label": "ForceHealingItemsIntoSecure",
+          "type": "bool",
+          "implemented": false,
+          "category": "PmcConfig",
+          "description": "SPT pmc.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.pmc.RemoveExistingPmcWaves",
+          "label": "RemoveExistingPmcWaves",
+          "type": "bool",
+          "implemented": false,
+          "category": "PmcConfig",
+          "description": "SPT pmc.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.pmc.UseDifficultyOverride",
+          "label": "UseDifficultyOverride",
+          "type": "bool",
+          "implemented": false,
+          "category": "PmcConfig",
+          "description": "SPT pmc.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.pmc.AllPMCsHavePlayerNameWithRandomPrefixChance",
+          "label": "AllPMCsHavePlayerNameWithRandomPrefixChance",
+          "type": "float",
+          "implemented": false,
+          "category": "PmcConfig",
+          "description": "SPT pmc.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.pmc.IsUsec",
+          "label": "IsUsec",
+          "type": "float",
+          "implemented": false,
+          "category": "PmcConfig",
+          "description": "SPT pmc.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.pmc.LooseWeaponInBackpackChancePercent",
+          "label": "LooseWeaponInBackpackChancePercent",
+          "type": "float",
+          "implemented": false,
+          "category": "PmcConfig",
+          "description": "SPT pmc.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.pmc.WeaponHasEnhancementChancePercent",
+          "label": "WeaponHasEnhancementChancePercent",
+          "type": "float",
+          "implemented": false,
+          "category": "PmcConfig",
+          "description": "SPT pmc.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.pmc.ForceArmband.Enabled",
+          "label": "Enabled",
+          "type": "bool",
+          "implemented": false,
+          "category": "PmcConfig / ForceArmband",
+          "description": "SPT pmc.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.pmc.ForceArmband.Bear.IsEmpty",
+          "label": "IsEmpty",
+          "type": "bool",
+          "implemented": false,
+          "category": "PmcConfig / ForceArmband / Bear",
+          "description": "SPT pmc.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.pmc.ForceArmband.Usec.IsEmpty",
+          "label": "IsEmpty",
+          "type": "bool",
+          "implemented": false,
+          "category": "PmcConfig / ForceArmband / Usec",
+          "description": "SPT pmc.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.pmc.BearType",
+          "label": "BearType",
+          "type": "string",
+          "implemented": false,
+          "category": "PmcConfig",
+          "description": "SPT pmc.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.pmc.Difficulty",
+          "label": "Difficulty",
+          "type": "string",
+          "implemented": false,
+          "category": "PmcConfig",
+          "description": "SPT pmc.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.pmc.PmcTypeDescription",
+          "label": "PmcTypeDescription",
+          "type": "string",
+          "implemented": false,
+          "category": "PmcConfig",
+          "description": "SPT pmc.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.pmc.UsecType",
+          "label": "UsecType",
+          "type": "string",
+          "implemented": false,
+          "category": "PmcConfig",
+          "description": "SPT pmc.json value \u2014 not implemented in aowlspt yet."
+        }
+      ],
+      "nested": [
+        {
+          "key": "spt.pmc.AccountTypeWeight",
+          "label": "AccountTypeWeight",
+          "type": "Dictionary<MemberCategory, Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.pmc.DogtagSettings",
+          "label": "DogtagSettings",
+          "type": "Dictionary<String, Dictionary<String, Dictionary<MongoId, Double>>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.pmc.PmcType",
+          "label": "PmcType",
+          "type": "Dictionary<String, Dictionary<String, Dictionary<String, Double>>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.pmc.GameVersionWeight",
+          "label": "GameVersionWeight",
+          "type": "Dictionary<String, Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.pmc.HostilitySettings",
+          "label": "HostilitySettings",
+          "type": "Dictionary<String, HostilitySettings>",
+          "implemented": false
+        },
+        {
+          "key": "spt.pmc.CustomPmcWaves",
+          "label": "CustomPmcWaves",
+          "type": "Dictionary<String, List<BossLocationSpawn>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.pmc.LocationSpecificPmcLevelOverride",
+          "label": "LocationSpecificPmcLevelOverride",
+          "type": "Dictionary<String, MinMax<Int32>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.pmc.LootItemLimitsRub",
+          "label": "LootItemLimitsRub",
+          "type": "List<MinMaxLootItemValue>",
+          "implemented": false
+        },
+        {
+          "key": "spt.pmc.GlobalLootBlacklist",
+          "label": "GlobalLootBlacklist",
+          "type": "List<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.pmc.BotRelativeLevelDelta",
+          "label": "BotRelativeLevelDelta",
+          "type": "MinMax<Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.pmc.LooseWeaponInBackpackLootMinMax",
+          "label": "LooseWeaponInBackpackLootMinMax",
+          "type": "MinMax<Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.pmc.LootSettings.Backpack.LocationMultiplier",
+          "label": "LocationMultiplier",
+          "type": "Dictionary<String, Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.pmc.LootSettings.Backpack.TotalRubByLevel",
+          "label": "TotalRubByLevel",
+          "type": "List<MinMaxLootValue>",
+          "implemented": false
+        },
+        {
+          "key": "spt.pmc.LootSettings.Pocket.LocationMultiplier",
+          "label": "LocationMultiplier",
+          "type": "Dictionary<String, Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.pmc.LootSettings.Pocket.TotalRubByLevel",
+          "label": "TotalRubByLevel",
+          "type": "List<MinMaxLootValue>",
+          "implemented": false
+        },
+        {
+          "key": "spt.pmc.LootSettings.Vest.LocationMultiplier",
+          "label": "LocationMultiplier",
+          "type": "Dictionary<String, Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.pmc.LootSettings.Vest.TotalRubByLevel",
+          "label": "TotalRubByLevel",
+          "type": "List<MinMaxLootValue>",
+          "implemented": false
+        },
+        {
+          "key": "spt.pmc.BackpackLoot.Blacklist",
+          "label": "Blacklist",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.pmc.BackpackLoot.Whitelist",
+          "label": "Whitelist",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.pmc.PocketLoot.Blacklist",
+          "label": "Blacklist",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.pmc.PocketLoot.Whitelist",
+          "label": "Whitelist",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.pmc.VestLoot.Blacklist",
+          "label": "Blacklist",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.pmc.VestLoot.Whitelist",
+          "label": "Whitelist",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        }
+      ]
+    },
+    {
+      "id": "spt.quest",
+      "label": "SPT / quest",
+      "configFile": "configs/quest.json",
+      "className": "QuestConfig",
+      "settings": [
+        {
+          "key": "spt.quest.ShowNonSeasonalEventQuests",
+          "label": "ShowNonSeasonalEventQuests",
+          "type": "bool",
+          "implemented": false,
+          "category": "QuestConfig",
+          "description": "SPT quest.json value \u2014 not implemented in aowlspt yet."
+        }
+      ],
+      "nested": [
+        {
+          "key": "spt.quest.EventQuests",
+          "label": "EventQuests",
+          "type": "Dictionary<MongoId, EventQuestData>",
+          "implemented": false
+        },
+        {
+          "key": "spt.quest.ProfileWhitelist",
+          "label": "ProfileWhitelist",
+          "type": "Dictionary<MongoId, HashSet<String>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.quest.MailRedeemTimeHours",
+          "label": "MailRedeemTimeHours",
+          "type": "Dictionary<String, Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.quest.ProfileBlacklist",
+          "label": "ProfileBlacklist",
+          "type": "Dictionary<String, HashSet<MongoId>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.quest.LocationIdMap",
+          "label": "LocationIdMap",
+          "type": "Dictionary<String, String>",
+          "implemented": false
+        },
+        {
+          "key": "spt.quest.BearOnlyQuests",
+          "label": "BearOnlyQuests",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.quest.UsecOnlyQuests",
+          "label": "UsecOnlyQuests",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.quest.RepeatableQuests",
+          "label": "RepeatableQuests",
+          "type": "List<RepeatableQuestConfig>",
+          "implemented": false
+        },
+        {
+          "key": "spt.quest.RepeatableQuestTemplates.Pmc",
+          "label": "Pmc",
+          "type": "Dictionary<String, MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.quest.RepeatableQuestTemplates.Scav",
+          "label": "Scav",
+          "type": "Dictionary<String, MongoId>",
+          "implemented": false
+        }
+      ]
+    },
+    {
+      "id": "spt.ragfair",
+      "label": "SPT / ragfair",
+      "configFile": "configs/ragfair.json",
+      "className": "RagfairConfig",
+      "settings": [
+        {
+          "key": "spt.ragfair.Dynamic.Armor.RemoveRemovablePlateChance",
+          "label": "RemoveRemovablePlateChance",
+          "type": "int",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / Armor",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.Barter.MakeSingleStackOnly",
+          "label": "MakeSingleStackOnly",
+          "type": "bool",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / Barter",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.Barter.ChancePercent",
+          "label": "ChancePercent",
+          "type": "float",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / Barter",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.Barter.MinRoubleCostToBecomeBarter",
+          "label": "MinRoubleCostToBecomeBarter",
+          "type": "float",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / Barter",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.Barter.PriceRangeVariancePercent",
+          "label": "PriceRangeVariancePercent",
+          "type": "float",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / Barter",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.Barter.ItemCountMax",
+          "label": "ItemCountMax",
+          "type": "int",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / Barter",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.Barter.ItemCountMin",
+          "label": "ItemCountMin",
+          "type": "int",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / Barter",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.PurchasesAreFoundInRaid",
+          "label": "PurchasesAreFoundInRaid",
+          "type": "bool",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.RemoveSeasonalItemsWhenNotInEvent",
+          "label": "RemoveSeasonalItemsWhenNotInEvent",
+          "type": "bool",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.ShowDefaultPresetsOnly",
+          "label": "ShowDefaultPresetsOnly",
+          "type": "bool",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.UseTraderPriceForOffersIfHigher",
+          "label": "UseTraderPriceForOffersIfHigher",
+          "type": "bool",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.GenerateBaseFleaPrices.GeneratePresetPriceByChildren",
+          "label": "GeneratePresetPriceByChildren",
+          "type": "bool",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / GenerateBaseFleaPrices",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.GenerateBaseFleaPrices.PreventPriceBeingBelowTraderBuyPrice",
+          "label": "PreventPriceBeingBelowTraderBuyPrice",
+          "type": "bool",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / GenerateBaseFleaPrices",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.GenerateBaseFleaPrices.UseHandbookPrice",
+          "label": "UseHandbookPrice",
+          "type": "bool",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / GenerateBaseFleaPrices",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.GenerateBaseFleaPrices.UseHideoutCraftMultiplier",
+          "label": "UseHideoutCraftMultiplier",
+          "type": "bool",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / GenerateBaseFleaPrices",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.GenerateBaseFleaPrices.HideoutCraftMultiplier",
+          "label": "HideoutCraftMultiplier",
+          "type": "float",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / GenerateBaseFleaPrices",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.GenerateBaseFleaPrices.PriceMultiplier",
+          "label": "PriceMultiplier",
+          "type": "float",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / GenerateBaseFleaPrices",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.ExpiredOfferThreshold",
+          "label": "ExpiredOfferThreshold",
+          "type": "int",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.OfferAdjustment.AdjustPriceWhenBelowHandbookPrice",
+          "label": "AdjustPriceWhenBelowHandbookPrice",
+          "type": "bool",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / OfferAdjustment",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.OfferAdjustment.HandbookPriceMultiplier",
+          "label": "HandbookPriceMultiplier",
+          "type": "float",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / OfferAdjustment",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.OfferAdjustment.MaxPriceDifferenceBelowHandbookPercent",
+          "label": "MaxPriceDifferenceBelowHandbookPercent",
+          "type": "float",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / OfferAdjustment",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.OfferAdjustment.PriceThresholdRub",
+          "label": "PriceThresholdRub",
+          "type": "float",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / OfferAdjustment",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.Pack.ChancePercent",
+          "label": "ChancePercent",
+          "type": "float",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / Pack",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.Pack.ItemCountMax",
+          "label": "ItemCountMax",
+          "type": "int",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / Pack",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.Pack.ItemCountMin",
+          "label": "ItemCountMin",
+          "type": "int",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / Pack",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.Blacklist.ArmorPlate.MaxProtectionLevel",
+          "label": "MaxProtectionLevel",
+          "type": "int",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / Blacklist / ArmorPlate",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.Blacklist.DamagedAmmoPacks",
+          "label": "DamagedAmmoPacks",
+          "type": "bool",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / Blacklist",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.Blacklist.EnableBsgList",
+          "label": "EnableBsgList",
+          "type": "bool",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / Blacklist",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.Blacklist.EnableCustomItemCategoryList",
+          "label": "EnableCustomItemCategoryList",
+          "type": "bool",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / Blacklist",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.Blacklist.EnableQuestList",
+          "label": "EnableQuestList",
+          "type": "bool",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / Blacklist",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Dynamic.Blacklist.TraderItems",
+          "label": "TraderItems",
+          "type": "bool",
+          "implemented": false,
+          "category": "RagfairConfig / Dynamic / Blacklist",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.OfferListingTaxMultiplier",
+          "label": "OfferListingTaxMultiplier",
+          "type": "int",
+          "implemented": false,
+          "category": "RagfairConfig",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.RunIntervalSeconds",
+          "label": "RunIntervalSeconds",
+          "type": "int",
+          "implemented": false,
+          "category": "RagfairConfig",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.RunIntervalValues.InRaid",
+          "label": "InRaid",
+          "type": "int",
+          "implemented": false,
+          "category": "RagfairConfig / RunIntervalValues",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.RunIntervalValues.OutOfRaid",
+          "label": "OutOfRaid",
+          "type": "int",
+          "implemented": false,
+          "category": "RagfairConfig / RunIntervalValues",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Sell.Fees",
+          "label": "Fees",
+          "type": "bool",
+          "implemented": false,
+          "category": "RagfairConfig / Sell",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Sell.Chance.SellMultiplier",
+          "label": "SellMultiplier",
+          "type": "float",
+          "implemented": false,
+          "category": "RagfairConfig / Sell / Chance",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Sell.Chance.Base",
+          "label": "Base",
+          "type": "int",
+          "implemented": false,
+          "category": "RagfairConfig / Sell / Chance",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Sell.Chance.MaxSellChancePercent",
+          "label": "MaxSellChancePercent",
+          "type": "int",
+          "implemented": false,
+          "category": "RagfairConfig / Sell / Chance",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Sell.Chance.MinSellChancePercent",
+          "label": "MinSellChancePercent",
+          "type": "int",
+          "implemented": false,
+          "category": "RagfairConfig / Sell / Chance",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.Sell.ExpireSeconds",
+          "label": "ExpireSeconds",
+          "type": "int",
+          "implemented": false,
+          "category": "RagfairConfig / Sell",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.TieredFlea.AmmoTiersEnabled",
+          "label": "AmmoTiersEnabled",
+          "type": "bool",
+          "implemented": false,
+          "category": "RagfairConfig / TieredFlea",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.ragfair.TieredFlea.Enabled",
+          "label": "Enabled",
+          "type": "bool",
+          "implemented": false,
+          "category": "RagfairConfig / TieredFlea",
+          "description": "SPT ragfair.json value \u2014 not implemented in aowlspt yet."
+        }
+      ],
+      "nested": [
+        {
+          "key": "spt.ragfair.Traders",
+          "label": "Traders",
+          "type": "Dictionary<MongoId, Boolean>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Dynamic.Armor.PlateSlotIdToRemovePool",
+          "label": "PlateSlotIdToRemovePool",
+          "type": "HashSet<String>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Dynamic.Barter.ItemTplBlacklist",
+          "label": "ItemTplBlacklist",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Dynamic.Barter.ItemTypeBlacklist",
+          "label": "ItemTypeBlacklist",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Dynamic.Condition",
+          "label": "Condition",
+          "type": "Dictionary<MongoId, Condition>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Dynamic.ItemPriceMultiplier",
+          "label": "ItemPriceMultiplier",
+          "type": "Dictionary<MongoId, Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Dynamic.ItemPriceOverrideRouble",
+          "label": "ItemPriceOverrideRouble",
+          "type": "Dictionary<MongoId, Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Dynamic.OfferCurrencyChangePercent",
+          "label": "OfferCurrencyChangePercent",
+          "type": "Dictionary<MongoId, Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Dynamic.UnreasonableModPrices",
+          "label": "UnreasonableModPrices",
+          "type": "Dictionary<MongoId, UnreasonableModPrices>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Dynamic.OfferItemCount",
+          "label": "OfferItemCount",
+          "type": "Dictionary<String, MinMax<Int32>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Dynamic.GenerateBaseFleaPrices.ItemTplMultiplierOverride",
+          "label": "ItemTplMultiplierOverride",
+          "type": "Dictionary<MongoId, Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Dynamic.GenerateBaseFleaPrices.ItemTypeMultiplierOverride",
+          "label": "ItemTypeMultiplierOverride",
+          "type": "Dictionary<MongoId, Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Dynamic.IgnoreQualityPriceVarianceBlacklist",
+          "label": "IgnoreQualityPriceVarianceBlacklist",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Dynamic.ShowAsSingleStack",
+          "label": "ShowAsSingleStack",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Dynamic.Rating",
+          "label": "Rating",
+          "type": "MinMax<Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Dynamic.StackablePercent",
+          "label": "StackablePercent",
+          "type": "MinMax<Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Dynamic.EndTimeSeconds",
+          "label": "EndTimeSeconds",
+          "type": "MinMax<Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Dynamic.NonStackableCount",
+          "label": "NonStackableCount",
+          "type": "MinMax<Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Dynamic.Pack.ItemTypeWhitelist",
+          "label": "ItemTypeWhitelist",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Dynamic.PriceRanges.Default",
+          "label": "Default",
+          "type": "MinMax<Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Dynamic.PriceRanges.Pack",
+          "label": "Pack",
+          "type": "MinMax<Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Dynamic.PriceRanges.Preset",
+          "label": "Preset",
+          "type": "MinMax<Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Dynamic.Blacklist.ArmorPlate.IgnoreSlots",
+          "label": "IgnoreSlots",
+          "type": "HashSet<String>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Dynamic.Blacklist.Custom",
+          "label": "Custom",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Dynamic.Blacklist.CustomItemCategoryList",
+          "label": "CustomItemCategoryList",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.Sell.Time",
+          "label": "Time",
+          "type": "MinMax<Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.TieredFlea.AmmoTplUnlocks",
+          "label": "AmmoTplUnlocks",
+          "type": "Dictionary<MongoId, Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.TieredFlea.UnlocksTpl",
+          "label": "UnlocksTpl",
+          "type": "Dictionary<MongoId, Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.ragfair.TieredFlea.UnlocksType",
+          "label": "UnlocksType",
+          "type": "Dictionary<MongoId, Int32>",
+          "implemented": false
+        }
+      ]
+    },
+    {
+      "id": "spt.repair",
+      "label": "SPT / repair",
+      "configFile": "configs/repair.json",
+      "className": "RepairConfig",
+      "settings": [
+        {
+          "key": "spt.repair.ApplyRandomizeDurabilityLoss",
+          "label": "ApplyRandomizeDurabilityLoss",
+          "type": "bool",
+          "implemented": false,
+          "category": "RepairConfig",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.ArmorKitSkillPointGainPerRepairPointMultiplier",
+          "label": "ArmorKitSkillPointGainPerRepairPointMultiplier",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.PriceMultiplier",
+          "label": "PriceMultiplier",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKitIntellectGainMultiplier.Armor",
+          "label": "Armor",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKitIntellectGainMultiplier",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKitIntellectGainMultiplier.Weapon",
+          "label": "Weapon",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKitIntellectGainMultiplier",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Armor.EliteBonusSettings.FenceStandingLossDiscount",
+          "label": "FenceStandingLossDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Armor / EliteBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Armor.EliteBonusSettings.ScavCaseDiscount",
+          "label": "ScavCaseDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Armor / EliteBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Armor.EliteBonusSettings.RepeatableQuestExtraCount",
+          "label": "RepeatableQuestExtraCount",
+          "type": "int",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Armor / EliteBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Armor.LevelBonusSettings.HealthRestoreDiscount",
+          "label": "HealthRestoreDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Armor / LevelBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Armor.LevelBonusSettings.HealthRestoreTraderDiscount",
+          "label": "HealthRestoreTraderDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Armor / LevelBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Armor.LevelBonusSettings.InsuranceDiscount",
+          "label": "InsuranceDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Armor / LevelBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Armor.LevelBonusSettings.InsuranceTraderDiscount",
+          "label": "InsuranceTraderDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Armor / LevelBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Armor.LevelBonusSettings.PaidExitDiscount",
+          "label": "PaidExitDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Armor / LevelBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Armor.LevelBonusSettings.RepeatableQuestChangeDiscount",
+          "label": "RepeatableQuestChangeDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Armor / LevelBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Headwear.EliteBonusSettings.FenceStandingLossDiscount",
+          "label": "FenceStandingLossDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Headwear / EliteBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Headwear.EliteBonusSettings.ScavCaseDiscount",
+          "label": "ScavCaseDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Headwear / EliteBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Headwear.EliteBonusSettings.RepeatableQuestExtraCount",
+          "label": "RepeatableQuestExtraCount",
+          "type": "int",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Headwear / EliteBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Headwear.LevelBonusSettings.HealthRestoreDiscount",
+          "label": "HealthRestoreDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Headwear / LevelBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Headwear.LevelBonusSettings.HealthRestoreTraderDiscount",
+          "label": "HealthRestoreTraderDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Headwear / LevelBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Headwear.LevelBonusSettings.InsuranceDiscount",
+          "label": "InsuranceDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Headwear / LevelBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Headwear.LevelBonusSettings.InsuranceTraderDiscount",
+          "label": "InsuranceTraderDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Headwear / LevelBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Headwear.LevelBonusSettings.PaidExitDiscount",
+          "label": "PaidExitDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Headwear / LevelBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Headwear.LevelBonusSettings.RepeatableQuestChangeDiscount",
+          "label": "RepeatableQuestChangeDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Headwear / LevelBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Vest.EliteBonusSettings.FenceStandingLossDiscount",
+          "label": "FenceStandingLossDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Vest / EliteBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Vest.EliteBonusSettings.ScavCaseDiscount",
+          "label": "ScavCaseDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Vest / EliteBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Vest.EliteBonusSettings.RepeatableQuestExtraCount",
+          "label": "RepeatableQuestExtraCount",
+          "type": "int",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Vest / EliteBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Vest.LevelBonusSettings.HealthRestoreDiscount",
+          "label": "HealthRestoreDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Vest / LevelBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Vest.LevelBonusSettings.HealthRestoreTraderDiscount",
+          "label": "HealthRestoreTraderDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Vest / LevelBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Vest.LevelBonusSettings.InsuranceDiscount",
+          "label": "InsuranceDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Vest / LevelBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Vest.LevelBonusSettings.InsuranceTraderDiscount",
+          "label": "InsuranceTraderDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Vest / LevelBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Vest.LevelBonusSettings.PaidExitDiscount",
+          "label": "PaidExitDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Vest / LevelBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Vest.LevelBonusSettings.RepeatableQuestChangeDiscount",
+          "label": "RepeatableQuestChangeDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Vest / LevelBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Weapon.EliteBonusSettings.FenceStandingLossDiscount",
+          "label": "FenceStandingLossDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Weapon / EliteBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Weapon.EliteBonusSettings.ScavCaseDiscount",
+          "label": "ScavCaseDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Weapon / EliteBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Weapon.EliteBonusSettings.RepeatableQuestExtraCount",
+          "label": "RepeatableQuestExtraCount",
+          "type": "int",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Weapon / EliteBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Weapon.LevelBonusSettings.HealthRestoreDiscount",
+          "label": "HealthRestoreDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Weapon / LevelBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Weapon.LevelBonusSettings.HealthRestoreTraderDiscount",
+          "label": "HealthRestoreTraderDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Weapon / LevelBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Weapon.LevelBonusSettings.InsuranceDiscount",
+          "label": "InsuranceDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Weapon / LevelBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Weapon.LevelBonusSettings.InsuranceTraderDiscount",
+          "label": "InsuranceTraderDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Weapon / LevelBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Weapon.LevelBonusSettings.PaidExitDiscount",
+          "label": "PaidExitDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Weapon / LevelBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.RepairKit.Weapon.LevelBonusSettings.RepeatableQuestChangeDiscount",
+          "label": "RepeatableQuestChangeDiscount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / RepairKit / Weapon / LevelBonusSettings",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.WeaponTreatment.CritFailureAmount",
+          "label": "CritFailureAmount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / WeaponTreatment",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.WeaponTreatment.CritFailureChance",
+          "label": "CritFailureChance",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / WeaponTreatment",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.WeaponTreatment.CritSuccessAmount",
+          "label": "CritSuccessAmount",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / WeaponTreatment",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.WeaponTreatment.CritSuccessChance",
+          "label": "CritSuccessChance",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / WeaponTreatment",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.repair.WeaponTreatment.PointGainMultiplier",
+          "label": "PointGainMultiplier",
+          "type": "float",
+          "implemented": false,
+          "category": "RepairConfig / WeaponTreatment",
+          "description": "SPT repair.json value \u2014 not implemented in aowlspt yet."
+        }
+      ],
+      "nested": []
+    },
+    {
+      "id": "spt.scavcase",
+      "label": "SPT / scavcase",
+      "configFile": "configs/scavcase.json",
+      "className": "ScavCaseConfig",
+      "settings": [
+        {
+          "key": "spt.scavcase.AmmoRewards.AmmoRewardChancePercent",
+          "label": "AmmoRewardChancePercent",
+          "type": "int",
+          "implemented": false,
+          "category": "ScavCaseConfig / AmmoRewards",
+          "description": "SPT scavcase.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.scavcase.AmmoRewards.MinStackSize",
+          "label": "MinStackSize",
+          "type": "int",
+          "implemented": false,
+          "category": "ScavCaseConfig / AmmoRewards",
+          "description": "SPT scavcase.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.scavcase.AllowBossItemsAsRewards",
+          "label": "AllowBossItemsAsRewards",
+          "type": "bool",
+          "implemented": false,
+          "category": "ScavCaseConfig",
+          "description": "SPT scavcase.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.scavcase.AllowMultipleAmmoRewardsPerRarity",
+          "label": "AllowMultipleAmmoRewardsPerRarity",
+          "type": "bool",
+          "implemented": false,
+          "category": "ScavCaseConfig",
+          "description": "SPT scavcase.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.scavcase.AllowMultipleMoneyRewardsPerRarity",
+          "label": "AllowMultipleMoneyRewardsPerRarity",
+          "type": "bool",
+          "implemented": false,
+          "category": "ScavCaseConfig",
+          "description": "SPT scavcase.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.scavcase.MoneyRewards.MoneyRewardChancePercent",
+          "label": "MoneyRewardChancePercent",
+          "type": "int",
+          "implemented": false,
+          "category": "ScavCaseConfig / MoneyRewards",
+          "description": "SPT scavcase.json value \u2014 not implemented in aowlspt yet."
+        }
+      ],
+      "nested": [
+        {
+          "key": "spt.scavcase.AmmoRewards.AmmoRewardBlacklist",
+          "label": "AmmoRewardBlacklist",
+          "type": "Dictionary<String, List<MongoId>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.scavcase.AmmoRewards.AmmoRewardValueRangeRub",
+          "label": "AmmoRewardValueRangeRub",
+          "type": "Dictionary<String, MinMax<Double>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.scavcase.RewardItemValueRangeRub",
+          "label": "RewardItemValueRangeRub",
+          "type": "Dictionary<String, MinMax<Double>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.scavcase.RewardItemBlacklist",
+          "label": "RewardItemBlacklist",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.scavcase.RewardItemParentBlacklist",
+          "label": "RewardItemParentBlacklist",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.scavcase.MoneyRewards.EurCount.Common",
+          "label": "Common",
+          "type": "MinMax<Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.scavcase.MoneyRewards.EurCount.Rare",
+          "label": "Rare",
+          "type": "MinMax<Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.scavcase.MoneyRewards.EurCount.SuperRare",
+          "label": "SuperRare",
+          "type": "MinMax<Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.scavcase.MoneyRewards.GpCount.Common",
+          "label": "Common",
+          "type": "MinMax<Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.scavcase.MoneyRewards.GpCount.Rare",
+          "label": "Rare",
+          "type": "MinMax<Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.scavcase.MoneyRewards.GpCount.SuperRare",
+          "label": "SuperRare",
+          "type": "MinMax<Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.scavcase.MoneyRewards.RubCount.Common",
+          "label": "Common",
+          "type": "MinMax<Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.scavcase.MoneyRewards.RubCount.Rare",
+          "label": "Rare",
+          "type": "MinMax<Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.scavcase.MoneyRewards.RubCount.SuperRare",
+          "label": "SuperRare",
+          "type": "MinMax<Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.scavcase.MoneyRewards.UsdCount.Common",
+          "label": "Common",
+          "type": "MinMax<Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.scavcase.MoneyRewards.UsdCount.Rare",
+          "label": "Rare",
+          "type": "MinMax<Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.scavcase.MoneyRewards.UsdCount.SuperRare",
+          "label": "SuperRare",
+          "type": "MinMax<Int32>",
+          "implemented": false
+        }
+      ]
+    },
+    {
+      "id": "spt.seasonalevents",
+      "label": "SPT / seasonalevents",
+      "configFile": "configs/seasonalevents.json",
+      "className": "SeasonalEventConfig",
+      "settings": [
+        {
+          "key": "spt.seasonalevents.EnableSeasonalEventDetection",
+          "label": "EnableSeasonalEventDetection",
+          "type": "bool",
+          "implemented": false,
+          "category": "SeasonalEventConfig",
+          "description": "SPT seasonalevents.json value \u2014 not implemented in aowlspt yet."
+        }
+      ],
+      "nested": [
+        {
+          "key": "spt.seasonalevents.BotAppearanceChanges",
+          "label": "BotAppearanceChanges",
+          "type": "Dictionary<SeasonalEventType, Dictionary<String, Dictionary<String, Dictionary<MongoId, Int32>>>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.seasonalevents.EventGear",
+          "label": "EventGear",
+          "type": "Dictionary<SeasonalEventType, Dictionary<String, Dictionary<String, Dictionary<MongoId, Int32>>>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.seasonalevents.EventLoot",
+          "label": "EventLoot",
+          "type": "Dictionary<SeasonalEventType, Dictionary<String, Dictionary<String, Dictionary<MongoId, Int32>>>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.seasonalevents.HostilitySettingsForEvent",
+          "label": "HostilitySettingsForEvent",
+          "type": "Dictionary<String, Dictionary<String, List<AdditionalHostilitySettings>>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.seasonalevents.EventBossSpawns",
+          "label": "EventBossSpawns",
+          "type": "Dictionary<String, Dictionary<String, List<BossLocationSpawn>>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.seasonalevents.EventWaves",
+          "label": "EventWaves",
+          "type": "Dictionary<String, Dictionary<String, List<Wave>>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.seasonalevents.KhorovodEventTransitWhitelist",
+          "label": "KhorovodEventTransitWhitelist",
+          "type": "Dictionary<String, List<Int32>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.seasonalevents.EventBotMapping",
+          "label": "EventBotMapping",
+          "type": "Dictionary<String, String>",
+          "implemented": false
+        },
+        {
+          "key": "spt.seasonalevents.ChristmasContainerIds",
+          "label": "ChristmasContainerIds",
+          "type": "HashSet<String>",
+          "implemented": false
+        },
+        {
+          "key": "spt.seasonalevents.GifterSettings",
+          "label": "GifterSettings",
+          "type": "List<GifterSetting>",
+          "implemented": false
+        },
+        {
+          "key": "spt.seasonalevents.Events",
+          "label": "Events",
+          "type": "List<SeasonalEvent>",
+          "implemented": false
+        }
+      ]
+    },
+    {
+      "id": "spt.trader",
+      "label": "SPT / trader",
+      "configFile": "configs/trader.json",
+      "className": "TraderConfig",
+      "settings": [
+        {
+          "key": "spt.trader.PurchasesAreFoundInRaid",
+          "label": "PurchasesAreFoundInRaid",
+          "type": "bool",
+          "implemented": false,
+          "category": "TraderConfig",
+          "description": "SPT trader.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.trader.TradersResetFromServerStart",
+          "label": "TradersResetFromServerStart",
+          "type": "bool",
+          "implemented": false,
+          "category": "TraderConfig",
+          "description": "SPT trader.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.trader.TraderPriceMultiplier",
+          "label": "TraderPriceMultiplier",
+          "type": "float",
+          "implemented": false,
+          "category": "TraderConfig",
+          "description": "SPT trader.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.trader.Fence.BlacklistSeasonalItems",
+          "label": "BlacklistSeasonalItems",
+          "type": "bool",
+          "implemented": false,
+          "category": "TraderConfig / Fence",
+          "description": "SPT trader.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.trader.Fence.RegenerateAssortsOnRefresh",
+          "label": "RegenerateAssortsOnRefresh",
+          "type": "bool",
+          "implemented": false,
+          "category": "TraderConfig / Fence",
+          "description": "SPT trader.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.trader.Fence.CoopExtractGift.SendGift",
+          "label": "SendGift",
+          "type": "bool",
+          "implemented": false,
+          "category": "TraderConfig / Fence / CoopExtractGift",
+          "description": "SPT trader.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.trader.Fence.CoopExtractGift.UseRewardItemBlacklist",
+          "label": "UseRewardItemBlacklist",
+          "type": "bool",
+          "implemented": false,
+          "category": "TraderConfig / Fence / CoopExtractGift",
+          "description": "SPT trader.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.trader.Fence.CoopExtractGift.GiftExpiryHours",
+          "label": "GiftExpiryHours",
+          "type": "int",
+          "implemented": false,
+          "category": "TraderConfig / Fence / CoopExtractGift",
+          "description": "SPT trader.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.trader.Fence.DiscountOptions.ItemPriceMult",
+          "label": "ItemPriceMult",
+          "type": "float",
+          "implemented": false,
+          "category": "TraderConfig / Fence / DiscountOptions",
+          "description": "SPT trader.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.trader.Fence.DiscountOptions.PresetPriceMult",
+          "label": "PresetPriceMult",
+          "type": "float",
+          "implemented": false,
+          "category": "TraderConfig / Fence / DiscountOptions",
+          "description": "SPT trader.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.trader.Fence.DiscountOptions.AssortSize",
+          "label": "AssortSize",
+          "type": "int",
+          "implemented": false,
+          "category": "TraderConfig / Fence / DiscountOptions",
+          "description": "SPT trader.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.trader.Fence.AmmoMaxPenLimit",
+          "label": "AmmoMaxPenLimit",
+          "type": "float",
+          "implemented": false,
+          "category": "TraderConfig / Fence",
+          "description": "SPT trader.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.trader.Fence.ItemPriceMult",
+          "label": "ItemPriceMult",
+          "type": "float",
+          "implemented": false,
+          "category": "TraderConfig / Fence",
+          "description": "SPT trader.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.trader.Fence.PartialRefreshChangePercent",
+          "label": "PartialRefreshChangePercent",
+          "type": "float",
+          "implemented": false,
+          "category": "TraderConfig / Fence",
+          "description": "SPT trader.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.trader.Fence.PlayerRepMax",
+          "label": "PlayerRepMax",
+          "type": "float",
+          "implemented": false,
+          "category": "TraderConfig / Fence",
+          "description": "SPT trader.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.trader.Fence.PlayerRepMin",
+          "label": "PlayerRepMin",
+          "type": "float",
+          "implemented": false,
+          "category": "TraderConfig / Fence",
+          "description": "SPT trader.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.trader.Fence.PresetPriceMult",
+          "label": "PresetPriceMult",
+          "type": "float",
+          "implemented": false,
+          "category": "TraderConfig / Fence",
+          "description": "SPT trader.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.trader.Fence.AssortSize",
+          "label": "AssortSize",
+          "type": "int",
+          "implemented": false,
+          "category": "TraderConfig / Fence",
+          "description": "SPT trader.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.trader.Fence.BtrDeliveryExpireHours",
+          "label": "BtrDeliveryExpireHours",
+          "type": "int",
+          "implemented": false,
+          "category": "TraderConfig / Fence",
+          "description": "SPT trader.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.trader.Fence.PartialRefreshTimeSeconds",
+          "label": "PartialRefreshTimeSeconds",
+          "type": "int",
+          "implemented": false,
+          "category": "TraderConfig / Fence",
+          "description": "SPT trader.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.trader.UpdateTimeDefault",
+          "label": "UpdateTimeDefault",
+          "type": "int",
+          "implemented": false,
+          "category": "TraderConfig",
+          "description": "SPT trader.json value \u2014 not implemented in aowlspt yet."
+        }
+      ],
+      "nested": [
+        {
+          "key": "spt.trader.Fence.CoopExtractGift.MessageLocaleIds",
+          "label": "MessageLocaleIds",
+          "type": "List<String>",
+          "implemented": false
+        },
+        {
+          "key": "spt.trader.Fence.ItemTypeLimits",
+          "label": "ItemTypeLimits",
+          "type": "Dictionary<MongoId, Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.trader.Fence.ItemStackSizeOverrideMinMax",
+          "label": "ItemStackSizeOverrideMinMax",
+          "type": "Dictionary<MongoId, MinMax<Int32>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.trader.Fence.ItemCategoryRoublePriceLimit",
+          "label": "ItemCategoryRoublePriceLimit",
+          "type": "Dictionary<MongoId, Nullable<Double>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.trader.Fence.ChancePlateExistsInArmorPercent",
+          "label": "ChancePlateExistsInArmorPercent",
+          "type": "Dictionary<String, Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.trader.Fence.PresetSlotsToRemoveChancePercent",
+          "label": "PresetSlotsToRemoveChancePercent",
+          "type": "Dictionary<String, Nullable<Double>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.trader.Fence.DiscountOptions.EquipmentPresetMinMax",
+          "label": "EquipmentPresetMinMax",
+          "type": "MinMax<Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.trader.Fence.DiscountOptions.WeaponPresetMinMax",
+          "label": "WeaponPresetMinMax",
+          "type": "MinMax<Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.trader.Fence.Blacklist",
+          "label": "Blacklist",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.trader.Fence.PreventDuplicateOffersOfCategory",
+          "label": "PreventDuplicateOffersOfCategory",
+          "type": "HashSet<MongoId>",
+          "implemented": false
+        },
+        {
+          "key": "spt.trader.Fence.ArmorMaxDurabilityPercentMinMax.Current",
+          "label": "Current",
+          "type": "MinMax<Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.trader.Fence.ArmorMaxDurabilityPercentMinMax.Max",
+          "label": "Max",
+          "type": "MinMax<Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.trader.Fence.WeaponDurabilityPercentMinMax.Current",
+          "label": "Current",
+          "type": "MinMax<Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.trader.Fence.WeaponDurabilityPercentMinMax.Max",
+          "label": "Max",
+          "type": "MinMax<Double>",
+          "implemented": false
+        },
+        {
+          "key": "spt.trader.Fence.EquipmentPresetMinMax",
+          "label": "EquipmentPresetMinMax",
+          "type": "MinMax<Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.trader.Fence.WeaponPresetMinMax",
+          "label": "WeaponPresetMinMax",
+          "type": "MinMax<Int32>",
+          "implemented": false
+        },
+        {
+          "key": "spt.trader.UpdateTime",
+          "label": "UpdateTime",
+          "type": "List<UpdateTime>",
+          "implemented": false
+        }
+      ]
+    },
+    {
+      "id": "spt.weather",
+      "label": "SPT / weather",
+      "configFile": "configs/weather.json",
+      "className": "WeatherConfig",
+      "settings": [
+        {
+          "key": "spt.weather.Acceleration",
+          "label": "Acceleration",
+          "type": "float",
+          "implemented": false,
+          "category": "WeatherConfig",
+          "description": "SPT weather.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.weather.OverrideSeason",
+          "label": "OverrideSeason",
+          "type": "enum",
+          "options": [
+            "AUTUMN",
+            "AUTUMN_LATE",
+            "SPRING",
+            "SPRING_EARLY",
+            "STORM",
+            "SUMMER",
+            "WINTER"
+          ],
+          "implemented": false,
+          "category": "WeatherConfig",
+          "description": "SPT weather.json value \u2014 not implemented in aowlspt yet."
+        },
+        {
+          "key": "spt.weather.Weather.GenerateWeatherAmountHours",
+          "label": "GenerateWeatherAmountHours",
+          "type": "int",
+          "implemented": false,
+          "category": "WeatherConfig / Weather",
+          "description": "SPT weather.json value \u2014 not implemented in aowlspt yet."
+        }
+      ],
+      "nested": [
+        {
+          "key": "spt.weather.SeasonDates",
+          "label": "SeasonDates",
+          "type": "List<SeasonDateTimes>",
+          "implemented": false
+        },
+        {
+          "key": "spt.weather.Weather.WeatherPresetWeight",
+          "label": "WeatherPresetWeight",
+          "type": "Dictionary<String, Dictionary<WeatherPreset, Double>>",
+          "implemented": false
+        },
+        {
+          "key": "spt.weather.Weather.PresetWeights",
+          "label": "PresetWeights",
+          "type": "Dictionary<String, PresetWeights>",
+          "implemented": false
+        },
+        {
+          "key": "spt.weather.Weather.TimePeriod",
+          "label": "TimePeriod",
+          "type": "WeatherSettings<Int32>",
+          "implemented": false
+        }
+      ]
+    }
+  ]
+}

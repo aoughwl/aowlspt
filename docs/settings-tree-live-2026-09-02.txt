@@ -1,0 +1,247 @@
+# Live SettingsScreen tree, measured 2026-09-02 from the running client (build 4,921,344 host DLL, GRAPHICS tab up, POSTFX subtab selected).
+# Captured with the live inspector: tree SettingsScreen depth 4, rects of every panel, the tab strip and the cloned subtab strip. Data, not prose.
+
+aowlspt live inspector -- batch 4, 14 command(s), on Unity thread 15848
+> find SettingsScreen
+  searching ALL 16 scene root(s) for name containing "SettingsScreen" (case-insensitive; budget 20000 nodes, 12ms per frame, continuing across frames automatically)
+    HIT 0x000001fd70ec5ee0 name="SettingsScreen"  parent="Common UI"   ($f1)
+  visited 20000 node(s) over 157 frame(s), 1 match(es), frontier 13697 node(s)
+  -- STOPPED EARLY on the NODE BUDGET. This is NOT proof the subject is absent. Continue with `find more` (it RESUMES from the frontier above and does not re-walk what it already rejected), or re-run with a bigger budget, or search from a narrower root.
+  matches are bound to $f1..$f1 for the rest of this batch
+> tree $f1 4
+  tree from 0x000001fd70ec5ee0 name="SettingsScreen" (max depth 4, max 3000 nodes)
+    "SettingsScreen"  0x000001fd70ec5ee0  (16 child)
+      + "Background"  0x000001fd22e903e0
+      + "Caption"  0x000001fd22d24d00  (1 child)
+        + "Settings Icon"  0x000001fd22d24d20
+      + "Toggles"  0x000001fd70ec5f00  (5 child)
+        + "GameToggleSpawner"  0x000001fd70ec5ea0  (1 child)
+          + "GameToggle"  0x000001fd22d2acc0  (2 child)
+            + "Background"  0x000001fd22d2ac60  (1 child)
+            + "SizeLabel"  0x000001fd22d2aba0  (2 child)
+        + "GraphicsToggleSpawner"  0x000001fd70ec5e20  (1 child)
+          + "GraphicsToggle"  0x000001fd22d2aa20  (2 child)
+            + "Background"  0x000001fd22d2a9c0  (1 child)
+            + "SizeLabel"  0x000001fd22d2a900  (2 child)
+        + "PostFxToggleSpawner"  0x000001fd70ec5dc0  (1 child)
+          + "PostFxToggle"  0x000001fd22d2a7e0  (2 child)
+            + "Background"  0x000001fd22d2a780  (1 child)
+            + "SizeLabel"  0x000001fd22d2a6a0  (1 child)
+        + "SoundToggleSpawner"  0x000001fd70ec5d40  (1 child)
+          + "SoundToggle"  0x000001fd22d2a520  (2 child)
+            + "Background"  0x000001fd22d2a4a0  (1 child)
+            + "SizeLabel"  0x000001fd22d2a3e0  (2 child)
+        + "ControlsToggleSpawner"  0x000001fd70ec5ce0  (1 child)
+          + "ControlsToggle"  0x000001fd22d2a2c0  (2 child)
+            + "Background"  0x000001fd22d2a260  (1 child)
+            + "SizeLabel"  0x000001fd22d2a0e0  (2 child)
+      + "Game Settings"  0x000001fd22d246c0  (2 child)
+        + "Container"  0x000001fd22d246e0  (2 child)
+          + "Nickname Panel"  0x000001fd22d24700  (5 child)
+            + "Warning Panel"  0x000001fd22d44920  (1 child)
+            + "InputField"  0x000001fd70ec5c60  (3 child)
+            + "UsedSymbolsCaption"  0x000001fd22d447a0
+            + "Image"  0x000001fd1bf75600
+            + "Blocker"  0x000001fd1bf755e0
+          + "Scroll View"  0x000001fd22d24680  (2 child)
+            + "Viewport"  0x000001fd70290be0  (1 child)
+            + "Scrollbar"  0x000001fd22d246a0  (1 child)
+        + "Overlay Layer"  0x000001fd70ec5b00  (1 child)
+          + "SettingsTooltip"  0x000001fd7009f200  (1 child)
+            + "Background"  0x000001fd7009f1e0  (3 child)
+      + "Graphics Settings"  0x000001fd70ebda20  (2 child)
+        + "Other Settings"  0x000001fd70ebda40  (1 child)
+          + "SettingsList"  0x000001fd22d24640  (2 child)
+            + "Viewport"  0x000001fd704e4f00  (1 child)
+            + "Scrollbar"  0x000001fd22d24660  (1 child)
+        + "Overlay Layer"  0x000001fd70ec59e0  (1 child)
+          + "SettingsTooltip"  0x000001fd707b43c0  (1 child)
+            + "Background"  0x000001fd707b43a0  (3 child)
+      + "PostFX Settings"  0x000001fd70ec58e0  (3 child)
+        + "Panel"  0x000001fd70ec5900  (2 child)
+          + "EnablePanel"  0x000001fd7089aaa0
+          + "SettingsPanel"  0x000001fd7089aa80  (28 child)
+            + "aowlspt-pfx-enabled"  0x000001fd2241a480  (3 child)
+            + "aowlspt-pfx-raidOnly"  0x000001fd2241a240  (3 child)
+            + "aowlspt-pfx-tonemapStrength"  0x000001fd22420f60  (3 child)
+            + "aowlspt-pfx-exposure"  0x000001fd224205c0  (3 child)
+            + "aowlspt-pfx-contrast"  0x000001fd224249e0  (3 child)
+            + "aowlspt-pfx-saturation"  0x000001fd22428fa0  (3 child)
+            + "aowlspt-pfx-vibrance"  0x000001fd224284e0  (3 child)
+            + "aowlspt-pfx-shadowDetail"  0x000001fd22429860  (3 child)
+            + "aowlspt-pfx-temperature"  0x000001fd22433e60  (3 child)
+            + "aowlspt-pfx-tint"  0x000001fd224335e0  (3 child)
+            + "aowlspt-pfx-lift"  0x000001fd22496ca0  (3 child)
+            + "aowlspt-pfx-gamma"  0x000001fd22496300  (3 child)
+            + "aowlspt-pfx-gain"  0x000001fd2249a4a0  (3 child)
+            + "aowlspt-pfx-shadows"  0x000001fd224ac940  (3 child)
+            + "aowlspt-pfx-highlights"  0x000001fd224ac040  (3 child)
+            + "aowlspt-pfx-sharpness"  0x000001fd224b34a0  (3 child)
+            + "aowlspt-pfx-bloom"  0x000001fd224b5b60  (3 child)
+            + "aowlspt-pfx-bloomStrength"  0x000001fd224b5860  (3 child)
+            + "aowlspt-pfx-bloomThreshold"  0x000001fd224b7c80  (3 child)
+            + "aowlspt-pfx-vignette"  0x000001fd224b7100  (3 child)
+            + "aowlspt-pfx-vignetteRadius"  0x000001fd224b9740  (3 child)
+            + "aowlspt-pfx-clarity"  0x000001fd224bbaa0  (3 child)
+            + "aowlspt-pfx-grain"  0x000001fd224bb040  (3 child)
+            + "aowlspt-pfx-grainSize"  0x000001fd224e4640  (3 child)
+            + "aowlspt-pfx-dither"  0x000001fd22533b00  (3 child)
+            + "aowlspt-pfx-chroma"  0x000001fd225330a0  (3 child)
+            + "aowlspt-pfx-diag"  0x000001fd2253f960  (3 child)
+            + "PostFxButtons"  0x000001fd70ec5880  (2 child)
+        + "Overlay Layer"  0x000001fd70ec57c0  (1 child)
+          + "SettingsTooltip"  0x000001fd70215560  (1 child)
+            + "Background"  0x000001fd70215540  (3 child)
+        + "aowl-pfx-banner"  0x000001fd2253f700
+      + "Sound Settings"  0x000001fd70ec56c0  (2 child)
+        + "Panel"  0x000001fd70ec56e0  (3 child)
+          + "SlidersSection"  0x000001fd7089a840  (1 child)
+            + "ChangeVoice"  0x000001fd70ec5660  (1 child)
+          + "TogglesSection"  0x000001fd7089a820
+          + "VoipSection"  0x000001fd70ec5580  (2 child)
+            + "BanBlocker"  0x000001fd70ec5520  (2 child)
+            + "Warning Panel"  0x000001fd70ec5440  (2 child)
+        + "SettingsTooltip"  0x000001fd708c1c00  (1 child)
+          + "Background"  0x000001fd708c1be0  (3 child)
+            + "Border Shadow"  0x000001fd1bf755c0
+            + "Border"  0x000001fd1bf755a0
+            + "Content"  0x000001fd70ec5400  (3 child)
+      + "Control Settings"  0x000001fd70ebd9c0  (3 child)
+        + "Toggles"  0x000001fd70ebd9e0  (2 child)
+          + "ControlToggle"  0x000001fd70ec5380  (1 child)
+            + "AnimatedToggle"  0x000001fd70ec5340  (2 child)
+          + "GesturesToggle"  0x000001fd70ec5300  (1 child)
+            + "AnimatedToggle"  0x000001fd70ec52e0  (2 child)
+        + "Content"  0x000001fd70ebd960  (2 child)
+          + "ControlsPart"  0x000001fd70ebd980  (2 child)
+            + "KeyBindingsPanel"  0x000001fd70ec52a0  (6 child)
+            + "MousePanel"  0x000001fd70ec51a0  (2 child)
+          + "GesturesPanel"  0x000001fd70ebd920  (1 child)
+            + "SettingsGesturesMenu"  0x000001fd70ec5160  (3 child)
+        + "Overlay Layer"  0x000001fd70ec6fe0  (1 child)
+          + "SettingsTooltip"  0x000001fd707fee60  (1 child)
+            + "Background"  0x000001fd707fee40  (3 child)
+      + "SaveSettingsButton"  0x000001fd22d24320  (1 child)
+        + "Text"  0x000001fd1bf75780
+      + "RestoreSettingsButton"  0x000001fd22d24300  (1 child)
+        + "Text"  0x000001fd1bf75740
+      + "SaveButton"  0x000001fd70ec6f00  (4 child)
+        + "RaycastTarget"  0x000001fd22d24a40
+        + "Background"  0x000001fd701ea980  (1 child)
+          + "Background_inside"  0x000001fd22d24a00  (1 child)
+            + "Noise"  0x000001fd22d24140
+        + "SizeLabel"  0x000001fd22d249a0  (3 child)
+          + "TMP UI SubObject [Jovanny Lemonad - Bender Normal Material]"  0x000001fd22eb2960
+          + "IconContainer"  0x000001fd22d249c0  (2 child)
+            + "IconIdle"  0x000001fd22d249e0
+            + "Icon"  0x000001fd22d24980
+          + "Label"  0x000001fd22d24960
+        + "Loader"  0x000001fd22e9fb20
+      + "CreditsButton"  0x000001fd70ec6ec0  (3 child)
+  128 node(s) printed  -- STOPPED EARLY on a cap; this subtree is larger than the budget. Deepen selectively with `tree $child` rather than raising the depth here.
+> rect $f1
+  klass = 0x000001faa1f2f0a0   (a Transform that is NOT a RectTransform has no rect -- the outermost menu roots are plain Transforms)
+  anchoredPosition = (0.0000, 35.0000)   via @0x2b5430
+  sizeDelta        = (0.0000, -70.0000)   via @0x2b54f0
+  anchorMin        = (0.0000, 0.0000)   via @0x2b52b0
+  anchorMax        = (1.0000, 1.0000)   via @0x2b5370
+  pivot            = (0.5000, 0.5000)   via @0x2b55b0
+  rect (x,y,w,h) = (-960.0000, -505.0000, 1920.0000, 1010.0000)   via @0x2b5240
+  NOTE: Vector2 getters decode via RAX (8-byte pack); get_rect decodes via the hidden-buffer sret convention Win64 uses for a struct >8 bytes. Both measured from GameAssembly.dll prologues, not assumed -- see abi/aowlspt_debugui.h.
+> children $f1 40
+  childCount = 16
+  via Transform::GetChild / get_childCount, Object::get_name (calls)
+    [0] transform=0x000001fd22e903e0 ($c0)  go=0x000001fd70eb46e0 ($g0)  name="Background"
+    [1] transform=0x000001fd22d24d00 ($c1)  go=0x000001fd70eb46c0 ($g1)  name="Caption"
+    [2] transform=0x000001fd70ec5f00 ($c2)  go=0x000001fd70ec5e80 ($g2)  name="Toggles"
+    [3] transform=0x000001fd22d246c0 ($c3)  go=0x000001fd22d44960 ($g3)  name="Game Settings"
+    [4] transform=0x000001fd70ebda20 ($c4)  go=0x000001fd70ebda00 ($g4)  name="Graphics Settings"
+    [5] transform=0x000001fd70ec58e0 ($c5)  go=0x000001fd70ec58c0 ($g5)  name="PostFX Settings"
+    [6] transform=0x000001fd70ec56c0 ($c6)  go=0x000001fd70ec56a0 ($g6)  name="Sound Settings"
+    [7] transform=0x000001fd70ebd9c0 ($c7)  go=0x000001fd70ebd9a0 ($g7)  name="Control Settings"
+    [8] transform=0x000001fd22d24320 ($c8)  go=0x000001fd70eb6ac0 ($g8)  name="SaveSettingsButton"
+    [9] transform=0x000001fd22d24300 ($c9)  go=0x000001fd70eb6a80 ($g9)  name="RestoreSettingsButton"
+    [10] transform=0x000001fd70ec6f00 ($c10)  go=0x000001fd22d24a20 ($g10)  name="SaveButton"
+    [11] transform=0x000001fd70ec6ec0 ($c11)  go=0x000001fd22d24d60 ($g11)  name="CreditsButton"
+    [12] transform=0x000001fd70ec6e80 ($c12)  go=0x000001fd22d24920 ($g12)  name="BackButton"
+    [13] transform=0x000001fd70ec6e40 ($c13)  go=0x000001fd22d24800 ($g13)  name="RevertButton"
+    [14] transform=0x000001fd70ec6e00 ($c14)  go=0x000001fd70ec6de0 ($g14)  name="BindContainer"
+    [15] transform=0x000001fd22e90220 ($c15)  go=0x000001fd22e90200 ($g15)  name="Toggles(Clone)"
+  transforms bound to $c0..$c15, GameObjects to $g0..$g15. NOTE: these are TRANSFORMS, not components -- `click` needs the Button, so go through `component $g0 Button` first.
+> rect $c2
+  klass = 0x000001faa1f2f0a0   (a Transform that is NOT a RectTransform has no rect -- the outermost menu roots are plain Transforms)
+  anchoredPosition = (0.0000, -79.0000)   via @0x2b5430
+  sizeDelta        = (845.0000, 46.0000)   via @0x2b54f0
+  anchorMin        = (0.5000, 1.0000)   via @0x2b52b0
+  anchorMax        = (0.5000, 1.0000)   via @0x2b5370
+  pivot            = (0.5000, 1.0000)   via @0x2b55b0
+  rect (x,y,w,h) = (-422.5000, -46.0000, 845.0000, 46.0000)   via @0x2b5240
+  NOTE: Vector2 getters decode via RAX (8-byte pack); get_rect decodes via the hidden-buffer sret convention Win64 uses for a struct >8 bytes. Both measured from GameAssembly.dll prologues, not assumed -- see abi/aowlspt_debugui.h.
+> rect $c3
+  klass = 0x000001faa1f2f0a0   (a Transform that is NOT a RectTransform has no rect -- the outermost menu roots are plain Transforms)
+  anchoredPosition = (0.0000, -71.5000)   via @0x2b5430
+  sizeDelta        = (0.0000, -143.0000)   via @0x2b54f0
+  anchorMin        = (0.0000, 0.0000)   via @0x2b52b0
+  anchorMax        = (1.0000, 1.0000)   via @0x2b5370
+  pivot            = (0.5000, 0.5000)   via @0x2b55b0
+  rect (x,y,w,h) = (-960.0000, -433.5000, 1920.0000, 867.0000)   via @0x2b5240
+  NOTE: Vector2 getters decode via RAX (8-byte pack); get_rect decodes via the hidden-buffer sret convention Win64 uses for a struct >8 bytes. Both measured from GameAssembly.dll prologues, not assumed -- see abi/aowlspt_debugui.h.
+> rect $c4
+  klass = 0x000001faa1f2f0a0   (a Transform that is NOT a RectTransform has no rect -- the outermost menu roots are plain Transforms)
+  anchoredPosition = (0.0000, 60.0000)   via @0x2b5430
+  sizeDelta        = (1000.0000, -225.0000)   via @0x2b54f0
+  anchorMin        = (0.5000, 0.0000)   via @0x2b52b0
+  anchorMax        = (0.5000, 1.0000)   via @0x2b5370
+  pivot            = (0.5000, 0.0000)   via @0x2b55b0
+  rect (x,y,w,h) = (-500.0000, 0.0000, 1000.0000, 785.0000)   via @0x2b5240
+  NOTE: Vector2 getters decode via RAX (8-byte pack); get_rect decodes via the hidden-buffer sret convention Win64 uses for a struct >8 bytes. Both measured from GameAssembly.dll prologues, not assumed -- see abi/aowlspt_debugui.h.
+> rect $c5
+  klass = 0x000001faa1f2f0a0   (a Transform that is NOT a RectTransform has no rect -- the outermost menu roots are plain Transforms)
+  anchoredPosition = (0.0000, -165.0000)   via @0x2b5430
+  sizeDelta        = (930.0000, 785.0000)   via @0x2b54f0
+  anchorMin        = (0.5000, 1.0000)   via @0x2b52b0
+  anchorMax        = (0.5000, 1.0000)   via @0x2b5370
+  pivot            = (0.5000, 1.0000)   via @0x2b55b0
+  rect (x,y,w,h) = (-465.0000, -785.0000, 930.0000, 785.0000)   via @0x2b5240
+  NOTE: Vector2 getters decode via RAX (8-byte pack); get_rect decodes via the hidden-buffer sret convention Win64 uses for a struct >8 bytes. Both measured from GameAssembly.dll prologues, not assumed -- see abi/aowlspt_debugui.h.
+> rect $c6
+  klass = 0x000001faa1f2f0a0   (a Transform that is NOT a RectTransform has no rect -- the outermost menu roots are plain Transforms)
+  anchoredPosition = (0.0000, -82.5000)   via @0x2b5430
+  sizeDelta        = (0.0000, -165.0000)   via @0x2b54f0
+  anchorMin        = (0.0000, 0.0000)   via @0x2b52b0
+  anchorMax        = (1.0000, 1.0000)   via @0x2b5370
+  pivot            = (0.5000, 0.5000)   via @0x2b55b0
+  rect (x,y,w,h) = (-960.0000, -422.5000, 1920.0000, 845.0000)   via @0x2b5240
+  NOTE: Vector2 getters decode via RAX (8-byte pack); get_rect decodes via the hidden-buffer sret convention Win64 uses for a struct >8 bytes. Both measured from GameAssembly.dll prologues, not assumed -- see abi/aowlspt_debugui.h.
+> rect $c7
+  klass = 0x000001faa1f2f0a0   (a Transform that is NOT a RectTransform has no rect -- the outermost menu roots are plain Transforms)
+  anchoredPosition = (0.0000, 0.0000)   via @0x2b5430
+  sizeDelta        = (0.0000, 0.0000)   via @0x2b54f0
+  anchorMin        = (0.0000, 0.0000)   via @0x2b52b0
+  anchorMax        = (1.0000, 1.0000)   via @0x2b5370
+  pivot            = (0.5000, 0.5000)   via @0x2b55b0
+  rect (x,y,w,h) = (-960.0000, -505.0000, 1920.0000, 1010.0000)   via @0x2b5240
+  NOTE: Vector2 getters decode via RAX (8-byte pack); get_rect decodes via the hidden-buffer sret convention Win64 uses for a struct >8 bytes. Both measured from GameAssembly.dll prologues, not assumed -- see abi/aowlspt_debugui.h.
+> rect $c15
+  klass = 0x000001faa1f2f0a0   (a Transform that is NOT a RectTransform has no rect -- the outermost menu roots are plain Transforms)
+  anchoredPosition = (0.0000, -128.0000)   via @0x2b5430
+  sizeDelta        = (-1418.6600, 46.0000)   via @0x2b54f0
+  anchorMin        = (0.0000, 1.0000)   via @0x2b52b0
+  anchorMax        = (1.0000, 1.0000)   via @0x2b5370
+  pivot            = (0.5000, 1.0000)   via @0x2b55b0
+  rect (x,y,w,h) = (-250.6699, -46.0000, 501.3399, 46.0000)   via @0x2b5240
+  NOTE: Vector2 getters decode via RAX (8-byte pack); get_rect decodes via the hidden-buffer sret convention Win64 uses for a struct >8 bytes. Both measured from GameAssembly.dll prologues, not assumed -- see abi/aowlspt_debugui.h.
+> children $c15 8
+  childCount = 4
+  via Transform::GetChild / get_childCount, Object::get_name (calls)
+    [0] transform=0x000001fd22e901e0 ($c0)  go=0x000001fd22e901c0 ($g0)  name="ControlToggle"
+    [1] transform=0x000001fd22e90240 ($c1)  go=0x000001fd22e91fc0 ($g1)  name="GesturesToggle"
+    [2] transform=0x000001fd22e91d00 ($c2)  go=0x000001fd22e91ce0 ($g2)  name="ControlToggle(Clone)"
+    [3] transform=0x000001fd22e91900 ($c3)  go=0x000001fd22e918c0 ($g3)  name="ControlToggle(Clone)"
+  transforms bound to $c0..$c3, GameObjects to $g0..$g3. NOTE: these are TRANSFORMS, not components -- `click` needs the Button, so go through `component $g0 Button` first.
+> children $c2 12
+  childCount = 1
+  via Transform::GetChild / get_childCount, Object::get_name (calls)
+    [0] transform=0x000001fd22e91ca0 ($c0)  go=0x000001fd22e91cc0 ($g0)  name="AnimatedToggle"
+  transforms bound to $c0..$c0, GameObjects to $g0..$g0. NOTE: these are TRANSFORMS, not components -- `click` needs the Button, so go through `component $g0 Button` first.
+aowlspt live inspector -- batch 4 complete, 245 line(s)

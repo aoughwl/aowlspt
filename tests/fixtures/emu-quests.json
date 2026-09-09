@@ -1,0 +1,135 @@
+{
+  "_comment": "A database small enough to reason about, with quests that actually have conditions. Two quests: the first is gated on level and pays out, the second is gated on the first. Both spellings of a condition are present on purpose -- q_debut uses the flattened form the current client writes, q_followup the older _parent/_props form -- because the emulator is pointed at whatever dump the user has and both have to work.",
+  "traders": {
+    "54cb50c76803fa8b248b4571": {
+      "base": {
+        "_id": "54cb50c76803fa8b248b4571",
+        "nickname": "Prapor",
+        "currency": "RUB",
+        "unlockedByDefault": true
+      }
+    }
+  },
+  "templates": {
+    "items": {
+      "5449016a4bdc2d6f028b456f": {
+        "_id": "5449016a4bdc2d6f028b456f",
+        "_props": {
+          "Name": "Roubles",
+          "Width": 1,
+          "Height": 1,
+          "StackMaxSize": 500000
+        }
+      },
+      "5644bd2b4bdc2d3b4c8b4572": {
+        "_id": "5644bd2b4bdc2d3b4c8b4572",
+        "_props": {
+          "Name": "AK-74N",
+          "Width": 4,
+          "Height": 2,
+          "StackMaxSize": 1
+        }
+      }
+    },
+    "quests": {
+      "q_debut": {
+        "_id": "q_debut",
+        "QuestName": "Debut",
+        "traderId": "54cb50c76803fa8b248b4571",
+        "conditions": {
+          "AvailableForStart": [
+            {
+              "conditionType": "Level",
+              "id": "c_start_level",
+              "value": 1,
+              "compareMethod": ">="
+            }
+          ],
+          "AvailableForFinish": [
+            {
+              "conditionType": "CounterCreator",
+              "id": "c_kill_scavs",
+              "value": 5,
+              "counter": {
+                "id": "c_kill_scavs_counter",
+                "conditions": [
+                  { "conditionType": "Kills", "target": "Savage" },
+                  { "conditionType": "Location", "target": ["bigmap"] }
+                ]
+              }
+            },
+            {
+              "conditionType": "HandoverItem",
+              "id": "c_hand_rifles",
+              "value": 2,
+              "target": ["5644bd2b4bdc2d3b4c8b4572"]
+            }
+          ],
+          "Fail": []
+        },
+        "rewards": {
+          "Started": [],
+          "Success": [
+            { "type": "Experience", "index": 0, "value": "1500" },
+            {
+              "type": "TraderStanding",
+              "index": 1,
+              "target": "54cb50c76803fa8b248b4571",
+              "value": 0.02
+            },
+            {
+              "type": "Item",
+              "index": 2,
+              "value": "1",
+              "target": "reward_rifle_0001",
+              "items": [
+                {
+                  "_id": "reward_rifle_0001",
+                  "_tpl": "5644bd2b4bdc2d3b4c8b4572",
+                  "upd": { "StackObjectsCount": 1 }
+                }
+              ]
+            }
+          ],
+          "Fail": []
+        }
+      },
+      "q_followup": {
+        "_id": "q_followup",
+        "QuestName": "Second Debut",
+        "traderId": "54cb50c76803fa8b248b4571",
+        "conditions": {
+          "AvailableForStart": [
+            {
+              "_parent": "Quest",
+              "_props": {
+                "id": "c_needs_debut",
+                "target": "q_debut",
+                "status": [4]
+              }
+            }
+          ],
+          "AvailableForFinish": [
+            {
+              "_parent": "TraderLoyalty",
+              "_props": {
+                "id": "c_needs_loyalty",
+                "target": "54cb50c76803fa8b248b4571",
+                "value": 2,
+                "compareMethod": ">="
+              }
+            }
+          ],
+          "Fail": []
+        },
+        "rewards": {
+          "Started": [],
+          "Success": [
+            { "type": "Experience", "index": 0, "value": 800 }
+          ],
+          "Fail": []
+        }
+      }
+    }
+  }
+}

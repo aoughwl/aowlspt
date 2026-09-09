@@ -1,0 +1,105 @@
+{
+ "timestamp": 1788448950,
+ "image_size": 44130304,
+ "checksum": 0,
+ "base": 6442450944,
+ "machine": 34404,
+ "sections": [
+  {
+   "name": ".text",
+   "rva": 4096,
+   "size": 2771840,
+   "code": true
+  },
+  {
+   "name": ".rdata",
+   "rva": 2777088,
+   "size": 1011392,
+   "code": false
+  },
+  {
+   "name": ".buildid",
+   "rva": 3788800,
+   "size": 53,
+   "code": false
+  },
+  {
+   "name": ".data",
+   "rva": 3792896,
+   "size": 39987360,
+   "code": false
+  },
+  {
+   "name": ".pdata",
+   "rva": 43782144,
+   "size": 35904,
+   "code": false
+  },
+  {
+   "name": ".tls",
+   "rva": 43819008,
+   "size": 16,
+   "code": false
+  },
+  {
+   "name": ".reloc",
+   "rva": 43823104,
+   "size": 3708,
+   "code": false
+  },
+  {
+   "name": "/4",
+   "rva": 43827200,
+   "size": 17438,
+   "code": false
+  },
+  {
+   "name": "/50",
+   "rva": 43847680,
+   "size": 1888,
+   "code": false
+  },
+  {
+   "name": "/116",
+   "rva": 43851776,
+   "size": 6960,
+   "code": false
+  },
+  {
+   "name": "/92",
+   "rva": 43859968,
+   "size": 103258,
+   "code": false
+  },
+  {
+   "name": "/104",
+   "rva": 43966464,
+   "size": 57680,
+   "code": false
+  },
+  {
+   "name": "/76",
+   "rva": 44027904,
+   "size": 9583,
+   "code": false
+  },
+  {
+   "name": "/34",
+   "rva": 44040192,
+   "size": 78271,
+   "code": false
+  },
+  {
+   "name": "/18",
+   "rva": 44122112,
+   "size": 3216,
+   "code": false
+  },
+  {
+   "name": "/65",
+   "rva": 44126208,
+   "size": 509,
+   "code": false
+  }
+ ]
+}

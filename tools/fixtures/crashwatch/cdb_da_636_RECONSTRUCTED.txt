@@ -1,0 +1,8 @@
+; RECONSTRUCTED -- see cdb_wer_636_RECONSTRUCTED.txt. The string itself is
+; verbatim from docs/AOWL_FACTS.md fact #71, which records
+;   da 00007ffb3dfd1373 = 'corrupted thread-free list.'  (vendor/mimalloc/src/page.c:205)
+; read out of EscapeFromTarkov.exe.636.dmp on 2026-09-03. The surrounding cdb
+; `da` layout is copied from a live `da` on this machine.
+00007ffb`3dfd1373  "corrupted thread-free list."
+00007ffb`3dfd138f  ""
+00000212`70000480  "..."

@@ -1,0 +1,12 @@
+{
+ "//": "The X1 debt inventory read by tools/gateaudit.py. It can only SHRINK.",
+ "//1": "Every entry is a token-gated il2cpp export bound or called outside the",
+ "//2": "armed `aowl_gate_call()` path -- a real hazard, not a waived rule. It is",
+ "//3": "printed as KNOWN DEBT on every run; a site that is NOT here fails the",
+ "//4": "build. NEVER add an entry to make a check pass: fix the site instead,",
+ "//5": "then delete the entry (gateaudit reports a stale entry, so the file",
+ "//6": "cannot rot into a blanket waiver).",
+ "//7": "Key = <path>|<export>|<kind>. Measured 2026-09-03 by",
+ "//8": "`python tools/gateaudit.py --baseline <empty>`; three sites, all in abi/.",
+ "//9": "EMPTY since 2026-09-03: navui's dead domain->class->type chain was DELETED and invoke2's il2cpp_class_get_type now goes through aowl_gate_call + aowl_handle_shape_ok. Do not add an entry to make a check pass."
+}

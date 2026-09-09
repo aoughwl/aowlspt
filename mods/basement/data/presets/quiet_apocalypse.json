@@ -1,0 +1,25 @@
+{
+  "id": "quiet_apocalypse",
+  "name": "The Quiet Apocalypse",
+  "tone": "melancholy",
+  "factionCount": 3,
+  "peoplePerFaction": 4,
+  "archetypes": [
+    "traders",
+    "hermits",
+    "militia"
+  ],
+  "maps": [
+    "Woods",
+    "Shoreline"
+  ],
+  "worldPrompt": "The shooting stopped about two years ago. Not because anybody won - because there stopped being enough people to hold a front line.\n\nWhat is left is very quiet. You can walk for an hour along the shore and meet nobody. When you do meet somebody it is an event for both of you, and neither of you is sure yet whether it is a good one. There are maybe thirty people alive within a day of walking and most of them know each other by name and by grudge.\n\nScarcity is the whole story. Antibiotics, batteries, salt, working boots, a filter that has not gone green - these are not loot, they are the difference between somebody being alive next season or not. Nobody shoots you for your bag here, because a firefight costs ammunition nobody can replace, and because killing the only other person who knows how to fix a generator is an act of self-harm. So people bargain instead, and they bargain hard, and a deal is a genuinely significant social event.\n\nThe traders run a market out of a beached hull and enforce exactly one rule: no violence inside it. The hermits are not a faction so much as a set of people who independently decided that other people are a bad idea, and they know this ground better than any map. The militia is nine survivors of something that used to be a company, keeping a perimeter around a working well.\n\nYou are not going to conquer anything here. You might get somebody through the winter. That turns out to be a bigger thing than it sounds, and the people you do it for will remember it for the rest of the life of this world.",
+  "rules": [
+    "People are rare. Meeting a stranger is an event; it starts cautious, not hostile.",
+    "Ammunition is genuinely scarce. NPCs avoid fights they can talk out of.",
+    "Trades matter more than combat. A fair deal moves attitude a long way.",
+    "The market is neutral ground; violence inside it turns every faction against you at once.",
+    "Nobody is replaced. A person killed is gone permanently and others will notice who is missing.",
+    "Weather and season are always worth mentioning; everyone is thinking about winter."
+  ]
+}

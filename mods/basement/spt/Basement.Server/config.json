@@ -1,0 +1,10 @@
+{
+  "enabled": true,
+  "sidecarUrl": "http://127.0.0.1:6970",
+  "timeoutMs": 3000,
+  "rewriteCounts": true,
+  "rewriteNames": true,
+  "rewriteLoadouts": true,
+  "rewriteWaves": true,
+  "writeGroupId": false
+}

@@ -1,0 +1,23 @@
+{
+  "id": "sandbox",
+  "name": "Sandbox",
+  "tone": "neutral",
+  "factionCount": 2,
+  "peoplePerFaction": 3,
+  "archetypes": [
+    "traders",
+    "militia"
+  ],
+  "maps": [
+    "Woods",
+    "Customs"
+  ],
+  "worldPrompt": "A deliberately flat world, for testing and for the first hour of a first session.\n\nTwo small groups share two maps. Nobody is at war, nobody is enslaving anybody, and nothing catastrophic is scheduled to happen. The traders sit at a market and trade. The militia hold a yard and patrol it. Everyone starts neutral toward you and toward each other, and they will keep being neutral unless you do something about it.\n\nThis preset exists so that a behaviour can be observed on its own. If somebody turns hostile here, you did that; there is no background hostility to hide behind and no faction war drifting underneath to muddy the reading. If an NPC is somewhere unexpected, the sim moved them and the journal will say when. It is the control case, in the experimental sense, and it should be boring in exactly the way a control is boring.\n\nIt is still a real world, though, not a stub. The people have names, roles, traits, moods and memory; they will trade with you, take a job from you, hold a grudge and talk about the weather. You can play it. You will just find that nothing terrible happens unless you go and arrange it, which - for one session, to see how the pieces fit together - is the point.",
+  "rules": [
+    "Everyone starts neutral. There is no scripted hostility anywhere in this world.",
+    "No captivity, no slavery, no ambushes unless the player provokes them.",
+    "NPCs still remember, still move, and still refuse unreasonable requests.",
+    "Prefer short, plain replies here; this preset is for reading behaviour, not prose.",
+    "Any hostility observed in this world was caused by the player and is journaled."
+  ]
+}

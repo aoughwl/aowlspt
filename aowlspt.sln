@@ -1,0 +1,31 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+# One project left, and it is a tool rather than a host.
+#
+# `Aowlspt.Abi` (the C# host engine) and `Aowlspt.Sim` (the simulator built on
+# it) were here until the simulator was rewritten in nimony -- see
+# `host/Aowlspt.Sim/aowlsim.nim`. Nothing referenced either of them afterwards,
+# so both are gone and every host in this repo is nimony now.
+#
+# `SptReflect` stays C# because what it does is read .NET metadata: it opens
+# SPT's assemblies with `System.Reflection.MetadataLoadContext` and writes
+# `reference/spt-4.1-surface.json`. It references nothing else here.
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SptReflect", "tools\SptReflect\SptReflect.csproj", "{A0000001-0000-0000-0000-000000000005}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{A0000001-0000-0000-0000-000000000005}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A0000001-0000-0000-0000-000000000005}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A0000001-0000-0000-0000-000000000005}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A0000001-0000-0000-0000-000000000005}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal

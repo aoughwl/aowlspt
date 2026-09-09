@@ -1,0 +1,27 @@
+{
+  "_comment": "aowl.autoraid - enter (and leave) a raid without touching the mouse. Three features: a command-line raid (aowlspt-launch --raid=\"Woods\"), a map menu on a key, and an optional SPAWNED default loadout. The mod installs no detour, resolves no IL2CPP name, and writes NOTHING into game memory: every state change is a CALL to the method the game itself calls, at an RVA byte-verified against the sixteen bytes it is declared to begin with. SHIPS INERT: hotkeys is false and loadoutMode is `current`, so with no command-line argument this mod does nothing at all. See mods/autoraid/README.md and docs/AUTORAID-MAP.md.",
+
+  "//hotkeys": "THE GATE for both key rows below. With this false NOTHING is polled - not GetModuleHandle, not UnityEngine.Input::GetKeyDown - and menuKey/enterKey provably do nothing. It is itself flagged as a keybind row so that a keybinds-only view cannot show you a key while hiding the switch that makes it fire. Default OFF.",
+  "hotkeys": false,
+
+  "//menuKey": "Opens the map menu overlay. Up/Down or 1-9 to choose, Enter to enter that raid, Escape or this key again to close. A UnityEngine.KeyCode NAME (F8, F9, Home, Insert, BackQuote, ...); an unknown name resolves to UNBOUND and says so in the log rather than silently never firing. Needs hotkeys ON. APPLIES LIVE.",
+  "menuKey": "F8",
+
+  "//enterKey": "One key that arms a raid on defaultMap immediately, with no menu drawn - so it keeps working even where the overlay cannot be drawn at all. \"None\" = off, which is the shipped value. Needs hotkeys ON. APPLIES LIVE.",
+  "enterKey": "None",
+
+  "//defaultMap": "The map enterKey uses, and the row the menu starts on. This is the map's DISPLAYED name on the location screen, matched case-insensitively - the only thing that identifies a map on this build, because every tile GameObject is called `Location Template(Clone)`. A map that is not currently on offer is REFUSED, and the refusal names every map that WAS on offer. APPLIES LIVE.",
+  "defaultMap": "Woods",
+
+  "//maps": "Comma-separated DISPLAYED map names, in the order the menu lists them; up to 12 are drawn. These are the maps offered BY THE MENU, not the maps the game is offering right now: the location screen shows only what the current mode allows (MEASURED 2026-09-02: RESERVE, LIGHTHOUSE, INTERCHANGE, CUSTOMS, GROUND ZERO, ICEBREAKER, WOODS - seven of the twelve here). APPLIES LIVE.",
+  "maps": "Customs,Woods,Shoreline,Interchange,Reserve,Lighthouse,Streets of Tarkov,Ground Zero,Factory,Laboratory,Icebreaker,Terminal",
+
+  "//busArmEnabled": "THE GATE on the `autoraid.arm` bus event. Another client-side mod (mods/basement, when the host reports phase MENU) may ask for a raid by emitting autoraid.arm with {\"map\":\"Woods\",\"side\":\"pmc\",\"source\":\"basement\",\"exitAfterSeconds\":0}; it runs the SAME machine.arm path -aowl.raid uses, on the main thread, and is refused on exactly the same terms (already in a raid, already armed, no map, call surface self-disabled). With this false an arriving event is REFUSED BY NAME and answered on autoraid.armed with accepted=false - never silently dropped. Default true. APPLIES LIVE.",
+  "busArmEnabled": true,
+
+  "//loadoutMode": "SERVER SIDE. `current` (the shipped value) means this mod does NOTHING to your gear: you go in wearing whatever the character wears, and loadout.json is not even opened. `spawned` means the kit in mods/autoraid/loadout.json is CREATED for the raid - the gear you were wearing is moved to the STASH first (never destroyed), and every created item is stripped from the profile at match end so none of it can reach the stash. APPLIES ON RESTART / NEXT RAID: the loadout lands before the client's last profile fetch, which has already happened by the time you can change this.",
+  "loadoutMode": "current",
+
+  "//applyAt": "SERVER SIDE. THERE IS ONLY ONE MOMENT AT WHICH A SPAWNED LOADOUT CAN WORK, so this is a switch and not a choice of trigger. MEASURED from the real wire capture, one menu cycle is: /client/game/profile/list -> profile/select -> raid/configuration -> match/local/start -> match/local/end -> profile/list. The PMC Inventory is sent ONLY at profile/list, and profile/list is fetched ONCE per cycle and NEVER after select or configuration - so a loadout applied on tarkov.raid.configured or tarkov.profile.selected arrives ONE RAID LATE, every time, while still reporting PASS. `listing` (the shipped value) applies from inside tarkov.profile.listing, the synchronous event mods/tarkov emits BEFORE it serves that document. `off` subscribes and logs but mints nothing, which separates `the trigger never fired` from `the mint failed`. APPLIES ON RESTART.",
+  "applyAt": "listing"
+}

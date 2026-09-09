@@ -1,0 +1,41 @@
+{
+  "schema": "aowlspt.basement.lootkinds/1",
+  "_comment": "Free text -> item classes -> how many. NOTHING about what a cache contains is written in code: a kind word an NPC says ('a crate of 5.45 and two AKs') is matched against `kinds[].words`, the classes it names are drawn from the item index built out of the live database, and the counts come from the ranges here. Change this file and the world's caches change with it. `classWords` is how an item TEMPLATE is classified when the database gives no usable `_parent` (the emutest fixture does not), so it is a NAME heuristic and the resolver says so in its note rather than pretending the classification is authoritative.",
+
+  "kinds": [
+    { "id": "weapons",    "words": ["weapon", "weapons", "guns", "gun", "rifle", "rifles", "ak", "aks", "carbine", "carbines", "shotgun", "pistol", "arms"],
+      "classes": ["weapon"], "minItems": 1, "maxItems": 3, "stackMin": 1, "stackMax": 2 },
+    { "id": "ammo",       "words": ["ammo", "ammunition", "rounds", "cartridge", "cartridges", "545", "556", "762", "boxes of ammunition"],
+      "classes": ["ammo"], "minItems": 1, "maxItems": 2, "stackMin": 30, "stackMax": 300 },
+    { "id": "meds",       "words": ["meds", "medical", "medicine", "medkit", "medkits", "bandages", "morphine", "stims"],
+      "classes": ["meds"], "minItems": 1, "maxItems": 3, "stackMin": 1, "stackMax": 4 },
+    { "id": "food",       "words": ["food", "rations", "tinned", "water", "supplies", "fuel", "diesel"],
+      "classes": ["food"], "minItems": 2, "maxItems": 4, "stackMin": 1, "stackMax": 3 },
+    { "id": "armor",      "words": ["armour", "armor", "plates", "rig", "rigs", "helmet", "helmets", "carrier"],
+      "classes": ["armor"], "minItems": 1, "maxItems": 2, "stackMin": 1, "stackMax": 1 },
+    { "id": "keys",       "words": ["key", "keys", "keycard", "keycards", "map", "maps", "documents", "papers"],
+      "classes": ["key"], "minItems": 1, "maxItems": 2, "stackMin": 1, "stackMax": 1 },
+    { "id": "valuables",  "words": ["valuables", "roubles", "dollars", "money", "currency", "gold", "trade", "tools", "toolset", "radios", "radio"],
+      "classes": ["valuables"], "minItems": 1, "maxItems": 3, "stackMin": 1, "stackMax": 5 }
+  ],
+
+  "classWords": [
+    { "class": "weapon",    "words": ["rifle", "carbine", "gun", "ak", "ak-74n", "shotgun", "pistol", "smg", "magazine"] },
+    { "class": "ammo",      "words": ["cartridge", "ammo", "rounds", "box"] },
+    { "class": "meds",      "words": ["salewa", "grizzly", "medkit", "bandage", "splint", "morphine", "kit"] },
+    { "class": "food",      "words": ["water", "bottle", "ration", "tushonka", "crackers", "fuel", "tank"] },
+    { "class": "armor",     "words": ["plate", "carrier", "helmet", "rig", "vest", "armor", "armour", "6b47"] },
+    { "class": "key",       "words": ["key", "keycard", "map", "quest"] },
+    { "class": "valuables", "words": ["roubles", "dollars", "bolts", "toolset", "loot", "brick", "crate", "stash", "scope", "muzzle", "glasses", "pack", "pockets"] }
+  ],
+
+  "numberWords": [
+    { "word": "a", "n": 1 }, { "word": "an", "n": 1 }, { "word": "one", "n": 1 },
+    { "word": "two", "n": 2 }, { "word": "three", "n": 3 }, { "word": "four", "n": 4 },
+    { "word": "five", "n": 5 }, { "word": "six", "n": 6 }, { "word": "ten", "n": 10 },
+    { "word": "dozen", "n": 12 }, { "word": "crate", "n": 20 }, { "word": "case", "n": 20 },
+    { "word": "few", "n": 3 }, { "word": "couple", "n": 2 }, { "word": "handful", "n": 5 }
+  ],
+
+  "stopWords": ["the", "of", "and", "with", "for", "under", "near", "behind", "inside", "guarded", "that", "there", "some", "left", "buried", "hidden", "old", "new"]
+}

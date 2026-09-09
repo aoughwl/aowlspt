@@ -1,0 +1,88 @@
+# Branch tips recorded before pruning gutted %TEMP% worktrees -- 2026-09-01T15:20:40-04:00
+# Removing a worktree NEVER deletes commits: branches live in the shared object
+# store. This file exists so the state is recoverable even by hand.
+
+wt-aowlui                          feat-aowlui                              09795d4e129cd81bc044be5c36509aca83397792
+wt-betadist                        feat-beta-distribution                   1f22ab6e7a69f6b1d30fd8277138f45f2c950212
+wt-codegen                         feat-codegen-resolve                     02d8df1dded3d612479df48efe721b7978f2ee3c
+wt-comps                           feat-components                          fb67119b8ed0762d7e3cb3ef07a962f6dd4e5c05
+wt-debugui                         feat-debug-ui                            0ed99f8ae424d37fabf46a25aa2bcb7407332899
+wt-dist                            feat-distribution                        62bfe9cf5899b992ce1aa49b5d9787de851809a9
+wt-easyasset                       probe-easyassets                         5ca078aff5824b0d5e1882cce27ff51382c4c9bd
+wt-hostall                         integ-host-all                           6a969ff88329eb572e985487f19161fe362f8107
+wt-hostfinal                       integ-host-final                         a828b310121c31aea879544f7f5440e694e156f3
+wt-integ                           integ-tooling                            3fc9f3e6ae38373a6ae26be07378fbc8bcbf5244
+wt-mapall                          feat-mapextract-all                      38d028b65a47610325543068d7f310501ae5d260
+wt-modstab                         feat-modstab-subtabs                     6c92b6800057f2b8f48ca03ae16dc431dce32844
+wt-nameidx                         feat-name-index                          5121076120296070bbad703f6ec6e0dbd406d0db
+wt-nameidx-stamp                   fix-nameidx-stamp                        562377f2c605aea1489292b0b48fc760f57e4b98
+wt-nimerge                         merge-nameidx                            734a5c02c46eefe7d03eaeef9920f908d8818db4
+wt-osclose                         integ-host-diag                          a3f7d283411d3a1fbe5313566adf1a522a53268a
+wt-probe                           probe-multitarget                        c864babb237124402ff1e9c0dd9c0ba55a641ed3
+wt-resolv                          feat-resolver-harden                     b6d0940a26edca6c5094edfdd23f1708effd732a
+wt-rva                             feat-patch-by-rva                        72f481c8e54c6d822d8b070bde235c3cf525d5fc
+wt-shared                          feat-shared-guard                        9d6beba862707a71dd551c12865ed3ae0d72d69b
+wt-splcoopwarn                     feat-splrebrand-coopwarn                 3faa3c52e29e219923ad9810b4038cf799f23b56
+wt-texredir                        feat-tex-bundle-redirect                 e1e7512813919509f924256be2eb6dd305583313
+
+# ======================================================================
+# SECOND RECORD -- 2026-09-01, the RELOCATION of the eight surviving
+# VOLATILE worktrees. The block above is an EARLIER record, written
+# before gutted %TEMP% worktrees were pruned; it is kept because those
+# checkouts are gone and this file is the only convenient record of
+# their tips. Appending rather than replacing: a tips file that only
+# holds the latest event is not a tips file.
+# ======================================================================
+
+WORKTREE TIPS -- recorded before the VOLATILE worktrees were relocated
+======================================================================
+
+Recorded 2026-09-01, immediately before `git worktree move` was run on the
+eight checkouts `python tools/wtcheck.py` reported as VOLATILE (real checkouts
+living under %TEMP%, which Windows temp cleanup has already GUTTED 14 of once).
+
+This file exists so that if a move goes wrong -- or if a checkout is discovered
+gutted later -- the branch tip is recoverable from here without archaeology.
+The commits themselves live in the shared object store at
+C:\Users\savant\Projects\aowlspt\.git, which is NOT under %TEMP%, so nothing
+below was ever at risk of being lost with the directory; what was at risk is
+the UNCOMMITTED content, which is listed too.
+
+    branch                        tip commit                                old path
+    ----------------------------------------------------------------------------------------------
+    feat-beta-distribution        1f22ab6e7a69f6b1d30fd8277138f45f2c950212  %TEMP%\wt-betadist
+    feat-distribution             62bfe9cf5899b992ce1aa49b5d9787de851809a9  %TEMP%\wt-dist
+    feat-mapextract-all           38d028b65a47610325543068d7f310501ae5d260  %TEMP%\wt-mapall
+    feat-modstab-subtabs          6c92b6800057f2b8f48ca03ae16dc431dce32844  %TEMP%\wt-modstab
+    merge-nameidx                 734a5c02c46eefe7d03eaeef9920f908d8818db4  %TEMP%\wt-nimerge
+    feat-shared-guard             9d6beba862707a71dd551c12865ed3ae0d72d69b  %TEMP%\wt-shared
+    feat-splrebrand-coopwarn      3faa3c52e29e219923ad9810b4038cf799f23b56  %TEMP%\wt-splcoopwarn
+    feat-tex-bundle-redirect      e1e7512813919509f924256be2eb6dd305583313  %TEMP%\wt-texredir
+
+New home for all eight: C:\Users\savant\Projects\aowlspt-wt\<name>, where
+<name> is the old leaf directory name (wt-betadist, wt-dist, ...). The leaf
+name was kept rather than renamed to the branch, so that any script, log line
+or note referring to `wt-mapall` still names the same checkout.
+
+Uncommitted content at the time of the move (all of it UNTRACKED; no tracked
+file was modified in any of the eight, and `git worktree move` moves the
+directory wholesale, so all of this travelled with it):
+
+    wt-betadist      clean
+    wt-dist          ?? .aowl-relay.jsonl
+    wt-mapall        ?? run_extract_all.sh
+    wt-modstab       ?? .aowl-relay.jsonl
+    wt-nimerge       ?? build/
+    wt-shared        ?? build/
+    wt-splcoopwarn   clean
+    wt-texredir      clean
+
+Two of them carry a `.aowl-relay.jsonl` -- a per-worktree fact relay written by
+`tools/factnote.py` when the `aowlfacts` MCP tools are absent. Those are
+measurements nobody has filed yet; `tools/factimport.py` reads relays and puts
+them in the store.
+
+To verify the state this file describes:
+
+    git worktree list
+    python tools/wtcheck.py          expects 0 VOLATILE and 0 GUTTED

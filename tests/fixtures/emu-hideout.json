@@ -1,0 +1,175 @@
+{
+  "_comment": "A database with a hideout and a skill table in it, for driving hideout production and skill progression the way tests/fixtures/emu-db.json drives trading. Deliberately small: three areas, two recipes, one mastering family. Everything a craft touches has a template with a size, because an item with no template is placed 1x1 and would hide a real placement bug.",
+
+  "hideout": {
+    "settings": {
+      "generatorSpeed": 1,
+      "generatorFuelFlowRate": 1.0,
+      "airFilterUnitFlowRate": 0.001,
+      "gpuBoostRate": 0.041225
+    },
+    "areas": [
+      {
+        "_id": "area-workbench",
+        "type": 10,
+        "enabled": true,
+        "needsFuel": false,
+        "stages": {
+          "0": { "constructionTime": 0, "requirements": [], "bonuses": [] },
+          "1": {
+            "constructionTime": 60,
+            "requirements": [],
+            "bonuses": [
+              { "type": "UnlockWeaponModification", "value": 1, "passive": true, "visible": true }
+            ]
+          },
+          "2": {
+            "constructionTime": 600,
+            "requirements": [],
+            "bonuses": [
+              { "type": "SkillGroupLevelingBoost", "skillName": "WeaponModding", "value": 0.2, "passive": true, "visible": true }
+            ]
+          }
+        }
+      },
+      {
+        "_id": "area-generator",
+        "type": 4,
+        "enabled": true,
+        "needsFuel": true,
+        "stages": {
+          "0": { "constructionTime": 0, "requirements": [], "bonuses": [] },
+          "1": {
+            "constructionTime": 120,
+            "requirements": [],
+            "bonuses": [
+              { "type": "EnergyRegeneration", "value": 1, "passive": true, "visible": false }
+            ]
+          }
+        }
+      },
+      {
+        "_id": "area-watercollector",
+        "type": 6,
+        "enabled": true,
+        "needsFuel": false,
+        "stages": {
+          "0": { "constructionTime": 0, "requirements": [], "bonuses": [] },
+          "1": { "constructionTime": 300, "requirements": [], "bonuses": [] }
+        }
+      }
+    ],
+    "production": {
+      "recipes": [
+        {
+          "_id": "recipe-bolts",
+          "areaType": 10,
+          "productionTime": 3600,
+          "endProduct": "59e35de086f7741778269d83",
+          "count": 2,
+          "continuous": false,
+          "productionLimitCount": 0,
+          "needFuelForAllProductionTime": false,
+          "locked": false,
+          "requirements": [
+            { "type": "Area", "areaType": 10, "requiredLevel": 1 },
+            { "type": "Item", "templateId": "5449016a4bdc2d6f028b456f", "count": 3, "isFunctional": false },
+            { "type": "Tool", "templateId": "590c2e1186f77425357b6124" }
+          ]
+        },
+        {
+          "_id": "recipe-water",
+          "areaType": 6,
+          "productionTime": 1800,
+          "endProduct": "5448ff904bdc2d6f028b456e",
+          "count": 1,
+          "continuous": true,
+          "productionLimitCount": 3,
+          "needFuelForAllProductionTime": true,
+          "locked": false,
+          "requirements": [
+            { "type": "Area", "areaType": 6, "requiredLevel": 1 }
+          ]
+        }
+      ],
+      "scavRecipes": [],
+      "cultistRecipes": []
+    }
+  },
+
+  "globals": {
+    "config": {
+      "SkillsSettings": {
+        "SkillProgressRate": 1.0,
+        "SkillFreshEffectiveness": 1.5,
+        "SkillFreshPoints": 10.0,
+        "SkillPointsBeforeFatigue": 100.0,
+        "SkillFatiguePerPoint": 1.0,
+        "SkillFatigueReset": 43200,
+        "WeaponSkillProgressRate": 1.0
+      },
+      "Mastering": [
+        {
+          "Name": "Ak",
+          "Templates": ["5644bd2b4bdc2d3b4c8b4572"],
+          "Level2": 250,
+          "Level3": 1000
+        }
+      ]
+    }
+  },
+
+  "templates": {
+    "items": {
+      "5811ce572459770cba1a34ea": {
+        "_id": "5811ce572459770cba1a34ea",
+        "_props": {
+          "Name": "Stash 10x68",
+          "Grids": [{ "_props": { "cellsH": 10, "cellsV": 68 } }]
+        }
+      },
+      "5449016a4bdc2d6f028b456f": {
+        "_id": "5449016a4bdc2d6f028b456f",
+        "_props": { "Name": "Roubles", "Width": 1, "Height": 1, "StackMaxSize": 500000 }
+      },
+      "590c2e1186f77425357b6124": {
+        "_id": "590c2e1186f77425357b6124",
+        "_props": { "Name": "Toolset", "Width": 2, "Height": 2, "StackMaxSize": 1 }
+      },
+      "59e35de086f7741778269d83": {
+        "_id": "59e35de086f7741778269d83",
+        "_props": { "Name": "Bolts", "Width": 1, "Height": 1, "StackMaxSize": 20 }
+      },
+      "5448ff904bdc2d6f028b456e": {
+        "_id": "5448ff904bdc2d6f028b456e",
+        "_props": { "Name": "Water bottle", "Width": 1, "Height": 2, "StackMaxSize": 1 }
+      },
+      "5d1b371186f774253763a656": {
+        "_id": "5d1b371186f774253763a656",
+        "_props": { "Name": "Expeditionary fuel tank", "Width": 2, "Height": 2, "StackMaxSize": 1, "MaxResource": 100 }
+      },
+      "5644bd2b4bdc2d3b4c8b4572": {
+        "_id": "5644bd2b4bdc2d3b4c8b4572",
+        "_props": { "Name": "AK-74N", "Width": 4, "Height": 2, "StackMaxSize": 1 }
+      }
+    },
+    "handbook": {
+      "Categories": [],
+      "Items": [
+        { "Id": "59e35de086f7741778269d83", "ParentId": "5b47574386f77428ca22b336", "Price": 2000 },
+        { "Id": "5448ff904bdc2d6f028b456e", "ParentId": "5b47574386f77428ca22b336", "Price": 15000 },
+        { "Id": "5d1b371186f774253763a656", "ParentId": "5b47574386f77428ca22b336", "Price": 60000 }
+      ]
+    }
+  },
+
+  "locales": {
+    "global": {
+      "en": {
+        "59e35de086f7741778269d83 Name": "Bolts",
+        "5448ff904bdc2d6f028b456e Name": "Water bottle"
+      }
+    },
+    "menu": { "en": { "MainMenu": "Main menu" } }
+  }
+}

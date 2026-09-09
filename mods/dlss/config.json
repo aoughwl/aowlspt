@@ -1,0 +1,18 @@
+{
+  "_comment": "aowl.dlss - the CONTROL SURFACE for DLSS / OptiScaler on this install. Nothing here is applied by the mod itself: the mod owns the schema and the persisted values, and a LAUNCHER-SIDE step (tools/dlssapply.py, called by aowlspt-launch before the executable starts) is what swaps nvngx_dlss.dll and writes OptiScaler.ini. Every key below therefore takes effect on the NEXT launch, and the boot log prints a PASS/FAIL verdict comparing the loaded module and the ini against these values. See docs/DLSS.md and docs/DLSSNR.md for the evidence behind every version and every caveat.",
+
+  "//version": "Which DLSS Super Resolution DLL to install. 1 = 310.5.3 (SHIPPED with the game, the rollback target), 2 = 310.7.0, 3 = 310.7.129. A step-valued number rather than a string because the native settings row that drives it is a NumberSlider; the F12 overlay shows the same numbers so the two surfaces cannot drift. APPLIES ON RESTART - the DLL is locked while the client runs.",
+  "version": 2,
+
+  "//upscaler": "OptiScaler's Dx11Upscaler. 1 = dlss (the game's own DLSS, native DX11), 2 = ffx_12 (FSR 3.1 through OptiScaler's DX11-on-DX12 bridge), 3 = xess_12 (XeSS, same bridge). MEASURED value names from D:/Aowlspt/OptiScaler.ini [Upscalers]. Only takes effect when OptiScaler is installed beside the executable; the verdict says so when it is not. APPLIES ON RESTART.",
+  "upscaler": 1,
+
+  "//nrEnabled": "OptiScaler [DlssNr] Enabled - the leaked 'DLSS 5' neural re-lighting pass. docs/DLSSNR.md is the whole provenance: an unsigned third-party rebuild of a leaked NVIDIA binary, a stated 616.56 driver minimum, and a D3D11 game that has to be bridged onto D3D12 (which REPLACES DLSS with FSR/XeSS as the upscaler while it is on). Off by default. APPLIES ON RESTART.",
+  "nrEnabled": false,
+
+  "//nrWorkingScale": "OptiScaler [DlssNr] WorkingScale, 0.25..1. The fraction of the frame the model works on; cost falls with the SQUARE of this (ini comment). 0.25 is what tools/dlssnr.py installs on this GPU. APPLIES ON RESTART.",
+  "nrWorkingScale": 0.25,
+
+  "//nrIntensity": "OptiScaler [DlssNr] Intensity, 0..2. How hard the model's re-lighting reads. APPLIES ON RESTART.",
+  "nrIntensity": 2.0
+}

@@ -1,0 +1,119 @@
+{
+ "schema": "aowlspt.maps/1",
+ "maps": [
+  {
+   "id": "Customs_TarkovDev",
+   "displayName": "Customs (TarkovDev)",
+   "internalNames": [
+    "bigmap"
+   ],
+   "author": "Tarkov.dev",
+   "coordinateRotation": 180,
+   "layers": 5
+  },
+  {
+   "id": "Factory_TarkovDev",
+   "displayName": "Factory (TarkovDev)",
+   "internalNames": [
+    "factory4_day",
+    "factory4_night"
+   ],
+   "author": "Tarkov.dev",
+   "coordinateRotation": 90,
+   "layers": 4
+  },
+  {
+   "id": "GroundZero_TarkovDev",
+   "displayName": "Ground Zero (TarkovDev)",
+   "internalNames": [
+    "Sandbox",
+    "Sandbox_high"
+   ],
+   "author": "Tarkov.dev",
+   "coordinateRotation": 180,
+   "layers": 4
+  },
+  {
+   "id": "Interchange_TarkovDev",
+   "displayName": "Interchange (TarkovDev)",
+   "internalNames": [
+    "Interchange"
+   ],
+   "author": "Tarkov.dev",
+   "coordinateRotation": 180,
+   "layers": 3
+  },
+  {
+   "id": "Labs_TarkovDev",
+   "displayName": "Labs (TarkovDev)",
+   "internalNames": [
+    "laboratory"
+   ],
+   "author": "Tarkov.dev",
+   "coordinateRotation": 270,
+   "layers": 3
+  },
+  {
+   "id": "Labyrinth",
+   "displayName": "Labyrinth",
+   "internalNames": [
+    "Labyrinth"
+   ],
+   "author": "acidphantasm",
+   "coordinateRotation": 90,
+   "layers": 1
+  },
+  {
+   "id": "Lighthouse_TarkovData",
+   "displayName": "Lighthouse (TarkovData)",
+   "internalNames": [
+    "Lighthouse"
+   ],
+   "author": "Shebuka",
+   "coordinateRotation": 180,
+   "layers": 1
+  },
+  {
+   "id": "Reserve_TarkovData",
+   "displayName": "Reserve (TarkovData)",
+   "internalNames": [
+    "RezervBase"
+   ],
+   "author": "Shebuka",
+   "coordinateRotation": 180,
+   "layers": 2
+  },
+  {
+   "id": "Shoreline_TarkovData",
+   "displayName": "Shoreline (TarkovData)",
+   "internalNames": [
+    "Shoreline"
+   ],
+   "author": "Shebuka",
+   "coordinateRotation": 180,
+   "layers": 4
+  },
+  {
+   "id": "Streets_TarkovData",
+   "displayName": "Streets of Tarkov (TarkovData)",
+   "internalNames": [
+    "TarkovStreets"
+   ],
+   "author": "Shebuka",
+   "coordinateRotation": 180,
+   "layers": 6
+  },
+  {
+   "id": "Woods_TarkovData",
+   "displayName": "Woods (TarkovData)",
+   "internalNames": [
+    "Woods"
+   ],
+   "author": "Shebuka",
+   "coordinateRotation": 180,
+   "layers": 3
+  }
+ ],
+ "totalLayers": 36,
+ "mapCount": 11
+}

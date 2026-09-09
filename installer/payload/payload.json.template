@@ -1,0 +1,26 @@
+{
+  "name": "aowlspt",
+  "version": "0.1.0",
+
+  "//": "The client these binaries were built against. Read it off your own",
+  "//": "install with: aowlspt-install detect. Required.",
+  "targetTarkovVersion": "1.1.0.46777",
+
+  "//": "mono for pre-1.0 clients, il2cpp for post-1.0. Required, and not",
+  "//": "inferable from the version -- see README.md.",
+  "targetBackend": "il2cpp",
+
+  "//": "full  -- installing mirrors the client from --source into --target,",
+  "//":          "then lays this payload over it. What a post-1.0 payload is:",
+  "//":          "everything ships in aowlspt/ and there is no runtime/ or",
+  "//":          "client/ to infer it from.",
+  "//": "overlay -- adds only to the install already at --target.",
+  "kind": "full",
+
+  "//": "Written to <target>/aowlspt/backend.json for the client to read.",
+  "//": "https:// with no port is the real post-1.0 shape: the client talks",
+  "//": "HTTPS on a hardcoded 443, so the launcher starts the backend with",
+  "//": "--tls on 443 and this url carries no port. Use http://127.0.0.1:PORT",
+  "//": "for plain-HTTP development instead.",
+  "backendUrl": "https://127.0.0.1/"
+}

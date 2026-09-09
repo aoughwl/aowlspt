@@ -1,0 +1,29 @@
+{
+  "_comment": "Debug -- the F3 overlay's configuration and the per-mod profiler. These are the values the mod starts with; after that the settings surface owns them, and every apply rewrites aowlspt-debugui.json beside the host DLL. The keys here, the schema in debug.nim and the host's own defaults in host/Aowlspt.Host.Il2Cpp/debugui.nim are three copies of one decision and must agree.",
+
+  "_overlayEnabled": "Draw the F3 panel at all. The host has its own debugUi flag too; BOTH must be on before anything appears.",
+  "overlayEnabled": true,
+
+  "_overlayFields": "One panel line per name, TOP TO BOTTOM in this order -- this is the 'fully customisable' part. Known: fps, frame, frametime, build, map, raid, bots, pos, rot, botlist, prof, prof1..prof8, note1, note2, note3. An unknown name prints itself with a '?' rather than vanishing, so a typo is visible on screen instead of being an inexplicably missing row.",
+  "overlayFields": "fps,frametime,build,map,raid,bots,pos,rot",
+
+  "overlayAnchor": "topleft",
+  "_overlayY": "Unity's Y grows UPWARD, so a top anchor wants a NEGATIVE Y to move down.",
+  "overlayX": 16.0,
+  "overlayY": -16.0,
+  "overlayFontSize": 18.0,
+  "overlayLineHeight": 22.0,
+  "_overlayThrottle": "The panel rebuilds its text every Nth frame. 1 is smoothest and costs the most.",
+  "overlayThrottle": 10,
+  "overlayColor": "1,1,0.62",
+  "espColor": "1,0.35,0.3",
+  "_overlayToggleKey":"Virtual-key code. 114 is VK_F3 -- the Minecraft key, and the shipped default. 0 disables the toggle.",
+  "overlayToggleKey": 114,
+
+  "_profiler": "Per-mod and per-host-rider timing. OFF is the shipped default and costs one load and a predicted branch per mod per tick. Nothing is measured while it is off, and the report says INCONCLUSIVE rather than reporting zero cost.",
+  "profiler": false,
+  "profilerWindowFrames": 120,
+
+  "_selfTestSpinMs": "THE FALSIFIER, not a feature. Set it to 5 with the profiler on: this mod should jump to the top of the profile at ~5 ms per tick with every other mod unchanged. If the cost lands anywhere else, the attribution is wrong and the profile should not be believed. Leave at 0.",
+  "selfTestSpinMs": 0.0
+}

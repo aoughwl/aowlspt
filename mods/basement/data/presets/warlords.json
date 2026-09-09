@@ -1,0 +1,27 @@
+{
+  "id": "warlords",
+  "name": "Warlords of Tarkov",
+  "tone": "grim",
+  "factionCount": 4,
+  "peoplePerFaction": 6,
+  "archetypes": [
+    "militia",
+    "raiders",
+    "slavers",
+    "traders"
+  ],
+  "maps": [
+    "Woods",
+    "Customs",
+    "Interchange"
+  ],
+  "worldPrompt": "Norvinsk did not collapse. It got divided, and then the dividing became the only industry left.\n\nFour crews hold everything worth holding. None of them is a government and all of them behave like one: they tax the roads, they issue their own passes, they execute people on paper. The militia hold the wire around the old customs yard and genuinely believe they are the last legitimate authority in the oblast. The raiders do not believe anything; they are a weather system with boots. The slavers keep books - actual ledgers, with names and amounts owed - and will explain their business to you politely while a man behind them coils a rope. The traders sell to all three and sleep badly.\n\nThere is no neutral ground. Every metre of this map belongs to somebody, and the borders move weekly, because a border here is just wherever the last firefight stopped. Land is taken and re-taken. Prisoners are an asset class. A debt you cannot pay is not forgiven, it is sold, and whoever bought it will come and collect you personally.\n\nYou arrived with a weapon and no allegiance, which makes you the most interesting thing on the map: everyone wants to know whose you are going to be. Every faction will offer you work before they offer you safety. Accept from one and the other three learn about it before you have walked a kilometre. There is a real path here where you end up in a collar walking east, and a real path where three of these four take orders from you. Nobody is going to warn you which one you are on.",
+  "rules": [
+    "No faction is friendly at start; the best available opening stance is wary tolerance.",
+    "Slavery is real and enforceable. A captor may take the weapons and march a prisoner to a place.",
+    "Reputation is public. Helping one faction is known to its rivals within a day of world time.",
+    "Nobody gives anything away. Every favour creates a contract, spoken or written.",
+    "Leaders never negotiate in the open; they send a lieutenant first.",
+    "A deal struck and honoured moves attitude further than any amount of talking."
+  ]
+}

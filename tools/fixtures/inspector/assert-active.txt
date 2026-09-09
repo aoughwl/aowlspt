@@ -1,0 +1,160 @@
+# MEASURED live-inspector output. Every OUTPUT block below is VERBATIM host
+# text captured from a real run on this machine on 2026-09-01/02 -- pointers,
+# counts, frame numbers and all. Nothing here is hand-written prose.
+#
+# WHY THIS EXISTS: three tools parse this prose (acceptance.py,
+# nativetabs_check.py, uihooks_check.py) and each had grown its own private
+# replay. Two of them passed VACUOUSLY on their own command echo or on a
+# fragment of the batch header before being fixed. One corpus, loaded by
+# tools/inspectfixtures.py, is how that stays fixed: every parser test runs
+# against text the host really emitted, including its refusals.
+#
+# DO NOT EDIT AN OUTPUT BLOCK BY HAND. If the host's wording changes, re-harvest
+# from a real capture and say where it came from in SOURCE. A fixture someone
+# tidied is no longer evidence.
+#
+# Entry format:  === ENTRY <id> / --- SOURCE / --- SHAPE / --- COMMAND /
+#                --- OUTPUT <verbatim ...> / --- END
+
+=== ENTRY assert-active-mixed
+--- SOURCE scratchpad bootU.out
+--- SHAPE nine verdicts in command order, 8 PASS and 1 FAIL, then the ASSERTIONS/BATCH VERDICT trailer
+--- COMMAND find Toggles $settings 40000
+--- OUTPUT
+aowlspt live inspector -- batch 83, 13 command(s), on Unity thread 1192
+> find Toggles $settings 40000
+  searching from 0x0000026c30ac6820 name="SettingsScreen" for name containing "Toggles" (case-insensitive; budget 40000 nodes, 12ms per frame, continuing across frames automatically)
+    HIT 0x0000026c30ac6840 name="Toggles"  parent="SettingsScreen"   ($f1)
+    HIT 0x0000026c30ac67e0 name="GameToggleSpawner"  parent="Toggles"   ($f2)
+    HIT 0x0000026c30ac6760 name="GraphicsToggleSpawner"  parent="Toggles"   ($f3)
+    HIT 0x0000026c30ac6700 name="PostFxToggleSpawner"  parent="Toggles"   ($f4)
+    HIT 0x0000026c30ac6680 name="SoundToggleSpawner"  parent="Toggles"   ($f5)
+    HIT 0x0000026c30ac6620 name="ControlsToggleSpawner"  parent="Toggles"   ($f6)
+    HIT 0x0000026c9e43d9e0 name="GameToggleSpawner(Clone)"  parent="Toggles"   ($f7)
+    HIT 0x0000026c9e467840 name="GameToggleSpawner(Clone)"  parent="Toggles"   ($f8)
+    HIT 0x0000026c9e46e680 name="GameToggleSpawner(Clone)"  parent="Toggles"   ($f9)
+    HIT 0x0000026c9e476840 name="GameToggleSpawner(Clone)"  parent="Toggles"   ($f10)
+    HIT 0x0000026c9e431300 name="Toggles(Clone)"  parent="Graphics Settings"   ($f11)
+    HIT 0x0000026c9e4365c0 name="Toggles(Clone)"  parent="PostFX Settings"   ($f12)
+    HIT 0x0000026c30abe320 name="Toggles"  parent="Control Settings"   ($f13)
+    HIT 0x0000026c3062c880 name="TogglesSection"  parent="Panel"   ($f14)
+  visited 1263 node(s) over 10 frame(s), 14 match(es), frontier 0 node(s)
+  -- the subtree was searched EXHAUSTIVELY. Every match is listed above.
+  matches are bound to $f1..$f14 for the rest of this batch
+> children $f1
+  childCount = 9
+  via Transform::GetChild / get_childCount, Object::get_name (calls)
+    [0] transform=0x0000026c30ac67e0 ($c0)  go=0x0000026c30ac6780 ($g0)  name="GameToggleSpawner"
+    [1] transform=0x0000026c30ac6760 ($c1)  go=0x0000026c30ac6720 ($g1)  name="GraphicsToggleSpawner"
+    [2] transform=0x0000026c30ac6700 ($c2)  go=0x0000026c30ac66c0 ($g2)  name="PostFxToggleSpawner"
+    [3] transform=0x0000026c30ac6680 ($c3)  go=0x0000026c30ac6640 ($g3)  name="SoundToggleSpawner"
+    [4] transform=0x0000026c30ac6620 ($c4)  go=0x0000026c30ac65e0 ($g4)  name="ControlsToggleSpawner"
+    [5] transform=0x0000026c9e43d9e0 ($c5)  go=0x0000026c9e43d9c0 ($g5)  name="GameToggleSpawner(Clone)"
+    [6] transform=0x0000026c9e467840 ($c6)  go=0x0000026c9e467820 ($g6)  name="GameToggleSpawner(Clone)"
+    [7] transform=0x0000026c9e46e680 ($c7)  go=0x0000026c9e46e660 ($g7)  name="GameToggleSpawner(Clone)"
+    [8] transform=0x0000026c9e476840 ($c8)  go=0x0000026c9e476820 ($g8)  name="GameToggleSpawner(Clone)"
+  transforms bound to $c0..$c8, GameObjects to $g0..$g8. NOTE: these are TRANSFORMS, not components -- `click` needs the Button, so go through `component $g0 Button` first.
+> assert-active $c0
+  PASS: $c0 activeInHierarchy = true, as claimed
+> assert-active $c1
+  PASS: $c1 activeInHierarchy = true, as claimed
+> assert-active $c2
+  FAIL: $c2 activeInHierarchy = false, but assert-active claimed true.  An INACTIVE node is NOT pressable: a press on one reports success and does nothing (fact #72).
+> assert-active $c3
+  PASS: $c3 activeInHierarchy = true, as claimed
+> assert-active $c4
+  PASS: $c4 activeInHierarchy = true, as claimed
+> assert-active $c5
+  PASS: $c5 activeInHierarchy = true, as claimed
+> assert-active $c6
+  PASS: $c6 activeInHierarchy = true, as claimed
+> assert-active $c7
+  PASS: $c7 activeInHierarchy = true, as claimed
+> assert-active $c8
+  PASS: $c8 activeInHierarchy = true, as claimed
+> verdict
+  ASSERTIONS: 8 pass, 1 fail, 0 inconclusive
+  BATCH VERDICT: FAIL
+> echo aowl-batch-1788322341671-0
+  aowl-batch-1788322341671-0
+  ASSERTIONS: 8 pass, 1 fail, 0 inconclusive
+  BATCH VERDICT: FAIL
+aowlspt live inspector -- batch 83 complete, 58 line(s)
+--- END
+
+=== ENTRY assert-active-all-fail
+--- SOURCE D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt (live, batch 19)
+--- SHAPE five FAILs -- every node INACTIVE, therefore unpressable (fact #72) -- and BATCH VERDICT: FAIL
+--- COMMAND assert-active 0x000001b9f696d5c0
+--- OUTPUT
+aowlspt live inspector -- batch 19, 6 command(s), on Unity thread 19784
+> assert-active 0x000001b9f696d5c0
+  FAIL: 0x000001b9f696d5c0 activeInHierarchy = false, but assert-active claimed true.  An INACTIVE node is NOT pressable: a press on one reports success and does nothing (fact #72).
+> assert-active 0x000001b940343b40
+  FAIL: 0x000001b940343b40 activeInHierarchy = false, but assert-active claimed true.  An INACTIVE node is NOT pressable: a press on one reports success and does nothing (fact #72).
+> assert-active 0x000001b94034ba00
+  FAIL: 0x000001b94034ba00 activeInHierarchy = false, but assert-active claimed true.  An INACTIVE node is NOT pressable: a press on one reports success and does nothing (fact #72).
+> assert-active 0x000001b94034b7e0
+  FAIL: 0x000001b94034b7e0 activeInHierarchy = false, but assert-active claimed true.  An INACTIVE node is NOT pressable: a press on one reports success and does nothing (fact #72).
+> assert-active 0x000001b940343ae0
+  FAIL: 0x000001b940343ae0 activeInHierarchy = false, but assert-active claimed true.  An INACTIVE node is NOT pressable: a press on one reports success and does nothing (fact #72).
+> echo aowl-batch-acceptance1812-1788335678497-7
+  aowl-batch-acceptance1812-1788335678497-7
+  ASSERTIONS: 0 pass, 5 fail, 0 inconclusive
+  BATCH VERDICT: FAIL
+aowlspt live inspector -- batch 19 complete, 15 line(s)
+--- END
+
+=== ENTRY assert-active-inconclusive
+--- SOURCE scratchpad boot4.out, batch 1
+--- SHAPE INCONCLUSIVE: the pointer was not readable, so the active state was never asked for -- NOT a pass and NOT a failure
+--- COMMAND rect 0x000001b0ba28f560
+--- OUTPUT
+aowlspt live inspector -- batch 1, 3 command(s), on Unity thread 12320
+> rect 0x000001b0ba28f560
+  ! not readable, or its native half is null; refusing to call.
+> assert-active 0x000001b0ba28f560
+  INCONCLUSIVE: assert-active 0x000001b0ba28f560: 0x000001b0ba28f560 is not readable, so its active state was never asked for  -- nothing was established; this is NOT a pass and NOT a failure.
+> echo aowl-batch-1788298068048-15
+  aowl-batch-1788298068048-15
+  ASSERTIONS: 0 pass, 0 fail, 1 inconclusive
+  BATCH VERDICT: INCONCLUSIVE
+aowlspt live inspector -- batch 1 complete, 9 line(s)
+--- END
+
+=== ENTRY assert-active-toggle-strip
+--- SOURCE live client, 2026-09-02, Settings open on the GAME tab, mods tab built; captured by tools/ichannel.py run_batch, batch 77
+--- SHAPE the whole top-row tab strip in one batch: 12 PASS and 1 FAIL, the FAIL being PostFxToggleSpawner, which is inactive BY DESIGN (POSTFX is folded into GRAPHICS as a subtab). Every one of the 8 mod-tab clones is activeInHierarchy=true -- the measurement that shows `8 of 8 clones active` was never a defect
+--- COMMAND assert-active 0x000002024b079e80
+--- OUTPUT
+aowlspt live inspector -- batch 77, 14 command(s), on Unity thread 16676
+> assert-active 0x000002024b079e80
+  PASS: 0x000002024b079e80 activeInHierarchy = true, as claimed
+> assert-active 0x000002024b079e00
+  PASS: 0x000002024b079e00 activeInHierarchy = true, as claimed
+> assert-active 0x000002024b079da0
+  FAIL: 0x000002024b079da0 activeInHierarchy = false, but assert-active claimed true.  An INACTIVE node is NOT pressable: a press on one reports success and does nothing (fact #72).
+> assert-active 0x000002024b079d20
+  PASS: 0x000002024b079d20 activeInHierarchy = true, as claimed
+> assert-active 0x000002024b079cc0
+  PASS: 0x000002024b079cc0 activeInHierarchy = true, as claimed
+> assert-active 0x000002030962f640
+  PASS: 0x000002030962f640 activeInHierarchy = true, as claimed
+> assert-active 0x00000203097aeae0
+  PASS: 0x00000203097aeae0 activeInHierarchy = true, as claimed
+> assert-active 0x00000203090dcb80
+  PASS: 0x00000203090dcb80 activeInHierarchy = true, as claimed
+> assert-active 0x00000203091dfaa0
+  PASS: 0x00000203091dfaa0 activeInHierarchy = true, as claimed
+> assert-active 0x00000203092f49a0
+  PASS: 0x00000203092f49a0 activeInHierarchy = true, as claimed
+> assert-active 0x00000203093df1e0
+  PASS: 0x00000203093df1e0 activeInHierarchy = true, as claimed
+> assert-active 0x0000020308cd9c00
+  PASS: 0x0000020308cd9c00 activeInHierarchy = true, as claimed
+> assert-active 0x0000020308da9440
+  PASS: 0x0000020308da9440 activeInHierarchy = true, as claimed
+  ASSERTIONS: 12 pass, 1 fail, 0 inconclusive
+  BATCH VERDICT: FAIL
+aowlspt live inspector -- batch 77 complete, 31 line(s)
+--- END

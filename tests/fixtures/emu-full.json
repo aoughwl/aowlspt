@@ -1,0 +1,3140 @@
+{
+ "traders": {
+  "54cb50c76803fa8b248b4571": {
+   "base": {
+    "_id": "54cb50c76803fa8b248b4571",
+    "nickname": "Prapor",
+    "currency": "RUB",
+    "unlockedByDefault": true,
+    "loyaltyLevels": [
+     {
+      "minLevel": 1,
+      "minSalesSum": 0,
+      "minStanding": 0.0,
+      "buy_price_coef": 100,
+      "repair_price_coef": 100,
+      "insurance_price_coef": 100,
+      "heal_price_coef": 0,
+      "_comment": "LL1 is the floor: everyone starts here. Its heal_price_coef is a literal zero, which is what every trader but Therapist carries on every row in live data -- and it means 'not named', not 'free'. Nothing in a test run is ever treated at this level, so a server that read loyaltyLevels[0] instead of the player's own row would charge full price where the row below says 150 per cent, and the treatment checks would see it."
+     },
+     {
+      "minLevel": 1,
+      "minSalesSum": 20000,
+      "minStanding": 0.0,
+      "heal_price_coef": 150,
+      "_comment": "Reached by the Trading section's own purchases, and the row every treatment in this run is priced by: 150 per cent, read as a percentage exactly as repair_price_coef is."
+     },
+     {
+      "minLevel": 1,
+      "minSalesSum": 40000,
+      "minStanding": 50.0,
+      "_comment": "Sales sum is reached and standing is not, so LL3 is never granted -- which is what pins 'every requirement, not the best match'."
+     }
+    ]
+   },
+   "assort": {
+    "items": [
+     {
+      "_id": "aaaaaaaaaaaaaaaaaaaaaaa1",
+      "_tpl": "5644bd2b4bdc2d3b4c8b4572",
+      "parentId": "hideout",
+      "slotId": "hideout",
+      "upd": {
+       "StackObjectsCount": 10
+      }
+     },
+     {
+      "_id": "aaaaaaaaaaaaaaaaaaaaaaa2",
+      "_tpl": "544fb45d4bdc2dee738b4568",
+      "parentId": "hideout",
+      "slotId": "hideout",
+      "upd": {
+       "StackObjectsCount": 40
+      }
+     },
+     {
+      "_comment": "A barter. It must NOT become a flea offer: it has no price, and an offer with no price sorts to the top of every cheapest-first search and cannot be paid for with money.",
+      "_id": "aaaaaaaaaaaaaaaaaaaaaaa3",
+      "_tpl": "590c657e86f77412b013051d",
+      "parentId": "hideout",
+      "slotId": "hideout"
+     },
+     {
+      "_comment": "A part of a rifle in the assort, not a separate offer. slotId is not 'hideout', so the generator skips it.",
+      "_id": "aaaaaaaaaaaaaaaaaaaaaaa4",
+      "_tpl": "57ac965c24597706be5f975c",
+      "parentId": "aaaaaaaaaaaaaaaaaaaaaaa1",
+      "slotId": "mod_scope"
+     },
+     {
+      "_comment": "Something edible to buy, so the out-of-raid Eat check has an item with a resource on it.",
+      "_id": "aaaaaaaaaaaaaaaaaaaaaaa6",
+      "_tpl": "5448ff904bdc2d6f028b456e",
+      "parentId": "hideout",
+      "slotId": "hideout"
+     }
+    ],
+    "barter_scheme": {
+     "aaaaaaaaaaaaaaaaaaaaaaa1": [
+      [
+       {
+        "_tpl": "5449016a4bdc2d6f028b456f",
+        "count": 25000
+       }
+      ]
+     ],
+     "aaaaaaaaaaaaaaaaaaaaaaa2": [
+      [
+       {
+        "_tpl": "5449016a4bdc2d6f028b456f",
+        "count": 1200
+       }
+      ]
+     ],
+     "aaaaaaaaaaaaaaaaaaaaaaa3": [
+      [
+       {
+        "_tpl": "544fb45d4bdc2dee738b4568",
+        "count": 3
+       }
+      ]
+     ],
+     "aaaaaaaaaaaaaaaaaaaaaaa6": [
+      [
+       {
+        "_tpl": "5449016a4bdc2d6f028b456f",
+        "count": 500
+       }
+      ]
+     ]
+    },
+    "loyal_level_items": {
+     "aaaaaaaaaaaaaaaaaaaaaaa1": 1,
+     "aaaaaaaaaaaaaaaaaaaaaaa2": 1,
+     "aaaaaaaaaaaaaaaaaaaaaaa3": 3,
+     "aaaaaaaaaaaaaaaaaaaaaaa6": 1
+    }
+   },
+   "dialogue": {
+    "_comment": "What Prapor actually says, and the reason `emu/dialogue` exists: this server posted one hardcoded English sentence for every trader and every outcome until it read this table. Both lists carry two ids, both of Prapor's lines carry `{location}` and the found ones carry `{date}` and `{time}` as well -- so the raid that loses his kit is sent with a location, every candidate resolves, and the message is Prapor's whichever of the two the seed picks. That is why both lines below open with the same four words: the pick is reproducible but it is not this file's to predict, so what a check can assert is what the two have in common, that the map is named, and that no placeholder survived unfilled.",
+    "insuranceStart": [
+     "fx_prapor_start_a",
+     "fx_prapor_start_b"
+    ],
+    "insuranceFound": [
+     "fx_prapor_found_a",
+     "fx_prapor_found_b"
+    ]
+   }
+  },
+  "5ac3b934156ae10c4430e83c": {
+   "base": {
+    "_id": "5ac3b934156ae10c4430e83c",
+    "nickname": "Ragman",
+    "currency": "USD",
+    "unlockedByDefault": true,
+    "repair": {
+     "_comment": "excluded_category names a category two levels above the one the plate's handbook entry is filed under, which is how a real trader base names them. Matching only the entry's own category would refuse nothing at all.",
+     "availability": true,
+     "currency": "5449016a4bdc2d6f028b456f",
+     "excluded_id_list": [],
+     "excluded_category": [
+      "5b47574386f77428ca22b33e"
+     ]
+    }
+   },
+   "assort": {
+    "items": [
+     {
+      "_id": "bbbbbbbbbbbbbbbbbbbbbbb1",
+      "_tpl": "5648a7494bdc2d9d488b4583",
+      "parentId": "hideout",
+      "slotId": "hideout"
+     }
+    ],
+    "barter_scheme": {
+     "bbbbbbbbbbbbbbbbbbbbbbb1": [
+      [
+       {
+        "_tpl": "5696686a4bdc2da3298b456a",
+        "count": 180
+       }
+      ]
+     ]
+    },
+    "loyal_level_items": {
+     "bbbbbbbbbbbbbbbbbbbbbbb1": 1
+    }
+   }
+  },
+  "579dc571d53a0658a154fbec": {
+   "base": {
+    "_comment": "Fence, with no assort. Scav karma needs a trader to write standing onto and nothing else; a Fence with stock would put offers on the flea and move every count this fixture pins.",
+    "_id": "579dc571d53a0658a154fbec",
+    "nickname": "Fence",
+    "currency": "RUB",
+    "unlockedByDefault": true,
+    "loyaltyLevels": [
+     {
+      "minLevel": 1,
+      "minSalesSum": 0,
+      "minStanding": 0.0,
+      "heal_price_coef": 0,
+      "_comment": "The zero that matters. This is the row a treatment at Fence is priced by, and a server that multiplied by it would heal for nothing -- so the treatment checks buy a heal here and assert it cost the table's full price rather than zero."
+     }
+    ],
+    "_comment_dialogue": "Fence has no `dialogue` deliberately, and it is load-bearing rather than an omission: he is the trader whose insurance return must still arrive with `DefaultReturnText`. Give him lines and the check that the plain wording survives for a trader the database says nothing about has nothing left to measure."
+   }
+  },
+  "54cb57776803fa99248b456e": {
+   "_comment": "The Therapist, and she is *only* a dialogue -- no `base`, so `traderSettings` skips her and she is invisible to the trader screen, the flea and every count this fixture pins. `Insure` does not check the trader against the table (the premium is the handbook's and the coefficient is the config's), so a second insuring trader costs one key here and proves the thing that actually needed proving: raid end queues one entry per insuring trader, and her return arrives in her own dialog rather than in Prapor's.",
+   "dialogue": {
+    "_comment": "Three found-lines, and only one of them can ever be used -- which is the point. `fx_ther_found_nolocale` has no entry in the locale table at all, and `fx_ther_found_unknown` carries `{nickname}`, a placeholder `substitute` has no value for and never will (it is a real one, out of Fence`s soldItems lines). Both are unusable on every raid, on every map, in every language, so whichever of the three the seed starts on, `say` has to rotate to `fx_ther_found_plain` -- and the check downstream can assert one exact sentence instead of a set. A list where only one candidate were unusable would exercise the rotation on about half of all runs and look exactly as green on the other half, which is the failure this fixture is shaped to avoid. Her start lines carry no placeholders because there is nothing about them worth making conditional.",
+    "insuranceStart": [
+     "fx_ther_start_a",
+     "fx_ther_start_b"
+    ],
+    "insuranceFound": [
+     "fx_ther_found_nolocale",
+     "fx_ther_found_unknown",
+     "fx_ther_found_plain"
+    ]
+   }
+  }
+ },
+ "templates": {
+  "items": {
+   "5449016a4bdc2d6f028b456f": {
+    "_id": "5449016a4bdc2d6f028b456f",
+    "_props": {
+     "Name": "Roubles",
+     "Width": 1,
+     "Height": 1,
+     "StackMaxSize": 500000
+    }
+   },
+   "5644bd2b4bdc2d3b4c8b4572": {
+    "_id": "5644bd2b4bdc2d3b4c8b4572",
+    "_props": {
+     "Name": "AK-74N",
+     "Width": 4,
+     "Height": 2,
+     "StackMaxSize": 1
+    }
+   },
+   "5811ce572459770cba1a34ea": {
+    "_id": "5811ce572459770cba1a34ea",
+    "_props": {
+     "Name": "Stash 10x68",
+     "Grids": [
+      {
+       "_props": {
+        "cellsH": 10,
+        "cellsV": 68
+       }
+      }
+     ]
+    }
+   },
+   "5696686a4bdc2da3298b456a": {
+    "_id": "5696686a4bdc2da3298b456a",
+    "_props": {
+     "Name": "Dollars",
+     "Width": 1,
+     "Height": 1,
+     "StackMaxSize": 50000
+    }
+   },
+   "544fb45d4bdc2dee738b4568": {
+    "_id": "544fb45d4bdc2dee738b4568",
+    "_props": {
+     "Name": "Salewa",
+     "Width": 1,
+     "Height": 2,
+     "StackMaxSize": 1,
+     "MaxHpResource": 400,
+     "_comment": "A medkit: MaxHpResource is what a fresh one heals in total, and emu/health fills upd.MedKit.HpResource from it the first time one is used."
+    }
+   },
+   "590c657e86f77412b013051d": {
+    "_id": "590c657e86f77412b013051d",
+    "_props": {
+     "Name": "Grizzly",
+     "Width": 2,
+     "Height": 2,
+     "StackMaxSize": 1,
+     "RarityPvE": "Rare"
+    }
+   },
+   "57ac965c24597706be5f975c": {
+    "_id": "57ac965c24597706be5f975c",
+    "_props": {
+     "Name": "PSO-1",
+     "Width": 2,
+     "Height": 1,
+     "StackMaxSize": 1
+    }
+   },
+   "5648a7494bdc2d9d488b4583": {
+    "_id": "5648a7494bdc2d9d488b4583",
+    "_props": {
+     "_comment": "The only Superrare template here. Every scav recipe below zeroes the Superrare band, so it must never come out of a case -- which is what tells a roll that honours the bands apart from one that picks out of every pool it has.",
+     "Name": "6B47",
+     "Width": 2,
+     "Height": 2,
+     "StackMaxSize": 1,
+     "RarityPvE": "Superrare"
+    }
+   },
+   "5710c24ad2720bc3458b45a3": {
+    "_id": "5710c24ad2720bc3458b45a3",
+    "_props": {
+     "Name": "Bolts",
+     "Width": 1,
+     "Height": 1,
+     "StackMaxSize": 30
+    }
+   },
+   "590c2e1186f77425357b6124": {
+    "_id": "590c2e1186f77425357b6124",
+    "_props": {
+     "Name": "Toolset",
+     "Width": 2,
+     "Height": 2,
+     "StackMaxSize": 1
+    }
+   },
+   "59e35de086f7741778269d83": {
+    "_id": "59e35de086f7741778269d83",
+    "_props": {
+     "Name": "Bolts",
+     "Width": 1,
+     "Height": 1,
+     "StackMaxSize": 20
+    }
+   },
+   "5448ff904bdc2d6f028b456e": {
+    "_id": "5448ff904bdc2d6f028b456e",
+    "_props": {
+     "Name": "Water bottle",
+     "Width": 1,
+     "Height": 2,
+     "StackMaxSize": 1,
+     "MaxResource": 60,
+     "effects_health": {
+      "Hydration": {
+       "value": 60,
+       "delay": 0,
+       "duration": 0
+      }
+     },
+     "_comment": "Food: `value` is what the WHOLE item is worth, so one of its 60 units is worth exactly 1 hydration. emu/health divides by MaxResource for that reason."
+    }
+   },
+   "5d1b371186f774253763a656": {
+    "_id": "5d1b371186f774253763a656",
+    "_props": {
+     "_comment": "One of the two Rare templates the scav case can draw from. RarityPvE is the database's own member and the only thing that puts a template in a scav case pool -- with a handbook price above zero and QuestItem unset, which the handbook above gives it.",
+     "Name": "Expeditionary fuel tank",
+     "Width": 2,
+     "Height": 2,
+     "StackMaxSize": 1,
+     "MaxResource": 100,
+     "RarityPvE": "Rare"
+    }
+   },
+   "ccccbox00000000000000001": {
+    "_id": "ccccbox00000000000000001",
+    "_props": {
+     "Name": "Test crate",
+     "Width": 2,
+     "Height": 2,
+     "Grids": [
+      {
+       "_name": "main",
+       "_props": {
+        "cellsH": 3,
+        "cellsV": 3
+       }
+      }
+     ]
+    }
+   },
+   "aaaaammo0000000000000001": {
+    "_id": "aaaaammo0000000000000001",
+    "_props": {
+     "Name": "Test cartridge",
+     "Width": 1,
+     "Height": 1,
+     "StackMaxSize": 60
+    }
+   },
+   "bbbbbox00000000000000002": {
+    "_id": "bbbbbox00000000000000002",
+    "_props": {
+     "Name": "Test ammo box",
+     "Width": 1,
+     "Height": 1,
+     "StackMaxSize": 1,
+     "StackSlots": [
+      {
+       "_name": "cartridges",
+       "_max_count": 100,
+       "_props": {
+        "filters": [
+         {
+          "Filter": [
+           "aaaaammo0000000000000001"
+          ]
+         }
+        ]
+       }
+      }
+     ]
+    }
+   },
+   "qqqquest0000000000000001": {
+    "_id": "qqqquest0000000000000001",
+    "_props": {
+     "_comment": "The only Common template in this database, and a quest item -- priced in the handbook, so the *only* thing keeping it out of a scav case is QuestItem. That makes the Common pool empty, and a recipe that asks for a Common item is refused by name. A server that let quest items into the pool would start that case instead, and hand the player an item a quest can no longer make them find.",
+     "Name": "Test quest item",
+     "Width": 1,
+     "Height": 1,
+     "StackMaxSize": 1,
+     "QuestItem": true,
+     "RarityPvE": "Common"
+    }
+   },
+   "wwwwgun00000000000000001": {
+    "_id": "wwwwgun00000000000000001",
+    "_props": {
+     "Name": "Test rifle",
+     "Width": 4,
+     "Height": 2,
+     "StackMaxSize": 1,
+     "ammoCaliber": "Caliber545x39"
+    }
+   },
+   "mmmmmag00000000000000001": {
+    "_id": "mmmmmag00000000000000001",
+    "_props": {
+     "Name": "Test magazine",
+     "Width": 1,
+     "Height": 1,
+     "StackMaxSize": 1,
+     "Cartridges": [
+      {
+       "_name": "cartridges",
+       "_max_count": 30
+      }
+     ],
+     "_comment_cartridges": "`_max_count` is what a magazine is filled to. Absent, no rounds go in at all -- a made-up capacity is a gun that jams on the client."
+    }
+   },
+   "rrrrgun00000000000000001": {
+    "_comment": "A repairable firearm. Degradation is written with its two ends EQUAL on purpose: the repair module draws between them from a seeded generator when they differ, and a check that has to predict the draw is checking the generator rather than the repair. 40 points at 0.025 is exactly 1.0 of MaxDurability.",
+    "_id": "rrrrgun00000000000000001",
+    "_props": {
+     "Name": "Test carbine",
+     "Width": 4,
+     "Height": 2,
+     "StackMaxSize": 1,
+     "Durability": 100,
+     "MaxDurability": 100,
+     "RepairCost": 50,
+     "MinRepairDegradation": 0.025,
+     "MaxRepairDegradation": 0.025,
+     "MinRepairKitDegradation": 0.05,
+     "MaxRepairKitDegradation": 0.05
+    }
+   },
+   "rrrrarm00000000000000001": {
+    "_comment": "Armour. `armorClass` is what makes the kit cost per point differ from a firearm's: 5 * 4 / 10 = 2 resource units a point.",
+    "_id": "rrrrarm00000000000000001",
+    "_props": {
+     "Name": "Test plate carrier",
+     "Width": 3,
+     "Height": 3,
+     "StackMaxSize": 1,
+     "armorClass": 4,
+     "Durability": 50,
+     "MaxDurability": 50,
+     "RepairCost": 100,
+     "MinRepairDegradation": 0.01,
+     "MaxRepairDegradation": 0.01,
+     "MinRepairKitDegradation": 0.1,
+     "MaxRepairKitDegradation": 0.1
+    }
+   },
+   "rrrrkit00000000000000001": {
+    "_comment": "A repair kit. `MaxRepairResource` is the charge a kit with no `upd.RepairKit` starts from, exactly as `MaxHpResource` is for a medkit.",
+    "_id": "rrrrkit00000000000000001",
+    "_props": {
+     "Name": "Test repair kit",
+     "Width": 2,
+     "Height": 1,
+     "StackMaxSize": 1,
+     "MaxRepairResource": 200
+    }
+   },
+   "ppppmap00000000000000001": {
+    "_comment": "A paper map. `MaxMarkersCount` is three so the fourth marker has something to be refused by.",
+    "_id": "ppppmap00000000000000001",
+    "_props": {
+     "Name": "Test map",
+     "Width": 1,
+     "Height": 1,
+     "StackMaxSize": 1,
+     "MaxMarkersCount": 3
+    }
+   },
+   "nnnnnil00000000000000001": {
+    "_comment": "Deliberately has no durability and no repair price: the refusals for 'this cannot be repaired' need something that cannot be.",
+    "_id": "nnnnnil00000000000000001",
+    "_props": {
+     "Name": "Test brick",
+     "Width": 1,
+     "Height": 1,
+     "StackMaxSize": 1
+    }
+   },
+   "bbbbhat00000000000000001": {
+    "_comment": "The only hat in the assault loadout, so the check can name it: a weighted pick with one entry is the one entry.",
+    "_id": "bbbbhat00000000000000001",
+    "_props": {
+     "Name": "Test helmet",
+     "Width": 2,
+     "Height": 2,
+     "StackMaxSize": 1
+    }
+   },
+   "ssssscope00000000000001": {
+    "_id": "ssssscope00000000000001",
+    "_props": {
+     "Name": "Test bot scope",
+     "Width": 1,
+     "Height": 1,
+     "StackMaxSize": 1
+    }
+   },
+   "mmmmuzz00000000000000001": {
+    "_comment": "Exists only so that `mod_muzzle` at a chance of zero has something it could have picked and did not.",
+    "_id": "mmmmuzz00000000000000001",
+    "_props": {
+     "Name": "Test muzzle brake",
+     "Width": 1,
+     "Height": 1,
+     "StackMaxSize": 1
+    }
+   },
+   "eeeeeye00000000000000001": {
+    "_id": "eeeeeye00000000000000001",
+    "_props": {
+     "Name": "Test glasses",
+     "Width": 1,
+     "Height": 1,
+     "StackMaxSize": 1
+    }
+   },
+   "vvvvvest0000000000000001": {
+    "_comment": "A rig with one 2x2 grid. The loot generator places into a real grid and refuses when it is full, exactly as the player's stash does -- two 1x1 items fit here and are given different cells.",
+    "_id": "vvvvvest0000000000000001",
+    "_props": {
+     "Name": "Test rig",
+     "Width": 3,
+     "Height": 3,
+     "StackMaxSize": 1,
+     "Grids": [
+      {
+       "_name": "main",
+       "_props": {
+        "cellsH": 2,
+        "cellsV": 2
+       }
+      }
+     ]
+    }
+   },
+   "bbbbpack0000000000000001": {
+    "_comment": "A backpack with a 1x1 grid, so that the 2x1 item in its pool fits in neither orientation. That is the check that a container with no room refuses rather than writing an overlapping location.",
+    "_id": "bbbbpack0000000000000001",
+    "_props": {
+     "Name": "Test pack",
+     "Width": 4,
+     "Height": 4,
+     "StackMaxSize": 1,
+     "Grids": [
+      {
+       "_name": "main",
+       "_props": {
+        "cellsH": 1,
+        "cellsV": 1
+       }
+      }
+     ]
+    }
+   },
+   "ppppockt0000000000000001": {
+    "_comment": "Pockets, with room in them. Its generation weight is on a count of zero, so what it proves is that a zero count means nothing goes in rather than the default going in.",
+    "_id": "ppppockt0000000000000001",
+    "_props": {
+     "Name": "Test pockets",
+     "Width": 1,
+     "Height": 1,
+     "StackMaxSize": 1,
+     "Grids": [
+      {
+       "_name": "pocket1",
+       "_props": {
+        "cellsH": 1,
+        "cellsV": 1
+       }
+      }
+     ]
+    }
+   },
+   "lllloot00000000000000001": {
+    "_comment": "The only entry in the rig's loot pool, so a check can name it: a weighted pick with one entry is that entry.",
+    "_id": "lllloot00000000000000001",
+    "_props": {
+     "Name": "Test loot",
+     "Width": 1,
+     "Height": 1,
+     "StackMaxSize": 1
+    }
+   },
+   "bbbbulk00000000000000001": {
+    "_comment": "Two cells wide, which is one more than the backpack above has.",
+    "_id": "bbbbulk00000000000000001",
+    "_props": {
+     "Name": "Test bulky loot",
+     "Width": 2,
+     "Height": 1,
+     "StackMaxSize": 1
+    }
+   },
+   "rrrrarm00000000000000002": {
+    "_comment": "A second plate, identical to the first except that its trader degradation is 0.05 rather than 0.01. That is not cosmetic: 20 points at 0.01 takes 0.2 off the maximum, and a check that has to read back 49.8 is a check about float printing. At 0.05 the same 20 points take exactly 1.",
+    "_id": "rrrrarm00000000000000002",
+    "_props": {
+     "Name": "Test plate carrier II",
+     "Width": 3,
+     "Height": 3,
+     "StackMaxSize": 1,
+     "armorClass": 4,
+     "Durability": 50,
+     "MaxDurability": 50,
+     "RepairCost": 100,
+     "MinRepairDegradation": 0.05,
+     "MaxRepairDegradation": 0.05,
+     "MinRepairKitDegradation": 0.1,
+     "MaxRepairKitDegradation": 0.1
+    }
+   }
+  },
+  "customization": {
+   "_comment": "The wardrobe. `emu/customise` refuses every `CustomizationSet` when this table is absent -- correctly, because an id it cannot check is an id it would write blind -- so without these entries not one line of that module is reachable over the wire. It is also not free to shorten: `selfCheckCustomisation` validates the ten ids `defaultCustomisation` gives a new profile, and both default voice names, against whatever table the server is loaded with. A fixture missing any of them stops the mod from loading.",
+   "cust_root": {
+    "_id": "cust_root",
+    "_name": "Customization",
+    "_parent": "",
+    "_type": "Node",
+    "_props": {
+     "Side": [
+      "Savage"
+     ]
+    }
+   },
+   "cust_parts": {
+    "_id": "cust_parts",
+    "_name": "BodyParts",
+    "_parent": "cust_root",
+    "_type": "Node",
+    "_props": {
+     "Side": []
+    }
+   },
+   "cust_head": {
+    "_id": "cust_head",
+    "_name": "Head",
+    "_parent": "cust_parts",
+    "_type": "Node",
+    "_props": {
+     "Side": []
+    }
+   },
+   "cust_body": {
+    "_id": "cust_body",
+    "_name": "Body",
+    "_parent": "cust_parts",
+    "_type": "Node",
+    "_props": {
+     "Side": []
+    }
+   },
+   "cust_feet": {
+    "_id": "cust_feet",
+    "_name": "Feet",
+    "_parent": "cust_parts",
+    "_type": "Node",
+    "_props": {
+     "Side": []
+    }
+   },
+   "cust_hands": {
+    "_id": "cust_hands",
+    "_name": "Hands",
+    "_parent": "cust_parts",
+    "_type": "Node",
+    "_props": {
+     "Side": []
+    }
+   },
+   "cust_suits": {
+    "_id": "cust_suits",
+    "_name": "Suits",
+    "_parent": "cust_root",
+    "_type": "Node",
+    "_props": {
+     "Side": []
+    }
+   },
+   "cust_upper": {
+    "_id": "cust_upper",
+    "_name": "Upper",
+    "_parent": "cust_suits",
+    "_type": "Node",
+    "_props": {
+     "Side": []
+    }
+   },
+   "cust_lower": {
+    "_id": "cust_lower",
+    "_name": "Lower",
+    "_parent": "cust_suits",
+    "_type": "Node",
+    "_props": {
+     "Side": []
+    }
+   },
+   "cust_voice": {
+    "_id": "cust_voice",
+    "_name": "Voice",
+    "_parent": "cust_root",
+    "_type": "Node",
+    "_props": {
+     "Side": []
+    }
+   },
+   "cust_tags": {
+    "_id": "cust_tags",
+    "_name": "DogTags",
+    "_parent": "cust_root",
+    "_type": "Node",
+    "_props": {
+     "Side": []
+    }
+   },
+   "5cde96047d6c8b20b577f016": {
+    "_id": "5cde96047d6c8b20b577f016",
+    "_name": "DefaultUsecHead",
+    "_parent": "cust_head",
+    "_type": "Item",
+    "_props": {
+     "Name": "DefaultUsecHead",
+     "Side": [
+      "Usec"
+     ],
+     "ProfileVersions": [],
+     "BodyPart": "Head",
+     "_comment": "The ten ids below are the ones emu/profile hands a new character, verbatim. They are here so that the load-time check which validates them has a table to validate them against -- seven of the eight it first ran on were the wrong entry and four named the wrong body part."
+    }
+   },
+   "5cde95d97d6c8b647a3769b0": {
+    "_id": "5cde95d97d6c8b647a3769b0",
+    "_name": "DefaultUsecBody",
+    "_parent": "cust_body",
+    "_type": "Item",
+    "_props": {
+     "Name": "DefaultUsecBody",
+     "Side": [
+      "Usec"
+     ],
+     "ProfileVersions": [],
+     "BodyPart": "Body"
+    }
+   },
+   "5cde95ef7d6c8b04713c4f2d": {
+    "_id": "5cde95ef7d6c8b04713c4f2d",
+    "_name": "DefaulUsecFeet",
+    "_parent": "cust_feet",
+    "_type": "Item",
+    "_props": {
+     "Name": "DefaulUsecFeet",
+     "Side": [
+      "Usec"
+     ],
+     "ProfileVersions": [],
+     "BodyPart": "Feet"
+    }
+   },
+   "5cde95fa7d6c8b04737c2d13": {
+    "_id": "5cde95fa7d6c8b04737c2d13",
+    "_name": "DefaultUsecHands",
+    "_parent": "cust_hands",
+    "_type": "Item",
+    "_props": {
+     "Name": "DefaultUsecHands",
+     "Side": [
+      "Usec"
+     ],
+     "ProfileVersions": [],
+     "BodyPart": "Hands"
+    }
+   },
+   "674731d1170146228c0d222a": {
+    "_id": "674731d1170146228c0d222a",
+    "_name": "dogtag_usec_default",
+    "_parent": "cust_tags",
+    "_type": "Item",
+    "_props": {
+     "Name": "dogtag_usec_default",
+     "Side": [
+      "Usec"
+     ],
+     "ProfileVersions": []
+    }
+   },
+   "5cc084dd14c02e000b0550a3": {
+    "_id": "5cc084dd14c02e000b0550a3",
+    "_name": "DefaultBearHead",
+    "_parent": "cust_head",
+    "_type": "Item",
+    "_props": {
+     "Name": "DefaultBearHead",
+     "Side": [
+      "Bear"
+     ],
+     "ProfileVersions": [],
+     "BodyPart": "Head"
+    }
+   },
+   "5cc0858d14c02e000c6bea66": {
+    "_id": "5cc0858d14c02e000c6bea66",
+    "_name": "DefaultBearBody",
+    "_parent": "cust_body",
+    "_type": "Item",
+    "_props": {
+     "Name": "DefaultBearBody",
+     "Side": [
+      "Bear"
+     ],
+     "ProfileVersions": [],
+     "BodyPart": "Body"
+    }
+   },
+   "5cc085bb14c02e000e67a5c5": {
+    "_id": "5cc085bb14c02e000e67a5c5",
+    "_name": "DefaultBearFeet",
+    "_parent": "cust_feet",
+    "_type": "Item",
+    "_props": {
+     "Name": "DefaultBearFeet",
+     "Side": [
+      "Bear"
+     ],
+     "ProfileVersions": [],
+     "BodyPart": "Feet"
+    }
+   },
+   "5cc0876314c02e000c6bea6b": {
+    "_id": "5cc0876314c02e000c6bea6b",
+    "_name": "DefaultBearHands",
+    "_parent": "cust_hands",
+    "_type": "Item",
+    "_props": {
+     "Name": "DefaultBearHands",
+     "Side": [
+      "Bear"
+     ],
+     "ProfileVersions": [],
+     "BodyPart": "Hands"
+    }
+   },
+   "674731c8bafff850080488bb": {
+    "_id": "674731c8bafff850080488bb",
+    "_name": "dogtag_bear_default",
+    "_parent": "cust_tags",
+    "_type": "Item",
+    "_props": {
+     "Name": "dogtag_bear_default",
+     "Side": [
+      "Bear"
+     ],
+     "ProfileVersions": []
+    }
+   },
+   "cust_voice_usec_1": {
+    "_id": "cust_voice_usec_1",
+    "_name": "Usec_1",
+    "_parent": "cust_voice",
+    "_type": "Item",
+    "_props": {
+     "Name": "Usec_1",
+     "Side": [
+      "Usec"
+     ],
+     "ProfileVersions": []
+    }
+   },
+   "cust_voice_bear_1": {
+    "_id": "cust_voice_bear_1",
+    "_name": "Bear_1",
+    "_parent": "cust_voice",
+    "_type": "Item",
+    "_props": {
+     "Name": "Bear_1",
+     "Side": [
+      "Bear"
+     ],
+     "ProfileVersions": []
+    }
+   },
+   "cust_voice_usec_2": {
+    "_id": "cust_voice_usec_2",
+    "_name": "Usec_2",
+    "_parent": "cust_voice",
+    "_type": "Item",
+    "_props": {
+     "Name": "Usec_2",
+     "Side": [
+      "Usec"
+     ],
+     "ProfileVersions": [],
+     "_comment": "A second Usec voice, whose Name differs from its id. Info.Voice holds the name; a server that wrote the id would pass a check made against the default voice, whose name and id would otherwise both have to be guessed at."
+    }
+   },
+   "cust_head_alt": {
+    "_id": "cust_head_alt",
+    "_name": "AltUsecHead",
+    "_parent": "cust_head",
+    "_type": "Item",
+    "_props": {
+     "_comment": "A second Usec head, so that a batch whose first option is good and whose second is not has something visible to half-apply. With only the default head available, 'neither was written' and 'the first was written' are the same document.",
+     "Name": "AltUsecHead",
+     "Side": [
+      "Usec"
+     ],
+     "ProfileVersions": [],
+     "BodyPart": "Head"
+    }
+   },
+   "cust_body_alt": {
+    "_id": "cust_body_alt",
+    "_name": "AltUsecBody",
+    "_parent": "cust_body",
+    "_type": "Item",
+    "_props": {
+     "Name": "AltUsecBody",
+     "Side": [
+      "Usec"
+     ],
+     "ProfileVersions": [],
+     "BodyPart": "Body"
+    }
+   },
+   "cust_hands_alt": {
+    "_id": "cust_hands_alt",
+    "_name": "AltUsecHands",
+    "_parent": "cust_hands",
+    "_type": "Item",
+    "_props": {
+     "Name": "AltUsecHands",
+     "Side": [
+      "Usec"
+     ],
+     "ProfileVersions": [],
+     "BodyPart": "Hands"
+    }
+   },
+   "cust_feet_alt": {
+    "_id": "cust_feet_alt",
+    "_name": "AltUsecFeet",
+    "_parent": "cust_feet",
+    "_type": "Item",
+    "_props": {
+     "Name": "AltUsecFeet",
+     "Side": [
+      "Usec"
+     ],
+     "ProfileVersions": [],
+     "BodyPart": "Feet"
+    }
+   },
+   "cust_upper_alt": {
+    "_id": "cust_upper_alt",
+    "_name": "AltUsecUpper",
+    "_parent": "cust_upper",
+    "_type": "Item",
+    "_props": {
+     "Name": "AltUsecUpper",
+     "Side": [
+      "Usec"
+     ],
+     "ProfileVersions": [],
+     "Body": "cust_body_alt",
+     "Hands": "cust_hands_alt",
+     "_comment": "One option, two writes: an Upper suite names the Body and the Hands that go with it, and both are entries of their own. Deliberately not the profile's defaults, so that 'the suite changed Body and Hands' is a difference and not a repaint of what was already there."
+    }
+   },
+   "cust_lower_alt": {
+    "_id": "cust_lower_alt",
+    "_name": "AltUsecLower",
+    "_parent": "cust_lower",
+    "_type": "Item",
+    "_props": {
+     "Name": "AltUsecLower",
+     "Side": [
+      "Usec"
+     ],
+     "ProfileVersions": [],
+     "Feet": "cust_feet_alt"
+    }
+   },
+   "cust_hideout": {
+    "_comment": "The hideout's own half of this table, and the reason it is here: `emu/decorate` derives the profile key it writes from `itemId -> _parent -> _name`, so a floor is only reachable over the wire if this fixture carries a node actually named `Floor`. The real table has `Floor`, `Wall`, `Ceiling`, `ShootingRangeMark` and `MannequinPose` under a hideout node; three of the five are enough to reach every branch of the module, and each one added here is one an offer or a pose below names.",
+    "_id": "cust_hideout",
+    "_name": "Hideout",
+    "_parent": "cust_root",
+    "_type": "Node",
+    "_props": {
+     "Side": []
+    }
+   },
+   "cust_floor": {
+    "_id": "cust_floor",
+    "_name": "Floor",
+    "_parent": "cust_hideout",
+    "_type": "Node",
+    "_props": {
+     "Side": []
+    }
+   },
+   "cust_mark": {
+    "_id": "cust_mark",
+    "_name": "ShootingRangeMark",
+    "_parent": "cust_hideout",
+    "_type": "Node",
+    "_props": {
+     "Side": []
+    }
+   },
+   "cust_pose": {
+    "_id": "cust_pose",
+    "_name": "MannequinPose",
+    "_parent": "cust_hideout",
+    "_type": "Node",
+    "_props": {
+     "Side": []
+    }
+   },
+   "cust_floor_plain": {
+    "_comment": "The floor `hideout.customisation.globals` names. Its `_parent` is the `Floor` node and nothing else says so: the key the apply writes into `Hideout.Customization` is this node's `_name`, so a check asserting `Floor` is asserting the derivation and not a literal.",
+    "_id": "cust_floor_plain",
+    "_name": "FloorPlain",
+    "_parent": "cust_floor",
+    "_type": "Item",
+    "_props": {
+     "Name": "FloorPlain",
+     "Side": [
+      "Usec",
+      "Bear"
+     ],
+     "ProfileVersions": []
+    }
+   },
+   "cust_mark_target": {
+    "_id": "cust_mark_target",
+    "_name": "TargetLevel3",
+    "_parent": "cust_mark",
+    "_type": "Item",
+    "_props": {
+     "Name": "TargetLevel3",
+     "Side": [
+      "Usec",
+      "Bear"
+     ],
+     "ProfileVersions": []
+    }
+   },
+   "cust_pose_standing": {
+    "_id": "cust_pose_standing",
+    "_name": "StandingPose",
+    "_parent": "cust_pose",
+    "_type": "Item",
+    "_props": {
+     "Name": "StandingPose",
+     "Side": [
+      "Usec",
+      "Bear"
+     ],
+     "ProfileVersions": [],
+     "MannequinPoseName": "standing"
+    }
+   },
+   "cust_pose_leaning": {
+    "_comment": "A second pose, so that a request setting two mannequins sets two *different* values. One pose id used twice would pass against a server that wrote the last one into both slots.",
+    "_id": "cust_pose_leaning",
+    "_name": "LeaningPose",
+    "_parent": "cust_pose",
+    "_type": "Item",
+    "_props": {
+     "Name": "LeaningPose",
+     "Side": [
+      "Usec",
+      "Bear"
+     ],
+     "ProfileVersions": [],
+     "MannequinPoseName": "leaning"
+    }
+   }
+  },
+  "handbook": {
+   "Categories": [
+    {
+     "Id": "5b5f78dc86f77409407a7f8e",
+     "ParentId": null,
+     "Icon": "",
+     "Color": "",
+     "Order": "0"
+    },
+    {
+     "Id": "5b5f78b786f77447ed5636b1",
+     "ParentId": "5b5f78dc86f77409407a7f8e",
+     "Icon": "",
+     "Color": "",
+     "Order": "1"
+    },
+    {
+     "Id": "5b47574386f77428ca22b33e",
+     "ParentId": null,
+     "Icon": "",
+     "Color": "",
+     "Order": "2"
+    },
+    {
+     "Id": "5b47574386f77428ca22b340",
+     "ParentId": "5b47574386f77428ca22b33e",
+     "Icon": "",
+     "Color": "",
+     "Order": "3"
+    },
+    {
+     "Id": "5b5f701386f774093f2ecf0f",
+     "ParentId": null,
+     "Icon": "",
+     "Color": "",
+     "Order": "4"
+    },
+    {
+     "Id": "5b47574386f77428ca22b336",
+     "ParentId": null,
+     "Icon": "",
+     "Color": "",
+     "Order": "5"
+    }
+   ],
+   "Items": [
+    {
+     "Id": "5644bd2b4bdc2d3b4c8b4572",
+     "ParentId": "5b5f78b786f77447ed5636b1",
+     "Price": 22000
+    },
+    {
+     "Id": "57ac965c24597706be5f975c",
+     "ParentId": "5b5f78b786f77447ed5636b1",
+     "Price": 9500
+    },
+    {
+     "Id": "544fb45d4bdc2dee738b4568",
+     "ParentId": "5b47574386f77428ca22b340",
+     "Price": 1100
+    },
+    {
+     "Id": "590c657e86f77412b013051d",
+     "ParentId": "5b47574386f77428ca22b340",
+     "Price": 24000
+    },
+    {
+     "Id": "5648a7494bdc2d9d488b4583",
+     "ParentId": "5b5f701386f774093f2ecf0f",
+     "Price": 18000
+    },
+    {
+     "Id": "5710c24ad2720bc3458b45a3",
+     "ParentId": "5b5f701386f774093f2ecf0f",
+     "Price": 350
+    },
+    {
+     "_comment": "Currency is in the real handbook too. An offer selling roubles for roubles matches every search and is skipped by the generator.",
+     "Id": "5449016a4bdc2d6f028b456f",
+     "ParentId": "5b5f701386f774093f2ecf0f",
+     "Price": 1
+    },
+    {
+     "_comment": "Priced at zero: no offer, and no sale to a trader either. 'I do not know what this is worth' is a different answer from 'it is worth nothing'.",
+     "Id": "5648a7494bdc2d9d488b4584",
+     "ParentId": "5b5f701386f774093f2ecf0f",
+     "Price": 0
+    },
+    {
+     "Id": "59e35de086f7741778269d83",
+     "ParentId": "5b47574386f77428ca22b336",
+     "Price": 2000
+    },
+    {
+     "Id": "5448ff904bdc2d6f028b456e",
+     "ParentId": "5b47574386f77428ca22b336",
+     "Price": 15000
+    },
+    {
+     "Id": "5d1b371186f774253763a656",
+     "ParentId": "5b47574386f77428ca22b336",
+     "Price": 60000
+    },
+    {
+     "_comment": "The quest item, priced. It is here so that the scav case's quest-item rule is the *only* thing keeping it out of the reward pool: an unpriced template is already excluded by the handbook rule, so a fixture that left this row out could not tell the two rules apart.",
+     "Id": "qqqquest0000000000000001",
+     "ParentId": "5b47574386f77428ca22b336",
+     "Price": 5000
+    },
+    {
+     "_comment": "Priced at zero so that it is a handbook *placement* and not a flea offer -- the market skips an entry with no price. It exists so that a trader's excluded_category has a category tree to walk: this sits under 5b47...b340, whose parent is 5b47...b33e, which is the id Ragman excludes.",
+     "Id": "rrrrarm00000000000000001",
+     "ParentId": "5b47574386f77428ca22b340",
+     "Price": 0
+    },
+    {
+     "_comment": "The carbine, filed in a different branch entirely, so that the exclusion above can be shown to be narrow rather than a trader who repairs nothing.",
+     "Id": "rrrrgun00000000000000001",
+     "ParentId": "5b5f78b786f77447ed5636b1",
+     "Price": 0
+    },
+    {
+     "_comment": "Priced at zero so that it is a handbook *placement* and not a flea offer -- the market skips an entry with no price. It exists so that a trader's excluded_category has a category tree to walk: this sits under 5b47...b340, whose parent is 5b47...b33e, which is the id Ragman excludes.",
+     "Id": "rrrrarm00000000000000002",
+     "ParentId": "5b47574386f77428ca22b340",
+     "Price": 0
+    },
+    {
+     "_comment": "The carbine, filed in a different branch entirely, so that the exclusion above can be shown to be narrow rather than a trader who repairs nothing.",
+     "Id": "rrrrgun00000000000000001",
+     "ParentId": "5b5f78b786f77447ed5636b1",
+     "Price": 0
+    }
+   ],
+   "_comment": "Two levels deep, so a search for the parent category has to walk the tree to find the offers under it. Matching only the exact id gives a tree whose branches are all empty."
+  },
+  "quests": {
+   "q_ratrun": {
+    "_id": "q_ratrun",
+    "QuestName": "Rat Run",
+    "traderId": "54cb50c76803fa8b248b4571",
+    "conditions": {
+     "AvailableForStart": [
+      { "conditionType": "Level", "id": "c_ratrun_level", "value": 1,
+        "compareMethod": ">=" }
+     ],
+     "AvailableForFinish": [
+      {
+       "conditionType": "CounterCreator",
+       "id": "c_ratrun",
+       "value": 1,
+       "counter": {
+        "id": "c_ratrun_counter",
+        "conditions": [
+         {
+          "conditionType": "Kills",
+          "target": "Savage",
+          "distance": { "compareMethod": ">=", "value": 0 },
+          "daytime": { "from": 0, "to": 0 },
+          "weapon": [],
+          "weaponModsInclusive": [],
+          "weaponModsExclusive": [],
+          "weaponCaliber": [],
+          "enemyEquipmentInclusive": [],
+          "enemyEquipmentExclusive": [],
+          "savageRole": [],
+          "bodyPart": []
+         }
+        ]
+       }
+      }
+     ],
+     "Fail": []
+    },
+    "rewards": { "Started": [], "Success": [], "Fail": [] }
+   },
+   "q_marksman": {
+    "_id": "q_marksman",
+    "QuestName": "Marksman",
+    "traderId": "54cb50c76803fa8b248b4571",
+    "conditions": {
+     "AvailableForStart": [
+      { "conditionType": "Level", "id": "c_marksman_level", "value": 1,
+        "compareMethod": ">=" }
+     ],
+     "AvailableForFinish": [
+      {
+       "conditionType": "CounterCreator",
+       "id": "c_marksman",
+       "value": 1,
+       "counter": {
+        "id": "c_marksman_counter",
+        "conditions": [
+         {
+          "conditionType": "Kills",
+          "target": "Savage",
+          "distance": { "compareMethod": ">=", "value": 100 },
+          "daytime": { "from": 0, "to": 0 }
+         }
+        ]
+       }
+      }
+     ],
+     "Fail": []
+    },
+    "rewards": { "Started": [], "Success": [], "Fail": [] }
+   },
+   "q_nightowl": {
+    "_id": "q_nightowl",
+    "QuestName": "Night Owl",
+    "traderId": "54cb50c76803fa8b248b4571",
+    "conditions": {
+     "AvailableForStart": [
+      { "conditionType": "Level", "id": "c_nightowl_level", "value": 1,
+        "compareMethod": ">=" }
+     ],
+     "AvailableForFinish": [
+      {
+       "conditionType": "CounterCreator",
+       "id": "c_nightowl",
+       "value": 1,
+       "counter": {
+        "id": "c_nightowl_counter",
+        "conditions": [
+         {
+          "conditionType": "Kills",
+          "target": "Savage",
+          "distance": { "compareMethod": ">=", "value": 0 },
+          "daytime": { "from": 22, "to": 10 }
+         }
+        ]
+       }
+      }
+     ],
+     "Fail": []
+    },
+    "rewards": { "Started": [], "Success": [], "Fail": [] }
+   },
+   "q_debut": {
+    "_id": "q_debut",
+    "QuestName": "Debut",
+    "traderId": "54cb50c76803fa8b248b4571",
+    "conditions": {
+     "AvailableForStart": [
+      {
+       "conditionType": "Level",
+       "id": "c_start_level",
+       "value": 1,
+       "compareMethod": ">="
+      }
+     ],
+     "AvailableForFinish": [
+      {
+       "conditionType": "CounterCreator",
+       "id": "c_kill_scavs",
+       "value": 5,
+       "counter": {
+        "id": "c_kill_scavs_counter",
+        "conditions": [
+         {
+          "conditionType": "Kills",
+          "target": "Savage"
+         },
+         {
+          "conditionType": "Location",
+          "target": [
+           "bigmap"
+          ]
+         }
+        ]
+       }
+      },
+      {
+       "conditionType": "HandoverItem",
+       "id": "c_hand_rifles",
+       "value": 2,
+       "target": [
+        "5644bd2b4bdc2d3b4c8b4572"
+       ]
+      }
+     ],
+     "Fail": []
+    },
+    "rewards": {
+     "Started": [],
+     "Success": [
+      {
+       "type": "Experience",
+       "index": 0,
+       "value": "1500"
+      },
+      {
+       "type": "TraderStanding",
+       "index": 1,
+       "target": "54cb50c76803fa8b248b4571",
+       "value": 0.02
+      },
+      {
+       "type": "Item",
+       "index": 2,
+       "value": "1",
+       "target": "reward_rifle_0001",
+       "items": [
+        {
+         "_id": "reward_rifle_0001",
+         "_tpl": "5644bd2b4bdc2d3b4c8b4572",
+         "upd": {
+          "StackObjectsCount": 1
+         }
+        }
+       ]
+      }
+     ],
+     "Fail": []
+    }
+   },
+   "q_followup": {
+    "_id": "q_followup",
+    "QuestName": "Second Debut",
+    "traderId": "54cb50c76803fa8b248b4571",
+    "conditions": {
+     "AvailableForStart": [
+      {
+       "_parent": "Quest",
+       "_props": {
+        "id": "c_needs_debut",
+        "target": "q_debut",
+        "status": [
+         4
+        ]
+       }
+      }
+     ],
+     "AvailableForFinish": [
+      {
+       "_parent": "TraderLoyalty",
+       "_props": {
+        "id": "c_needs_loyalty",
+        "target": "54cb50c76803fa8b248b4571",
+        "value": 2,
+        "compareMethod": ">="
+       }
+      }
+     ],
+     "Fail": []
+    },
+    "rewards": {
+     "Started": [],
+     "Success": [
+      {
+       "type": "Experience",
+       "index": 0,
+       "value": 800
+      }
+     ],
+     "Fail": []
+    }
+   },
+   "q_reward": {
+    "_comment": "The only quest here that can actually be finished, and the only one that pays an item: redeeming that item out of the mailbox is what the mail checks drag.",
+    "_id": "q_reward",
+    "QuestName": "The Payout",
+    "traderId": "54cb50c76803fa8b248b4571",
+    "conditions": {
+     "AvailableForStart": [
+      {
+       "conditionType": "Level",
+       "id": "c_reward_level",
+       "value": 1,
+       "compareMethod": ">="
+      }
+     ],
+     "AvailableForFinish": [
+      {
+       "conditionType": "HandoverItem",
+       "id": "c_reward_hand",
+       "value": 1,
+       "target": [
+        "544fb45d4bdc2dee738b4568"
+       ]
+      }
+     ],
+     "Fail": []
+    },
+    "rewards": {
+     "Started": [],
+     "Success": [
+      {
+       "type": "Experience",
+       "index": 0,
+       "value": 900
+      },
+      {
+       "type": "Item",
+       "index": 1,
+       "value": "1",
+       "target": "reward_salewa_0001",
+       "items": [
+        {
+         "_id": "reward_salewa_0001",
+         "_tpl": "544fb45d4bdc2dee738b4568",
+         "upd": {
+          "StackObjectsCount": 1
+         }
+        }
+       ]
+      }
+     ],
+     "Fail": []
+    }
+   }
+  },
+  "achievements": [
+   {
+    "_comment": "Awardable: one condition, of a kind the evaluator has.",
+    "id": "ach_level_two",
+    "name": "Getting started",
+    "conditions": {
+     "AvailableForFinish": [
+      {
+       "conditionType": "Level",
+       "id": "c_ach_level",
+       "compareMethod": ">=",
+       "value": 2
+      }
+     ]
+    },
+    "rewards": [
+     {
+      "type": "Experience",
+      "value": 100
+     }
+    ]
+   },
+   {
+    "_comment": "Never awardable here: `ExitStatus` is not a kind this server's evaluator knows, so the group is met-but-unchecked and awarding it would be paying for something never verified.",
+    "id": "ach_unknowable",
+    "name": "Unknowable",
+    "conditions": {
+     "AvailableForFinish": [
+      {
+       "conditionType": "ExitStatus",
+       "id": "c_ach_exit",
+       "status": [
+        "Survived"
+       ]
+      }
+     ]
+    },
+    "rewards": [
+     {
+      "type": "Experience",
+      "value": 9999
+     }
+    ]
+   },
+   {
+    "_comment": "Never awardable here either: an empty group is trivially met and would hand out the whole table on the first raid.",
+    "id": "ach_empty",
+    "name": "No conditions",
+    "conditions": {
+     "AvailableForFinish": []
+    },
+    "rewards": [
+     {
+      "type": "Experience",
+      "value": 9999
+     }
+    ]
+   }
+  ],
+  "repeatableQuests": {
+   "_comment": "The reference's RepeatableQuestDatabase, as `aowl importdb` now brings it across from templates/repeatableQuests.json. One type is enough here: the generator's arms are per type and the machinery around them -- the period, the reroll, the reward budget -- is not.",
+   "templates": {
+    "Exploration": {
+     "_id": "eeeexplore00000000000001",
+     "traderId": "54cb50c76803fa8b248b4571",
+     "location": null,
+     "type": "Exploration",
+     "isKey": false,
+     "restartable": false,
+     "instantComplete": false,
+     "secretQuest": false,
+     "canShowNotificationsInGame": true,
+     "rewards": {
+      "Started": [],
+      "Success": [],
+      "Fail": []
+     },
+     "conditions": {
+      "AvailableForStart": [],
+      "AvailableForFinish": [],
+      "Fail": []
+     },
+     "side": "Pmc",
+     "name": "{templateId} name {traderId}",
+     "description": "{templateId} description {traderId} 0",
+     "changeCost": [
+      {
+       "templateId": "5449016a4bdc2d6f028b456f",
+       "count": 7000
+      }
+     ],
+     "changeStandingCost": 0
+    }
+   },
+   "data": {},
+   "rewards": {
+    "itemsBlacklist": []
+   },
+   "samples": []
+  }
+ },
+ "locales": {
+  "global": {
+   "en": {
+    "5644bd2b4bdc2d3b4c8b4572 Name": "AK-74N 5.45x39 assault rifle",
+    "544fb45d4bdc2dee738b4568 Name": "Salewa first aid kit",
+    "590c657e86f77412b013051d Name": "Grizzly first aid kit",
+    "57ac965c24597706be5f975c Name": "PSO-1 4x24 scope",
+    "5648a7494bdc2d9d488b4583 Name": "6B47 helmet",
+    "5710c24ad2720bc3458b45a3 Name": "Bolts",
+    "59e35de086f7741778269d83 Name": "Bolts",
+    "5448ff904bdc2d6f028b456e Name": "Water bottle",
+    "_comment_dialogue": "The trader lines `traders.<id>.dialogue` names. `locationName` resolves `locations.bigmap.base.Name` through this table too, which is why `bigmap Name` is here and why a check can assert the word `Customs` in a message: the map arrives from the client spelled `bigmap` and no part of the server spells the display name. Two absences are as load-bearing as the entries. There is no entry for `fx_ther_found_nolocale`, so `say` has to rotate past an id that resolves to nothing; and there is no `locales.global.xx` table at all, so a client asking for a language this database has never heard of falls back to English rather than to an empty message.",
+    "bigmap Name": "Customs",
+    "fx_prapor_start_a": "Prapor here. Sending my dogs out to {location} to look for your kit.",
+    "fx_prapor_start_b": "Prapor here. My guys are on their way to {location} already.",
+    "fx_prapor_found_a": "Prapor here. My dogs dug your gear out of {location} -- you dropped it on {date} at {time}.",
+    "fx_prapor_found_b": "Prapor here. Got your things back off {location}, lost {date} {time}. Try to hold on to them.",
+    "fx_ther_start_a": "Therapist speaking. I have people looking into your insurance case.",
+    "fx_ther_start_b": "Therapist speaking. My colleagues will retrieve what they can.",
+    "fx_ther_found_unknown": "Therapist speaking. {nickname}, your things were fetched back off {location}.",
+    "fx_ther_found_plain": "Therapist speaking. Your things are back. Do take better care of them."
+   }
+  },
+  "menu": {
+   "en": {
+    "MainMenu": "Main menu"
+   }
+  }
+ },
+ "hideout": {
+  "areas": [
+   {
+    "type": 3,
+    "enabled": true,
+    "stages": {
+     "1": {
+      "constructionTime": 0,
+      "requirements": []
+     }
+    },
+    "_comment": "Area 3 is the one the upgrade checks drive, and its first stage is instant so the upgrade and the complete can be sent back to back."
+   },
+   {
+    "_id": "area-gym",
+    "_comment": "The gym's own area, at the number the qte entry names. Instant and free, like area 3 and the workbench, because what the gym checks is the workout and not the construction clock.",
+    "type": 29,
+    "enabled": true,
+    "stages": {
+     "0": {
+      "constructionTime": 0,
+      "requirements": [],
+      "bonuses": []
+     },
+     "1": {
+      "constructionTime": 0,
+      "requirements": [],
+      "bonuses": []
+     }
+    }
+   },
+   {
+    "_id": "area-scavcase",
+    "_comment": "The scav case, in the client's own numbering (14). Instant, like area 3 and the workbench, so the scav case checks can build it in two back-to-back requests -- the gate they care about is `the scav case is not built yet`, not the construction clock, which area 21 already pins.",
+    "type": 14,
+    "enabled": true,
+    "needsFuel": false,
+    "stages": {
+     "0": {
+      "constructionTime": 0,
+      "requirements": [],
+      "bonuses": []
+     },
+     "1": {
+      "constructionTime": 0,
+      "requirements": [],
+      "bonuses": []
+     }
+    }
+   },
+   {
+    "_id": "area-workbench",
+    "type": 10,
+    "enabled": true,
+    "needsFuel": false,
+    "stages": {
+     "0": {
+      "constructionTime": 0,
+      "requirements": [],
+      "bonuses": []
+     },
+     "1": {
+      "constructionTime": 0,
+      "requirements": [],
+      "bonuses": [
+       {
+        "type": "UnlockWeaponModification",
+        "value": 1,
+        "passive": true,
+        "visible": true
+       }
+      ],
+      "_comment": "Instant, like area 3, so the Production section can build the workbench in two back-to-back requests. The construction timer itself is pinned by area 21 below, which is the area that exists for it."
+     },
+     "2": {
+      "constructionTime": 600,
+      "requirements": [],
+      "bonuses": [
+       {
+        "type": "SkillGroupLevelingBoost",
+        "skillName": "WeaponModding",
+        "value": 0.2,
+        "passive": true,
+        "visible": true
+       }
+      ]
+     }
+    }
+   },
+   {
+    "_id": "area-generator",
+    "type": 4,
+    "enabled": true,
+    "needsFuel": true,
+    "stages": {
+     "0": {
+      "constructionTime": 0,
+      "requirements": [],
+      "bonuses": []
+     },
+     "1": {
+      "constructionTime": 120,
+      "requirements": [],
+      "bonuses": [
+       {
+        "type": "EnergyRegeneration",
+        "value": 1,
+        "passive": true,
+        "visible": false
+       }
+      ]
+     }
+    }
+   },
+   {
+    "_id": "area-watercollector",
+    "type": 6,
+    "enabled": true,
+    "needsFuel": false,
+    "stages": {
+     "0": {
+      "constructionTime": 0,
+      "requirements": [],
+      "bonuses": []
+     },
+     "1": {
+      "constructionTime": 300,
+      "requirements": [],
+      "bonuses": []
+     }
+    }
+   },
+   {
+    "_id": "area-loyaltygate",
+    "_comment": "Exists to be refused. Its stage wants Prapor at loyalty 3, which the fixture's Prapor makes unreachable (LL3 needs a standing of 50 and nothing in this database moves it), so this area can never be built and the refusal is the check.",
+    "type": 20,
+    "enabled": true,
+    "stages": {
+     "0": {
+      "constructionTime": 0,
+      "requirements": []
+     },
+     "1": {
+      "constructionTime": 0,
+      "requirements": [
+       {
+        "type": "TraderLoyalty",
+        "traderId": "54cb50c76803fa8b248b4571",
+        "loyaltyLevel": 3
+       }
+      ]
+     }
+    }
+   },
+   {
+    "_id": "area-timedbuild",
+    "_comment": "The area that costs something and takes time. 1200 roubles and an hour: the money is what pins 'the requirements are taken' and the hour is what pins 'a complete before its time is refused'.",
+    "type": 21,
+    "enabled": true,
+    "stages": {
+     "0": {
+      "constructionTime": 0,
+      "requirements": []
+     },
+     "1": {
+      "constructionTime": 3600,
+      "requirements": [
+       {
+        "type": "Item",
+        "templateId": "5449016a4bdc2d6f028b456f",
+        "count": 1200,
+        "isFunctional": false
+       },
+       {
+        "type": "Area",
+        "areaType": 3,
+        "requiredLevel": 1
+       }
+      ]
+     }
+    }
+   },
+   {
+    "_id": "area-areagate",
+    "_comment": "Gated behind an area level nothing in this run reaches.",
+    "type": 22,
+    "enabled": true,
+    "stages": {
+     "0": {
+      "constructionTime": 0,
+      "requirements": []
+     },
+     "1": {
+      "constructionTime": 0,
+      "requirements": [
+       {
+        "type": "Area",
+        "areaType": 10,
+        "requiredLevel": 5
+       }
+      ]
+     }
+    }
+   },
+   {
+    "_id": "area-shortfall",
+    "_comment": "The shape every area in a real hideout table has and none of the others here do: a stage that asks for materials the profile owns none of. Against an imported database that is every one of the twenty-eight areas at level 1, and it is the pressure that once made stage materials partial -- taken as far as the stash went, shortfall warned about, level granted. It is a refusal again: the answer to a profile that cannot afford a stage is to go and get the materials, and `tools/realtest.nim` now does exactly that against real data.",
+    "type": 23,
+    "enabled": true,
+    "stages": {
+     "0": {
+      "constructionTime": 0,
+      "requirements": []
+     },
+     "1": {
+      "constructionTime": 0,
+      "requirements": [
+       {
+        "type": "Item",
+        "templateId": "59e35de086f7741778269d84",
+        "count": 2,
+        "isFunctional": false,
+        "isEncoded": false,
+        "isSpawnedInSession": true
+       }
+      ]
+     }
+    }
+   },
+   {
+    "_id": "area-unaffordable",
+    "_comment": "And the half of that which is still hard: currency. A stage priced in roubles the profile does not have is refused, because a rouble stack carries no state this server cannot see and 'you do not have 999,999,999 roubles' is a statement it can make.",
+    "type": 24,
+    "enabled": true,
+    "stages": {
+     "0": {
+      "constructionTime": 0,
+      "requirements": []
+     },
+     "1": {
+      "constructionTime": 0,
+      "requirements": [
+       {
+        "type": "Item",
+        "templateId": "5449016a4bdc2d6f028b456f",
+        "count": 999999999,
+        "isFunctional": false
+       }
+      ]
+     }
+    }
+   },
+   {
+    "_id": "area-ownrequirements",
+    "_comment": "An area gated by its OWN requirements rather than its stage's -- the list that sits beside `stages`, switched on by `enableAreaRequirements`. Three areas in a real table have this shape (the Place of Fame, the Gym and the Cultist Circle, all behind the emergency wall at level 6) and nothing read it until it was found there.",
+    "type": 25,
+    "enabled": true,
+    "enableAreaRequirements": true,
+    "requirements": [
+     {
+      "type": "Area",
+      "areaType": 22,
+      "requiredLevel": 6
+     }
+    ],
+    "stages": {
+     "0": {
+      "constructionTime": 0,
+      "requirements": []
+     },
+     "1": {
+      "constructionTime": 0,
+      "requirements": []
+     }
+    }
+   },
+   {
+    "_id": "area-ownrequirements-off",
+    "_comment": "The same list with the flag off, which is the shape twenty-five of the twenty-eight real areas have: a `requirements` array the game does not apply. Reading it without the flag would lock most of a real hideout behind an area nobody has built.",
+    "type": 26,
+    "enabled": true,
+    "enableAreaRequirements": false,
+    "requirements": [
+     {
+      "type": "Area",
+      "areaType": 22,
+      "requiredLevel": 6
+     }
+    ],
+    "stages": {
+     "0": {
+      "constructionTime": 0,
+      "requirements": []
+     },
+     "1": {
+      "constructionTime": 0,
+      "requirements": []
+     }
+    }
+   },
+   {
+    "_id": "area-skillgate",
+    "_comment": "A `Skill` requirement, which real stages carry nine of and no fixture had one of. The level is derived from the profile's own progress through the game's curve, so this is a gate the client cannot talk its way past.",
+    "type": 27,
+    "enabled": true,
+    "stages": {
+     "0": {
+      "constructionTime": 0,
+      "requirements": []
+     },
+     "1": {
+      "constructionTime": 0,
+      "requirements": [
+       {
+        "type": "Skill",
+        "skillName": "HideoutManagement",
+        "skillLevel": 5
+       }
+      ]
+     }
+    }
+   },
+   {
+    "_id": "area-boughtitem",
+    "_comment": "The other half of the strict rule, and the half no other area here covers: a stage whose material is an ordinary item the profile *does* hold. Area 21 pins that money is taken; this pins that a non-currency material is taken, in full, and that the stash is exactly two screw nuts poorer afterwards -- the two the workbench crafted earlier in the run.",
+    "type": 28,
+    "enabled": true,
+    "stages": {
+     "0": {
+      "constructionTime": 0,
+      "requirements": []
+     },
+     "1": {
+      "constructionTime": 0,
+      "requirements": [
+       {
+        "type": "Item",
+        "templateId": "59e35de086f7741778269d83",
+        "count": 2,
+        "isFunctional": false
+       }
+      ]
+     }
+    }
+   },
+   {
+    "_id": "area-shootingrange",
+    "_comment": "The shooting range, at the number `emu/decorate` reads off every `shootingRangeMark` condition in the real `hideout.customisation` -- 12. Three stages, all instant and free, because what the checks that use it measure is a *condition* being read out of the customisation table (`areaType 12 >= 3`) and a score being refused when there is no range at all. Making it cost anything would put the construction rules between those checks and what they are about. Nothing else in this fixture names area 12, so adding it moves no other check: the areas the hideout section drives are 3, 10 and 20 to 28, and none of them reads a sibling.",
+    "type": 12,
+    "enabled": true,
+    "stages": {
+     "0": {
+      "constructionTime": 0,
+      "requirements": [],
+      "bonuses": []
+     },
+     "1": {
+      "constructionTime": 0,
+      "requirements": [],
+      "bonuses": []
+     },
+     "2": {
+      "constructionTime": 0,
+      "requirements": [],
+      "bonuses": []
+     },
+     "3": {
+      "constructionTime": 0,
+      "requirements": [],
+      "bonuses": []
+     }
+    }
+   }
+  ],
+  "customisation": {
+   "_comment": "The hideout's wardrobe -- the table `/client/hideout/customization/offer/list` sends and `HideoutCustomizationApplyCommand` resolves against. Two globals and one slot, and each is here to provoke exactly one answer. `hc_floor` is unconditional and is the one an apply must accept, writing `Hideout.Customization.Floor` -- a key derived from `itemId -> templates.customization[itemId]._parent -> ._name` and written down nowhere. `hc_mark` carries the one condition kind no other fixture reaches, `HideoutArea`, so that the same offer can be refused before area 12 is built and accepted after it reaches level 3: that pair is the only check saying conditions are read out of this table rather than compiled in. `hc_poster` is a slot -- a place, not a thing, and carrying no `itemId` -- so applying it must be refused by name. NOTE: `emu/decorate`'s load-time self-check walks every entry in `globals` against `templates.customization` and refuses to serve when an offer's `type` is not its item's branch with the first letter lowered, so `floor`/`Floor` and `shootingRangeMark`/`ShootingRangeMark` below are load-bearing spellings.",
+   "globals": [
+    {
+     "id": "hc_floor",
+     "type": "floor",
+     "systemName": "Floor_Plain",
+     "isEnabled": true,
+     "itemId": "cust_floor_plain",
+     "conditions": []
+    },
+    {
+     "id": "hc_mark",
+     "type": "shootingRangeMark",
+     "systemName": "Target_Level3",
+     "isEnabled": true,
+     "itemId": "cust_mark_target",
+     "conditions": [
+      {
+       "conditionType": "HideoutArea",
+       "areaType": 12,
+       "value": 3,
+       "compareMethod": ">="
+      }
+     ]
+    }
+   ],
+   "slots": [
+    {
+     "id": "hc_poster",
+     "type": "posterSlot",
+     "systemName": "Poster_1",
+     "isEnabled": true,
+     "slotId": "Poster_1",
+     "areaTypeId": 14,
+     "conditions": []
+    }
+   ]
+  },
+  "settings": {
+   "generatorSpeed": 1,
+   "generatorFuelFlowRate": 1.0,
+   "airFilterUnitFlowRate": 0.001,
+   "gpuBoostRate": 0.041225
+  },
+  "qte": [
+   {
+    "_comment": "The gym. `area` is 29 and not the real table's 23 on purpose: area 23 in this fixture is the stage that asks for materials the stash has none of, and three checks in emutest pin the fact that it cannot be built. The server reads the area number off this entry rather than knowing it, so a buildable area of its own exercises the same gate without moving what those checks measure. Four quickTimeEvents rather than the real fifteen -- only the count is read, and it is what bounds how long a workout a client may claim. The `results` block is the real one, verbatim.",
+    "id": "gym-bench",
+    "area": 29,
+    "areaLevel": 1,
+    "quickTimeEvents": [
+     {
+      "type": "ShrinkingCircle"
+     },
+     {
+      "type": "ShrinkingCircle"
+     },
+     {
+      "type": "ShrinkingCircle"
+     },
+     {
+      "type": "ShrinkingCircle"
+     }
+    ],
+    "requirements": [
+     {
+      "type": "Health",
+      "energy": 30,
+      "hydration": 30
+     },
+     {
+      "type": "BodyPartBuff",
+      "bodyPart": "LeftArm",
+      "effectName": "Fracture",
+      "excluded": true
+     },
+     {
+      "type": "BodyPartBuff",
+      "bodyPart": "RightArm",
+      "effectName": "Fracture",
+      "excluded": true
+     }
+    ],
+    "results": {
+     "finishEffect": {
+      "energy": 0,
+      "hydration": 0,
+      "rewardsRange": [
+       {
+        "weight": 1,
+        "result": "Exit",
+        "time": 86400,
+        "type": "MusclePain"
+       }
+      ]
+     },
+     "singleSuccessEffect": {
+      "energy": -2,
+      "hydration": -2,
+      "rewardsRange": [
+       {
+        "weight": 1,
+        "result": "None",
+        "skillId": "Endurance",
+        "levelMultipliers": [
+         {
+          "level": 0,
+          "multiplier": 6
+         },
+         {
+          "level": 10,
+          "multiplier": 5
+         },
+         {
+          "level": 25,
+          "multiplier": 4
+         }
+        ],
+        "type": "Skill"
+       },
+       {
+        "weight": 1,
+        "result": "None",
+        "skillId": "Strength",
+        "levelMultipliers": [
+         {
+          "level": 0,
+          "multiplier": 6
+         },
+         {
+          "level": 10,
+          "multiplier": 5
+         },
+         {
+          "level": 25,
+          "multiplier": 4
+         }
+        ],
+        "type": "Skill"
+       }
+      ]
+     },
+     "singleFailEffect": {
+      "energy": -4,
+      "hydration": -4,
+      "rewardsRange": [
+       {
+        "weight": 1,
+        "result": "Exit",
+        "type": "GymArmTrauma"
+       }
+      ]
+     }
+    }
+   }
+  ],
+  "production": {
+   "recipes": [
+    {
+     "_id": "recipe-bolts",
+     "areaType": 10,
+     "productionTime": 3600,
+     "endProduct": "59e35de086f7741778269d83",
+     "count": 2,
+     "continuous": false,
+     "productionLimitCount": 0,
+     "needFuelForAllProductionTime": false,
+     "locked": false,
+     "requirements": [
+      {
+       "type": "Area",
+       "areaType": 10,
+       "requiredLevel": 1
+      },
+      {
+       "type": "Item",
+       "templateId": "5449016a4bdc2d6f028b456f",
+       "count": 3,
+       "isFunctional": false
+      },
+      {
+       "type": "Tool",
+       "templateId": "590c2e1186f77425357b6124"
+      }
+     ]
+    },
+    {
+     "_id": "recipe-water",
+     "areaType": 6,
+     "productionTime": 1800,
+     "endProduct": "5448ff904bdc2d6f028b456e",
+     "count": 1,
+     "continuous": true,
+     "productionLimitCount": 3,
+     "needFuelForAllProductionTime": true,
+     "locked": false,
+     "requirements": [
+      {
+       "type": "Area",
+       "areaType": 6,
+       "requiredLevel": 1
+      }
+     ]
+    },
+    {
+     "_id": "recipe-quick",
+     "areaType": 10,
+     "productionTime": 0,
+     "endProduct": "59e35de086f7741778269d83",
+     "count": 2,
+     "continuous": false,
+     "productionLimitCount": 0,
+     "needFuelForAllProductionTime": false,
+     "locked": false,
+     "requirements": [
+      {
+       "type": "Area",
+       "areaType": 10,
+       "requiredLevel": 1
+      },
+      {
+       "type": "Item",
+       "templateId": "5449016a4bdc2d6f028b456f",
+       "count": 3,
+       "isFunctional": false
+      }
+     ]
+    },
+    {
+     "_id": "recipe-slow",
+     "areaType": 10,
+     "productionTime": 3600,
+     "endProduct": "5448ff904bdc2d6f028b456e",
+     "count": 1,
+     "continuous": false,
+     "productionLimitCount": 0,
+     "needFuelForAllProductionTime": false,
+     "locked": false,
+     "requirements": [
+      {
+       "type": "Area",
+       "areaType": 10,
+       "requiredLevel": 1
+      },
+      {
+       "type": "Item",
+       "templateId": "5449016a4bdc2d6f028b456f",
+       "count": 5,
+       "isFunctional": false
+      }
+     ]
+    },
+    {
+     "_id": "recipe-rich",
+     "areaType": 10,
+     "productionTime": 0,
+     "endProduct": "59e35de086f7741778269d83",
+     "count": 1,
+     "continuous": false,
+     "productionLimitCount": 0,
+     "needFuelForAllProductionTime": false,
+     "locked": false,
+     "requirements": [
+      {
+       "type": "Area",
+       "areaType": 10,
+       "requiredLevel": 1
+      },
+      {
+       "type": "Item",
+       "templateId": "590c657e86f77412b013051d",
+       "count": 4,
+       "isFunctional": false
+      }
+     ]
+    },
+    {
+     "_id": "recipe-filtered",
+     "_comment": "The one requirement type that is paid for out of the area rather than out of the stash. One recipe in an imported table has it -- the water collector's 66 units of filter -- and it used to start without touching the filter at all: the craft ran, the output landed, and the filter was still full.",
+     "areaType": 10,
+     "productionTime": 0,
+     "endProduct": "5448ff904bdc2d6f028b456e",
+     "count": 1,
+     "continuous": false,
+     "productionLimitCount": 0,
+     "needFuelForAllProductionTime": false,
+     "locked": false,
+     "requirements": [
+      {
+       "type": "Area",
+       "areaType": 10,
+       "requiredLevel": 1
+      },
+      {
+       "type": "Resource",
+       "templateId": "5d1b385e86f774252167b98a",
+       "resource": 66
+      }
+     ]
+    },
+    {
+     "_id": "recipe-locked",
+     "_comment": "A craft a quest unlocks, and the quest is one nothing in this database can finish. Forty-three recipes in an imported table are gated this way and every one of them was craftable by a player who had never accepted the quest, because the production path resolved its requirements without a profile to read.",
+     "areaType": 10,
+     "productionTime": 0,
+     "endProduct": "5448ff904bdc2d6f028b456e",
+     "count": 1,
+     "continuous": false,
+     "productionLimitCount": 0,
+     "needFuelForAllProductionTime": false,
+     "locked": false,
+     "requirements": [
+      {
+       "type": "Area",
+       "areaType": 10,
+       "requiredLevel": 1
+      },
+      {
+       "type": "QuestComplete",
+       "questId": "q_never"
+      }
+     ]
+    },
+    {
+     "_id": "recipe-unlocked",
+     "_comment": "The same gate, on the quest this run does finish.",
+     "areaType": 10,
+     "productionTime": 0,
+     "endProduct": "5448ff904bdc2d6f028b456e",
+     "count": 1,
+     "continuous": false,
+     "productionLimitCount": 0,
+     "needFuelForAllProductionTime": false,
+     "locked": false,
+     "requirements": [
+      {
+       "type": "Area",
+       "areaType": 10,
+       "requiredLevel": 1
+      },
+      {
+       "type": "QuestComplete",
+       "questId": "q_reward"
+      }
+     ]
+    }
+   ],
+   "scavRecipes": [
+    {
+     "_id": "scavcase-rare",
+     "_comment": "The runnable one, and first in the array because realtest discovers `scavRecipes[0]`. Two Rare items and nothing else: the Common band is zeroed so an empty Common pool must not be consulted, and the Superrare band is zeroed so the one Superrare template in this database must never come out of it. productionTime 0 so the case can be collected in the same run -- the clock itself is pinned by recipe-slow.",
+     "productionTime": 0,
+     "endProducts": {
+      "Common": {
+       "min": 0,
+       "max": 0
+      },
+      "Rare": {
+       "min": 2,
+       "max": 2
+      },
+      "Superrare": {
+       "min": 0,
+       "max": 0
+      }
+     },
+     "requirements": [
+      {
+       "type": "Item",
+       "templateId": "5449016a4bdc2d6f028b456f",
+       "count": 15000,
+       "isFunctional": false
+      }
+     ]
+    },
+    {
+     "_id": "scavcase-common",
+     "_comment": "The refusal. It asks for one Common item, and the only Common template in this database is a quest item -- so the pool is empty and the case must be refused by name *before* its 15,000 roubles are taken. A case that produced nothing because the database had nothing to put in it would be a theft with a shrug attached.",
+     "productionTime": 0,
+     "endProducts": {
+      "Common": {
+       "min": 1,
+       "max": 1
+      },
+      "Rare": {
+       "min": 1,
+       "max": 1
+      },
+      "Superrare": {
+       "min": 0,
+       "max": 0
+      }
+     },
+     "requirements": [
+      {
+       "type": "Item",
+       "templateId": "5449016a4bdc2d6f028b456f",
+       "count": 15000,
+       "isFunctional": false
+      }
+     ]
+    }
+   ],
+   "cultistRecipes": [],
+   "_comment": "Each refusal in emu/production has exactly one recipe that provokes it: recipe-quick finishes at once, recipe-slow cannot finish inside a test run, recipe-rich asks for materials the profile does not have, and recipe-bolts asks for a tool it does not have. recipe-water is the continuous one."
+  }
+ },
+ "globals": {
+  "config": {
+   "_comment_fence": "`FenceSettings`, for two things that used to be assumed. `FenceId` is the game's own statement of which trader is the scav trader -- `emu/traders` hard-coded it on the stated grounds that no such flag existed, and it does. `PmcBotKillStandingMultiplier` scales what killing a PMC as a scav is worth; it is 1 in every real dump, so a fixture that also wrote 1 could not tell a server that reads it from one that ignores it. It is 3 here, and the karma arithmetic in `emutest` is what says which of those this server is.",
+   "FenceSettings": {
+    "FenceId": "579dc571d53a0658a154fbec",
+    "PmcBotKillStandingMultiplier": 3,
+    "paidExitStandingNumerator": 0.2
+   },
+   "SkillsSettings": {
+    "SkillProgressRate": 1.0,
+    "SkillFreshEffectiveness": 1.5,
+    "SkillFreshPoints": 10.0,
+    "SkillPointsBeforeFatigue": 100.0,
+    "SkillFatiguePerPoint": 1.0,
+    "SkillFatigueReset": 43200,
+    "WeaponSkillProgressRate": 1.0
+   },
+   "Mastering": [
+    {
+     "Name": "Ak",
+     "Templates": [
+      "5644bd2b4bdc2d3b4c8b4572"
+     ],
+     "Level2": 250,
+     "Level3": 1000
+    }
+   ],
+   "Health": {
+    "_comment": "The treatment price table. Without it `RestoreHealth` refuses at every trader -- correctly, because free healing is not the same answer as 'the price is not known' -- so nothing in emutest could reach a single line of the trader-healing arithmetic. The three point prices are the live figures for hit points and made-up-but-distinct ones for energy and hydration, so that a server that priced all three off HealthPointPrice would produce a different total.",
+    "HealPrice": {
+     "HealthPointPrice": 30,
+     "EnergyPointPrice": 2,
+     "HydrationPointPrice": 3
+    },
+    "Effects": {
+     "Fracture": {
+      "RemovePrice": 1000
+     },
+     "LightBleeding": {
+      "RemovePrice": 400
+     },
+     "Contusion": {
+      "_comment": "Priced by nothing. A live table carries five effects with a RemovePrice and a dozen without, because the rest are not things a trader treats -- and an effect with no price must be refused *by name*, with nothing charged and the hit points bundled into the same request left untreated.",
+      "DefaultDelay": 5
+     }
+    }
+   },
+   "RagFair": {
+    "_comment": "The only number `emu/market`'s `renewOffer` reads. It is 48 in the real database and it is 48 here, so a renewal of 12 hours is inside it and one of 99 is refused *naming 48* -- which is the check that says the bound came out of the table. `maxRenewHours` defaults to zero rather than to 48 when the field is missing, and refuses every renewal by name on that path: a fixture without this block proves that half, and it is the reason this is one key and not a copy of the real RagFair block.",
+    "maxRenewOfferTimeInHour": 48
+   },
+   "RepairSettings": {
+    "_comment": "Kit resource spent per point of durability restored. A firearm costs `durabilityPointCostGuns`; armour costs `durabilityPointCostArmor * armorClass / armorClassDivisor`.",
+    "durabilityPointCostGuns": 2,
+    "durabilityPointCostArmor": 5,
+    "armorClassDivisor": 10
+   }
+  },
+  "ItemPresets": {
+   "pppppppppppppppppppppppp": {
+    "_id": "pppppppppppppppppppppppp",
+    "_encyclopedia": "wwwwgun00000000000000001",
+    "_items": [
+     {
+      "_id": "r0000000000000000000000r",
+      "_tpl": "wwwwgun00000000000000001"
+     },
+     {
+      "_id": "m0000000000000000000000m",
+      "_tpl": "mmmmmag00000000000000001",
+      "parentId": "r0000000000000000000000r",
+      "slotId": "mod_magazine"
+     }
+    ]
+   }
+  }
+ },
+ "locations": {
+  "testmap": {
+   "base": {
+    "_Id": "testmap",
+    "Name": "Test Map",
+    "EscapeTimeLimit": 35,
+    "GlobalLootChanceModifier": 1.0,
+    "GlobalContainerChanceModifier": 1.0
+   },
+   "staticContainers": {
+    "staticContainers": [
+     {
+      "probability": 1.0,
+      "template": {
+       "Id": "crate_1",
+       "IsStatic": true,
+       "useGravity": false,
+       "randomRotation": false,
+       "Position": {
+        "x": 1.0,
+        "y": 2.0,
+        "z": 3.0
+       },
+       "Rotation": {
+        "x": 0.0,
+        "y": 90.0,
+        "z": 0.0
+       },
+       "IsGroupPosition": false,
+       "GroupPositions": [],
+       "Root": "cccccccccccccccccccccccc",
+       "Items": [
+        {
+         "_id": "cccccccccccccccccccccccc",
+         "_tpl": "ccccbox00000000000000001"
+        }
+       ]
+      }
+     },
+     {
+      "probability": 0.0,
+      "template": {
+       "Id": "crate_never",
+       "IsStatic": true,
+       "Position": {
+        "x": 9.0,
+        "y": 0.0,
+        "z": 9.0
+       },
+       "Root": "dddddddddddddddddddddddd",
+       "Items": [
+        {
+         "_id": "dddddddddddddddddddddddd",
+         "_tpl": "ccccbox00000000000000001"
+        }
+       ]
+      }
+     }
+    ],
+    "staticForced": [
+     {
+      "containerId": "crate_1",
+      "itemTpl": "qqqquest0000000000000001"
+     }
+    ]
+   },
+   "looseLoot": {
+    "spawnpointCount": {
+     "mean": 2,
+     "std": 0
+    },
+    "spawnpointsForced": [
+     {
+      "locationId": "forced_1",
+      "probability": 1.0,
+      "template": {
+       "Id": "forced_1",
+       "IsStatic": false,
+       "useGravity": true,
+       "Position": {
+        "x": 4.0,
+        "y": 0.0,
+        "z": 4.0
+       },
+       "Root": "eeeeeeeeeeeeeeeeeeeeeeee",
+       "Items": [
+        {
+         "_id": "eeeeeeeeeeeeeeeeeeeeeeee",
+         "_tpl": "qqqquest0000000000000001"
+        }
+       ]
+      }
+     }
+    ],
+    "spawnpoints": [
+     {
+      "locationId": "loose_1",
+      "probability": 1.0,
+      "template": {
+       "Id": "loose_1",
+       "IsStatic": false,
+       "useGravity": true,
+       "Position": {
+        "x": 5.0,
+        "y": 0.0,
+        "z": 6.0
+       },
+       "Root": "ffffffffffffffffffffffff",
+       "Items": [
+        {
+         "_id": "ffffffffffffffffffffffff",
+         "_tpl": "wwwwgun00000000000000001"
+        },
+        {
+         "_id": "ffffffffffffffffffffff02",
+         "_tpl": "aaaaammo0000000000000001"
+        }
+       ]
+      },
+      "itemDistribution": [
+       {
+        "composedKey": {
+         "key": "ffffffffffffffffffffffff"
+        },
+        "relativeProbability": 1
+       }
+      ]
+     },
+     {
+      "locationId": "loose_never",
+      "probability": 0.0,
+      "template": {
+       "Id": "loose_never",
+       "Position": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+       },
+       "Root": "1111111111111111111111ff",
+       "Items": [
+        {
+         "_id": "1111111111111111111111ff",
+         "_tpl": "aaaaammo0000000000000001"
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "factory4_day": {
+   "base": {
+    "_Id": "factory4_day",
+    "Name": "Factory",
+    "EscapeTimeLimit": 40,
+    "BotMax": 12,
+    "BotMaxPvE": 9,
+    "_comment_bots": "`BotMax` is what `/client/game/bot/limit` answers for this map. It used to answer the literal 30 for every map with no database path behind it at all."
+   }
+  },
+  "bigmap": {
+   "base": {
+    "_comment": "Customs, and it is here for its `Name` and nothing else. `emu/dialogue.locationName` reads `locations.<id>.base.Name` and resolves it through `locales.global.<lang>`, so a trader's `{location}` renders as the display name rather than as the client's key -- and the difference between `Customs` and `bigmap` in a player's inbox is the whole reason that lookup exists. No loot tables and no bot cap: nothing here plays a raid on this map, the insurance raid only names it, and tables it does not need would move what the loot checks measure.",
+    "_Id": "bigmap",
+    "Name": "bigmap Name",
+    "EscapeTimeLimit": 40
+   }
+  }
+ },
+ "loot": {
+  "staticLoot": {
+   "ccccbox00000000000000001": {
+    "itemcountDistribution": [
+     {
+      "count": 2,
+      "relativeProbability": 1
+     }
+    ],
+    "itemDistribution": [
+     {
+      "tpl": "aaaaammo0000000000000001",
+      "relativeProbability": 5
+     },
+     {
+      "tpl": "bbbbbox00000000000000002",
+      "relativeProbability": 5
+     }
+    ]
+   }
+  }
+ },
+ "_comment": "One database for the whole of emutest: the union of emu-db, emu-market, emu-hideout, emu-loot and emu-quests, plus what the joins between them need. It is one file because the emulator is one server and its systems meet each other -- a quest reward is redeemed out of the mailbox into the same stash a flea purchase lands in, and a craft consumes the same rouble stack a trader was paid from. Five databases would prove each system and none of the joins. Every number in here is small enough to check by hand.",
+ "weather": {
+  "_comment": "A database path for `/client/weather`. The route used to be a constant -- temp 18, season 1 -- which is a fine default and was the only answer there was, so a weather mod had nothing to write to and could not add a route of its own because the backend refuses a duplicate.",
+  "season": 3,
+  "acceleration": 7,
+  "weather": {
+   "cloud": 0.4,
+   "wind_speed": 6,
+   "wind_direction": 2,
+   "wind_gustiness": 0.3,
+   "rain": 2,
+   "rain_intensity": 0.5,
+   "fog": 0.2,
+   "temp": -14,
+   "pressure": 741
+  }
+ },
+ "bots": {
+  "core": {
+   "_comment": "The fallback brain settings, answered for a role or a difficulty the database does not have.",
+   "aimSpeed": 1
+  },
+  "_comment_base": "`bots/base.json` -- SPT's own bot skeleton, verbatim from an imported database, and the document every generated bot is now a copy of before anything is written over it. It is a sibling of `base` rather than a member of it so that the skeleton stays byte-faithful: a `_comment` inside it would ship to the client inside every bot. Two members are here for their shape and are the two places `base.json` and the client's declared `BotBase` disagree: `WishList` is `[]` where the type says `Dictionary<MongoId, Int32>`, and `Encyclopedia` is `null` where the type says `Dictionary<MongoId, Boolean>`. The type wins in both, and keeping the file's spelling here is what makes that checkable. `Customization.Voice` is the third: a template id, on `Customization`, which is where the client reads a voice -- `Info.Voice` is not a member of anything.",
+  "base": {
+   "_id": "60dc8576337fdf54e60e1800",
+   "aid": 0,
+   "savage": null,
+   "Info": {
+    "Nickname": "BOTNAME",
+    "LowerNickname": "",
+    "Side": "Savage",
+    "Level": 1,
+    "Experience": 0,
+    "RegistrationDate": 0,
+    "GameVersion": "",
+    "AccountType": 0,
+    "MemberCategory": 0,
+    "SelectedMemberCategory": 0,
+    "lockedMoveCommands": false,
+    "SavageLockTime": 0,
+    "LastTimePlayedAsSavage": 0,
+    "Settings": {
+     "Role": "assault",
+     "BotDifficulty": "normal",
+     "Experience": -1,
+     "StandingForKill": -0.04,
+     "AggressorBonus": 0.02,
+     "UseSimpleAnimator": false
+    },
+    "NicknameChangeDate": 0,
+    "NeedWipeOptions": [],
+    "lastCompletedWipe": null,
+    "lastWipeTimestamp": null,
+    "lastCompletedEvent": null,
+    "BannedState": false,
+    "BannedUntil": 0,
+    "IsStreamerModeAvailable": false,
+    "SquadInviteRestriction": false,
+    "HasCoopExtension": false,
+    "isMigratedSkills": false,
+    "HasPveGame": false,
+    "PrestigeLevel": 0
+   },
+   "Customization": {
+    "Head": "5cc2e4d014c02e000d0115f8",
+    "Body": "5cc2e59214c02e000f16684e",
+    "Feet": "5cde9fb87d6c8b0474535da9",
+    "Hands": "5cc2e68f14c02e28b47de290",
+    "Voice": "67b877e7d2dc6a01d5059dd9"
+   },
+   "Health": {
+    "UpdateTime": 0,
+    "Immortal": false
+   },
+   "Inventory": {
+    "fastPanel": {},
+    "hideoutAreaStashes": {},
+    "favoriteItems": []
+   },
+   "Skills": {
+    "Common": [],
+    "Mastering": [],
+    "Points": 0
+   },
+   "Stats": {
+    "Eft": {
+     "SessionCounters": {
+      "Items": []
+     },
+     "OverallCounters": {
+      "Items": []
+     },
+     "SessionExperienceMult": 0,
+     "ExperienceBonusMult": 0,
+     "TotalSessionExperience": 0,
+     "LastSessionDate": 0,
+     "Aggressor": null,
+     "DroppedItems": [],
+     "FoundInRaidItems": [],
+     "Victims": [],
+     "CarriedQuestItems": [],
+     "DamageHistory": {
+      "LethalDamagePart": "Head",
+      "LethalDamage": null,
+      "BodyParts": []
+     },
+     "LastPlayerState": null,
+     "TotalInGameTime": 0,
+     "SurvivorClass": "Unknown"
+    }
+   },
+   "Encyclopedia": null,
+   "TaskConditionCounters": {},
+   "InsuredItems": [],
+   "Hideout": null,
+   "Bonuses": [],
+   "WishList": [],
+   "Variables": {}
+  },
+  "types": {
+   "assault": {
+    "firstName": [
+     "Scav"
+    ],
+    "lastName": [],
+    "appearance": {
+     "_comment": "Weight maps -- `{template: weight}` -- which is how SPT 4.x writes all five of these, and `voice` is the fifth. This block used to be four arrays, the generator used to read four arrays, and the two agreeing is exactly why every bot in every raid wore the same four ids for months with a green test suite. Three things here are deliberate. `head` carries an entry weighted zero, so `a weight of zero means never, not rarely` is checkable. `feet` is entirely zero, so `a pool that sums to zero produces nothing rather than element zero` is checkable -- element zero of a degenerate distribution is precisely how a map ends up in one pair of boots -- and what has to show instead is `bots.base`'s own foot. And `voice` is here at all, because it is the table nothing ever read.",
+     "head": {
+      "aaaahead0000000000000001": 5,
+      "aaaahead0000000000000002": 5,
+      "aaaahead0000000000000003": 0
+     },
+     "body": {
+      "bbbbbody0000000000000001": 1
+     },
+     "feet": {
+      "ccccfeet0000000000000001": 0,
+      "ccccfeet0000000000000002": 0
+     },
+     "hands": {
+      "ddddhand0000000000000001": 1
+     },
+     "voice": {
+      "eeeevoic0000000000000001": 3,
+      "eeeevoic0000000000000002": 0
+     }
+    },
+    "experience": {
+     "standingForKill": {
+      "easy": -0.03,
+      "normal": -0.04,
+      "hard": -0.05
+     },
+     "aggressorBonus": {
+      "easy": 0.01,
+      "normal": 0.02,
+      "hard": 0.02
+     }
+    },
+    "difficulty": {
+     "hard": {
+      "aimSpeed": 0.1
+     }
+    },
+    "chances": {
+     "_comment": "Three tables, spelled as a real database spells them: `equipment`, `weaponMods`, `equipmentMods`. A single `chances.mods` was the obvious guess and is wrong.",
+     "equipment": {
+      "Headwear": 100,
+      "Eyewear": 0,
+      "FirstPrimaryWeapon": 100,
+      "TacticalVest": 100,
+      "Backpack": 100,
+      "Earpiece": 0,
+      "FaceCover": 0,
+      "ArmorVest": 0,
+      "ArmBand": 0,
+      "SecondPrimaryWeapon": 0,
+      "Holster": 0,
+      "Scabbard": 0,
+      "Pockets": 100,
+      "SecuredContainer": 0
+     },
+     "weaponMods": {
+      "mod_magazine": 100,
+      "mod_scope": 100,
+      "mod_muzzle": 0
+     },
+     "equipmentMods": {
+      "_comment": "Deliberately keyed in the other casing from the mod table below: stock data spells this slot `Helmet_top` on 59 items and `helmet_top` on 3, and a chance looked up by exact key would miss and silently use the default of 100.",
+      "helmet_top": 0
+     }
+    },
+    "inventory": {
+     "equipment": {
+      "Headwear": {
+       "bbbbhat00000000000000001": 1
+      },
+      "Eyewear": {
+       "eeeeeye00000000000000001": 1
+      },
+      "FirstPrimaryWeapon": {
+       "wwwwgun00000000000000001": 1
+      },
+      "TacticalVest": {
+       "vvvvvest0000000000000001": 1
+      },
+      "Backpack": {
+       "bbbbpack0000000000000001": 1
+      },
+      "Pockets": {
+       "ppppockt0000000000000001": 1
+      }
+     },
+     "mods": {
+      "wwwwgun00000000000000001": {
+       "mod_magazine": [
+        "mmmmmag00000000000000001"
+       ],
+       "mod_scope": [
+        "ssssscope00000000000001"
+       ],
+       "mod_muzzle": [
+        "mmmmuzz00000000000000001"
+       ]
+      },
+      "bbbbhat00000000000000001": {
+       "Helmet_top": [
+        "ssssscope00000000000001"
+       ]
+      }
+     },
+     "Ammo": {
+      "Caliber545x39": {
+       "aaaaammo0000000000000001": 1
+      }
+     },
+     "items": {
+      "_comment": "One pool per container slot, keyed exactly as `inventory.equipment` is, and each a weight map of template to weight rather than a list.",
+      "TacticalVest": {
+       "lllloot00000000000000001": 1
+      },
+      "Backpack": {
+       "bbbbulk00000000000000001": 1
+      },
+      "Pockets": {
+       "lllloot00000000000000001": 1
+      }
+     }
+    },
+    "health": {
+     "_comment": "The shape a real `bots/types/<role>.json` ships. `BodyParts` is a LIST of variants -- stock `assault` has three, most roles have one -- and each variant is a map of part name to `{min, max}`. What used to be here was an object keyed \"0\" carrying `Head` alone, which the generator refuses whole and correctly: half a body is a bot the client will not spawn. So every bot this fixture ever produced fell back to the literal 35/85 human, bosses included, and no check could see it. Two variants, so a roll can be told from a splice. `LeftLeg` has `min` != `max`, so a range can be told from a point and `Maximum` can be told from the roll. `Head` is 33 and 44 rather than 35, so the hardcoded human is distinguishable from the table. And `Temperature`, `Hydration` and `Energy` sit one level up as `{min, max}` of their own, which is where a real table puts them.",
+     "Hydration": {
+      "min": 100,
+      "max": 100
+     },
+     "Energy": {
+      "min": 100,
+      "max": 100
+     },
+     "Temperature": {
+      "min": 36,
+      "max": 40
+     },
+     "BodyParts": [
+      {
+       "Head": {
+        "min": 33,
+        "max": 33
+       },
+       "Chest": {
+        "min": 80,
+        "max": 80
+       },
+       "Stomach": {
+        "min": 70,
+        "max": 70
+       },
+       "LeftArm": {
+        "min": 60,
+        "max": 60
+       },
+       "RightArm": {
+        "min": 60,
+        "max": 60
+       },
+       "LeftLeg": {
+        "min": 50,
+        "max": 70
+       },
+       "RightLeg": {
+        "min": 65,
+        "max": 65
+       }
+      },
+      {
+       "Head": {
+        "min": 44,
+        "max": 44
+       },
+       "Chest": {
+        "min": 85,
+        "max": 85
+       },
+       "Stomach": {
+        "min": 70,
+        "max": 70
+       },
+       "LeftArm": {
+        "min": 60,
+        "max": 60
+       },
+       "RightArm": {
+        "min": 60,
+        "max": 60
+       },
+       "LeftLeg": {
+        "min": 50,
+        "max": 70
+       },
+       "RightLeg": {
+        "min": 65,
+        "max": 65
+       }
+      }
+     ]
+    },
+    "generation": {
+     "_comment": "The key of a weights entry is a COUNT and the value is how likely that count is, so a single entry is a fixed count and a count of zero means nothing goes in. Three kinds, deliberately: two items into a rig with room for exactly two, two into a backpack with room for neither, and none into pockets that have room.",
+     "items": {
+      "vestLoot": {
+       "weights": {
+        "2": 1
+       },
+       "whitelist": []
+      },
+      "backpackLoot": {
+       "weights": {
+        "2": 1
+       },
+       "whitelist": []
+      },
+      "pocketLoot": {
+       "weights": {
+        "0": 1
+       },
+       "whitelist": []
+      }
+     }
+    }
+   },
+   "_comment_karma": "Two more roles, here for `emu/traders.scavKillKarma` and for nothing else -- they carry only the one member it reads, because a role a raid never generates does not need a loadout. `bear` is the positive side of Fence's karma at BSG's own rate, and it is the role that makes `PmcBotKillStandingMultiplier` and the `Side` join reachable. `gifter` carries `easy` and no `normal` on purpose: it is the only way to reach the refusal that says a role this database does not price at the requested difficulty earns no standing. Every one of the 57 roles in a real dump does carry `normal`, so that branch is unreachable on real data and would be dead code nobody had ever run. Its `easy` is -0.9 rather than the 0 a real `gifter` carries, and that is the whole point of the number: a server that quietly fell back to whichever column the role does have would move Fence's standing by nine tenths, which no arithmetic mistake can hide.",
+   "bear": {
+    "experience": {
+     "standingForKill": {
+      "easy": 0.02,
+      "normal": 0.02,
+      "hard": 0.03
+     }
+    }
+   },
+   "gifter": {
+    "experience": {
+     "standingForKill": {
+      "easy": -0.9
+     }
+    }
+   }
+  }
+ },
+ "configs": {
+  "_comment": "SPT's own configs/quest.json, trimmed to the one member the emulator reads. It is the half of repeatable quests that is not in the database directory: how many quests a set has, how long it lasts, which traders offer what, and the reward budget.",
+  "quest": {
+   "repeatableQuests": [
+    {
+     "id": "dddaily00000000000000001",
+     "name": "Daily",
+     "side": "Pmc",
+     "types": [
+      "Exploration"
+     ],
+     "resetTime": 86400,
+     "numQuests": 2,
+     "minPlayerLevel": 1,
+     "_comment": "rewardSpread is ZERO on purpose. The spread is a draw from the seeded generator, and a check that has to predict the draw is checking the generator rather than the budget -- so the figures below are paid exactly.",
+     "rewardScaling": {
+      "levels": [
+       1
+      ],
+      "experience": [
+       500
+      ],
+      "roubles": [
+       3000
+      ],
+      "reputation": [
+       0.01
+      ],
+      "items": [
+       2
+      ],
+      "gpCoins": [
+       1
+      ],
+      "rewardSpread": 0,
+      "skillRewardChance": [
+       0
+      ],
+      "skillPointReward": [
+       0
+      ]
+     },
+     "locations": {
+      "any": [
+       "any"
+      ]
+     },
+     "traderWhitelist": [
+      {
+       "traderId": "54cb50c76803fa8b248b4571",
+       "name": "prapor",
+       "questTypes": [
+        "Exploration"
+       ]
+      }
+     ],
+     "questConfig": {
+      "Exploration": [
+       {
+        "levelRange": {
+         "min": 1,
+         "max": 100
+        },
+        "minExtracts": 3,
+        "maxExtracts": 3,
+        "specificExits": {
+         "chance": 0
+        }
+       }
+      ]
+     },
+     "freeChanges": 1,
+     "freeChangesAvailable": 1
+    }
+   ]
+  }
+ }
+}

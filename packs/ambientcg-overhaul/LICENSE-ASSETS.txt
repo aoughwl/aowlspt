@@ -1,0 +1,20 @@
+ambientCG Overhaul -- asset license
+====================================
+
+All image assets referenced by this pack's manifest.json are sourced from
+ambientCG (https://ambientcg.com) and are released under the
+
+    Creative Commons CC0 1.0 Universal (Public Domain Dedication)
+    https://creativecommons.org/publicdomain/zero/1.0/
+
+CC0 places these materials in the public domain: you may copy, modify,
+distribute, and use them, even for commercial purposes, without asking
+permission and without attribution. Attribution to ambientCG is appreciated but
+not required.
+
+This means the assembled pack (manifest.json + assets/) is freely
+redistributable. Nothing in this pack is derived from or contains any BSG /
+Escape from Tarkov copyrighted material.
+
+The scripts in this directory (assemble_pack.py, assemble.ps1) are part of the
+aowlspt project and licensed under the aowlspt repository LICENSE.

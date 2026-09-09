@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Offline member verifier for the SPT client: reads Assembly-CSharp.dll (or
+       any managed DLL) with the Mono.Cecil that BepInEx ships, without loading
+       it. Every EFT member Basement.Client touches was checked with this.
+         dotnet run -c Release -\- <dll> member EFT.Player Position
+         dotnet run -c Release -\- <dll> type EFT.RaidSettings [filter]
+         dotnet run -c Release -\- <dll> grep MatchmakerOffline
+         dotnet run -c Release -\- <dll> callers "TarkovApplication::LocalGameMatching"
+         dotnet run -c Release -\- <dll> calls   "CG_OnReadyToStartMatchingAsync::MoveNext"
+         dotnet run -c Release -\- <dll> enum EFT.ESideType
+       Exit 1 = MISSING. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <SptInstallDir Condition="'$(SptInstallDir)' == '' and '$(SPT_INSTALL_DIR)' != ''">$(SPT_INSTALL_DIR)</SptInstallDir>
+    <SptInstallDir Condition="'$(SptInstallDir)' == ''">D:\SPT415</SptInstallDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="Mono.Cecil"><HintPath>$(SptInstallDir)\BepInEx\core\Mono.Cecil.dll</HintPath></Reference>
+  </ItemGroup>
+</Project>

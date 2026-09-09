@@ -1,0 +1,70 @@
+# MEASURED live-inspector output. Every OUTPUT block below is VERBATIM host
+# text captured from a real run on this machine on 2026-09-01/02 -- pointers,
+# counts, frame numbers and all. Nothing here is hand-written prose.
+#
+# WHY THIS EXISTS: three tools parse this prose (acceptance.py,
+# nativetabs_check.py, uihooks_check.py) and each had grown its own private
+# replay. Two of them passed VACUOUSLY on their own command echo or on a
+# fragment of the batch header before being fixed. One corpus, loaded by
+# tools/inspectfixtures.py, is how that stays fixed: every parser test runs
+# against text the host really emitted, including its refusals.
+#
+# DO NOT EDIT AN OUTPUT BLOCK BY HAND. If the host's wording changes, re-harvest
+# from a real capture and say where it came from in SOURCE. A fixture someone
+# tidied is no longer evidence.
+#
+# Entry format:  === ENTRY <id> / --- SOURCE / --- SHAPE / --- COMMAND /
+#                --- OUTPUT <verbatim ...> / --- END
+
+=== ENTRY roots-dontdestroyonload
+--- SOURCE scratchpad boot.out, batch 4
+--- SHAPE 11 roots via the DontDestroyOnLoad fallback; SceneManager lists 3 scenes with rootCount=0 TRUTHFULLY
+--- COMMAND roots
+--- OUTPUT
+aowlspt live inspector -- batch 4, 2 command(s), on Unity thread 17180
+> roots
+  via SceneManager::get_sceneCount / GetSceneAt, Scene::GetNameInternal / GetIsLoadedInternal / GetRootCountInternal, GameObject::get_scene_Injected, Scene::GetRootGameObjects (calls; the last one ALLOCATES)
+  3 scene(s) from SceneManager
+  scene[0] handle=-9632 name="EnvironmentUIScene" loaded=true rootCount=0
+    EnvironmentUIScene: 0 roots
+  scene[1] handle=-17668 name="LoginUIScene" loaded=true rootCount=0
+    LoginUIScene: 0 roots
+  scene[2] handle=-26618 name="PreloaderUIScene" loaded=true rootCount=0
+    PreloaderUIScene: 0 roots
+  scene[anchor] handle=-12 name="DontDestroyOnLoad"  <- the scene $preloader actually belongs to. SceneManager does NOT list it, which on this build is where the live UI is.
+    [$r0] transform=0x0000017c4d73dee0  go=0x0000017aa51dd620 ($rgo0)  name="StandaloneWebPlugin"   (DontDestroyOnLoad)
+    [$r1] transform=0x0000017c4d73dec0  go=0x0000017aa51dd560 ($rgo1)  name="WebView Thread Dispatcher"   (DontDestroyOnLoad)
+    [$r2] transform=0x0000017c4d73dea0  go=0x0000017b4f885ba0 ($rgo2)  name="[Technical Systems]"   (DontDestroyOnLoad)
+    [$r3] transform=0x0000017bd117a8e0  go=0x0000017b95b027e0 ($rgo3)  name="Application (Main Client)"   (DontDestroyOnLoad)
+    [$r4] transform=0x0000017b4f921ca0  go=0x0000017b4f921f40 ($rgo4)  name="Canvas"   (DontDestroyOnLoad)
+    [$r5] transform=0x0000017bd117a920  go=0x0000017bd117a9e0 ($rgo5)  name="AudioListener"   (DontDestroyOnLoad)
+    [$r6] transform=0x0000017c4d73de80  go=0x0000017bd0fce9c0 ($rgo6)  name="Easy Assets"   (DontDestroyOnLoad)
+    [$r7] transform=0x0000017c4d73de60  go=0x0000017bd2507100 ($rgo7)  name="___Input"   (DontDestroyOnLoad)
+    [$r8] transform=0x0000017bd23636e0  go=0x0000017bd2567c20 ($rgo8)  name="Environment UI"   (DontDestroyOnLoad)
+    [$r9] transform=0x0000017c4d73de40  go=0x0000017bd1183940 ($rgo9)  name="Login UI"   (DontDestroyOnLoad)
+    [$r10] transform=0x0000017c4c8e1c80  go=0x0000017c4c8e1c40 ($rgo10)  name="Preloader UI"   (DontDestroyOnLoad)
+  11 root(s) bound to $r0..$r10 as TRANSFORMS -- the same kind of pointer $c0 and $f1 are, so they go straight into children/tree/parent/find. The GameObject of each is $rgo0..$rgo10 (that is what `component` wants).
+  e.g.  find PvE $r9        or   children $r9
+> echo aowl-batch-14638
+  aowl-batch-14638
+aowlspt live inspector -- batch 4 complete, 26 line(s)
+--- END
+
+=== ENTRY roots-scenemanager-only
+--- SOURCE scratchpad boot.out, batch 2
+--- SHAPE early boot: 1 scene, 1 root, and the anchor-scene question REFUSED (could not ask $preloader which scene it belongs to)
+--- COMMAND roots
+--- OUTPUT
+aowlspt live inspector -- batch 2, 2 command(s), on Unity thread 17180
+> roots
+  via SceneManager::get_sceneCount / GetSceneAt, Scene::GetNameInternal / GetIsLoadedInternal / GetRootCountInternal, GameObject::get_scene_Injected, Scene::GetRootGameObjects (calls; the last one ALLOCATES)
+  1 scene(s) from SceneManager
+  scene[0] handle=-90 name="EftMainScene" loaded=true rootCount=1
+    [$r0] transform=0x0000017aa738efe0  go=0x0000017b4f8850a0 ($rgo0)  name="EFT.StaticManager"   (EftMainScene)
+  (could not ask $preloader which scene it belongs to; either the anchor is null or GameObject::get_scene_Injected did not verify)
+  1 root(s) bound to $r0..$r0 as TRANSFORMS -- the same kind of pointer $c0 and $f1 are, so they go straight into children/tree/parent/find. The GameObject of each is $rgo0..$rgo0 (that is what `component` wants).
+  e.g.  find PvE $r9        or   children $r9
+> echo aowl-batch-5147
+  aowl-batch-5147
+aowlspt live inspector -- batch 2 complete, 11 line(s)
+--- END

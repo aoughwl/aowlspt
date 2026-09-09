@@ -1,0 +1,13 @@
+{
+  "//enabled": "Add the Admin Trader to the game at backend start. Turning this off does not remove a trader already written into a running server's database -- restart the backend.",
+  "enabled": true,
+
+  "//nickname": "What the trader is called on the trading screen. This is the one setting that applies live: change it on the in-game settings page and the trader is renamed on the spot.",
+  "nickname": "Admin Trader",
+
+  "//maxOffers": "How many handbook items he stocks. The handbook holds about 4,300 tradeable items, so the default is effectively 'all of them'. Lower it if you want a shorter list to scroll.",
+  "maxOffers": 4500,
+
+  "//soloTrader": "Hide every trader except the Admin Trader, so his is the only name on the list. Nothing is deleted: each other trader gets traders.<id>.base.aowlHidden = true, which the server skips when it builds the list, and turning this back off clears the flag and returns them all intact. Applies live -- reopen the trading screen to see it.",
+  "soloTrader": false
+}

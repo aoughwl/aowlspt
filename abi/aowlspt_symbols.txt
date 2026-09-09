@@ -1,0 +1,175 @@
+# aowlspt_symbols.txt -- the ONLY place a by-name IL2CPP method becomes an RVA.
+#
+# `tools/il2cpp_symtab.py gen` resolves every line below offline, out of
+# GameAssembly.dll plus the decrypted metadata, and emits
+# abi/aowlspt_symtab.h and abi/aowlspt_symtab.nim.
+#
+# Nothing here is resolved at runtime. A runtime name lookup goes through a
+# TOKEN-GATED il2cpp export -- one that takes a trailing argument the stock
+# signature does not have -- and called the stock way it does not fail, it
+# returns a plausible RANDOM value. Its failure mode is indistinguishable from
+# success until something dereferences the answer, and by then the client is
+# already dead with a log byte-identical to a healthy run. Resolving offline
+# sidesteps the export ABI entirely: a byte-verified static RVA calls the
+# compiled body directly. (Mechanism measured offline; see
+# docs/IL2CPP_EXPORTS.md on feat-il2cpp-export-map.)
+#
+# FORMAT
+#
+#   IDENT = Ns.Type::Method/arity
+#   IDENT = Ns.Type::Method/arity  shared-call why="at least 20 characters"
+#
+# `arity` may be `*`, which is honoured ONLY when the name has exactly one
+# overload. The moment there are two, the symbol is REJECTED rather than
+# guessed at -- `EFT.UI.Settings.SettingsScreen::Show` and
+# `Scene::GetRootGameObjects` are both overloaded on this build.
+#
+# FOUR GATES, all applied at generation, all able to reject:
+#   * the name must resolve to exactly ONE code address
+#   * that address must be in the `il2cpp` PE section (generated METHOD code is
+#     NOT in `.text`). This gate is about methods only -- the `il2cpp_*`
+#     EXPORTS all live in `.text` and belong there.
+#   * it must not be this build's universal empty-body stub -- found by owner
+#     count AND opcode shape, not hardcoded. 9,614 method definitions resolve
+#     to it, `TMP_Text::ForceMeshUpdate` among them.
+#   * exactly ONE method definition must own it, unless `shared-call` is
+#     written out with a reason.
+#
+# THE SHARED-CALL ESCAPE HATCH. The IL2CPP backend folds identical bodies, so
+# unrelated methods share one address. CALLING a shared address is correct --
+# it is the right code for the receiver you pass. DETOURING one is a write
+# whose blast radius is every owner. So a shared symbol gets `AOWL_SYMC_<X>`
+# and NO `AOWL_SYM_<X>`: a detour site cannot reach it by accident, it has to
+# be typed on purpose, and this file has to carry the reason.
+#
+# Adding a symbol: find it first --
+#   python tools\il2cpp_symtab.py find-method <GameAssembly.dll> \
+#       .cache\global-metadata.dec.dat <substring>
+# which prints the RVA, the section, the owner count, and a warning if it is
+# the stub or shared. Then add a line here and rebuild.
+
+# --------------------------------------------------------------- UnityEngine
+GO_GET_TRANSFORM        = UnityEngine.GameObject::get_transform/0
+GO_SET_ACTIVE           = UnityEngine.GameObject::SetActive/1
+GO_ACTIVE_SELF          = UnityEngine.GameObject::get_activeSelf/0
+GO_ACTIVE_IN_HIERARCHY  = UnityEngine.GameObject::get_activeInHierarchy/0
+GO_GET_LAYER            = UnityEngine.GameObject::get_layer/0
+GO_GET_SCENE_INJECTED   = UnityEngine.GameObject::get_scene_Injected/1
+
+OBJ_GET_NAME            = UnityEngine.Object::get_name/0
+OBJ_SET_NAME            = UnityEngine.Object::set_name/1
+OBJ_GET_INSTANCE_ID     = UnityEngine.Object::GetInstanceID/0
+
+TF_GET_CHILD_COUNT      = UnityEngine.Transform::get_childCount/0
+TF_GET_CHILD            = UnityEngine.Transform::GetChild/1
+TF_SET_AS_FIRST_SIBLING = UnityEngine.Transform::SetAsFirstSibling/0
+TF_GET_LOCAL_POSITION   = UnityEngine.Transform::get_localPosition/0
+TF_SET_LOCAL_POSITION   = UnityEngine.Transform::set_localPosition/1
+TF_GET_LOCAL_SCALE      = UnityEngine.Transform::get_localScale/0
+TF_SET_LOCAL_SCALE      = UnityEngine.Transform::set_localScale/1
+
+RT_GET_RECT             = UnityEngine.RectTransform::get_rect/0
+RT_GET_ANCHOR_MIN       = UnityEngine.RectTransform::get_anchorMin/0
+RT_SET_ANCHOR_MIN       = UnityEngine.RectTransform::set_anchorMin/1
+RT_GET_ANCHOR_MAX       = UnityEngine.RectTransform::get_anchorMax/0
+RT_SET_ANCHOR_MAX       = UnityEngine.RectTransform::set_anchorMax/1
+RT_GET_ANCHORED_POS     = UnityEngine.RectTransform::get_anchoredPosition/0
+RT_SET_ANCHORED_POS     = UnityEngine.RectTransform::set_anchoredPosition/1
+RT_GET_SIZE_DELTA       = UnityEngine.RectTransform::get_sizeDelta/0
+RT_SET_SIZE_DELTA       = UnityEngine.RectTransform::set_sizeDelta/1
+RT_GET_PIVOT            = UnityEngine.RectTransform::get_pivot/0
+RT_SET_PIVOT            = UnityEngine.RectTransform::set_pivot/1
+
+CANVAS_GET_RENDER_MODE  = UnityEngine.Canvas::get_renderMode/0
+CANVAS_GET_SCALE_FACTOR = UnityEngine.Canvas::get_scaleFactor/0
+CANVAS_GET_SORT_ORDER   = UnityEngine.Canvas::get_sortingOrder/0
+CAMERA_GET_MAIN         = UnityEngine.Camera::get_main/0
+TIME_GET_FRAME_COUNT    = UnityEngine.Time::get_frameCount/0
+
+SCENE_GET_NAME          = UnityEngine.SceneManagement.Scene::GetNameInternal/1
+SCENE_GET_IS_LOADED     = UnityEngine.SceneManagement.Scene::GetIsLoadedInternal/1
+SCENE_GET_ROOT_COUNT    = UnityEngine.SceneManagement.Scene::GetRootCountInternal/1
+SCENEMGR_GET_COUNT      = UnityEngine.SceneManagement.SceneManager::get_sceneCount/0
+SCENEMGR_GET_AT         = UnityEngine.SceneManagement.SceneManager::GetSceneAt/1
+
+UNITYEVENT_INVOKE       = UnityEngine.Events.UnityEvent::Invoke/0
+BUTTON_PRESS            = UnityEngine.UI.Button::Press/0
+GRAPHIC_SET_RAYCAST     = UnityEngine.UI.Graphic::set_raycastTarget/1
+SLIDER_SET_MIN          = UnityEngine.UI.Slider::set_minValue/1
+SLIDER_SET_MAX          = UnityEngine.UI.Slider::set_maxValue/1
+SLIDER_SET_NO_NOTIFY    = UnityEngine.UI.Slider::SetValueWithoutNotify/1
+SLIDER_UPDATE_VISUALS   = UnityEngine.UI.Slider::UpdateVisuals/0
+TOGGLE_SET_IS_ON        = UnityEngine.UI.Toggle::set_isOn/1
+TOGGLE_SET_NO_NOTIFY    = UnityEngine.UI.Toggle::SetIsOnWithoutNotify/1
+
+TYPE_FROM_HANDLE        = System.Type::GetTypeFromHandle/1
+
+# --------------------------------------------------------------------- TMPro
+TMP_SET_TEXT            = TMPro.TMP_Text::set_text/1
+TMP_SET_PROPS_CHANGED   = TMPro.TMP_Text::set_havePropertiesChanged/1
+TMP_SET_PARENT_ALIGN    = TMPro.TMP_DefaultControls::SetParentAndAlign/2
+# TMPro.TMP_Text::ForceMeshUpdate/2 is DELIBERATELY ABSENT. It resolves to
+# 0x628110 -- this build's universal `ret 0` -- and would be rejected. The
+# concrete subclasses do have real, single-owner bodies; use those if the
+# repaint is ever actually needed:
+TMPUGUI_FORCE_MESH      = TMPro.TextMeshProUGUI::ForceMeshUpdate/2
+TMPPRO_FORCE_MESH       = TMPro.TextMeshPro::ForceMeshUpdate/2
+
+# ------------------------------------------------------------------------ EFT
+LOCTEXT_SET_LABEL       = EFT.UI.LocalizedText::SetLabelText/1
+SETTINGSSCREEN_SHOW1    = EFT.UI.Settings.SettingsScreen::ShowScreen/1
+SETTINGSTAB_SET_SEL     = EFT.UI.Settings.SettingsTab::set_IsSelected/1
+GAMESETTINGSTAB_UPDATE  = EFT.UI.Settings.GameSettingsTab::Update/0
+TARKOVAPP_UPDATE        = EFT.TarkovApplication::Update/0
+GAMEWORLD_REGISTER      = EFT.GameWorld::RegisterPlayer/1
+GAMEWORLD_TICK_UPDATE   = EFT.GameWorldUnityTickListener::Update/0
+BOTSPAWNER_ADD_PLAYER   = EFT.BotSpawner::AddPlayer/1
+BOTOWNER_PREACTIVATE    = EFT.BotOwner::PreActivate/5
+BOTOWNER_UPDATE_MANUAL  = EFT.BotOwner::UpdateManual/0
+LODBIAS_ON_POST_RENDER  = EFT.CameraControl.CameraLodBiasController::OnPostRender/0
+ONRENDEROBJ_MANAGER     = OnRenderObjectManager::OnRenderObject/0
+
+# ----------------------------------------------- CALL ONLY -- shared RVAs
+# Every one of these is already used as a CALL target in abi/aowlspt_debugui.h
+# or abi/aowlspt_invoke2.h and none of them is detoured anywhere in this repo
+# (checked by grep, 2026-08-26). They are listed with the escape hatch so that
+# stays true by construction rather than by anybody remembering.
+
+COMPONENT_GET_GAMEOBJECT = UnityEngine.Component::get_gameObject/0  shared-call why="52 owners: every Component subclass folds to this one two-instruction body. Reading a GameObject off a Component we already hold is correct for whatever the receiver is; a detour here would fire for the whole engine."
+COMPONENT_GET_TRANSFORM  = UnityEngine.Component::get_transform/0   shared-call why="15 owners, same folded accessor shape as get_gameObject. Call-only for the same reason."
+BEHAVIOUR_SET_ENABLED    = UnityEngine.Behaviour::set_enabled/1     shared-call why="32 owners. Enabling the Behaviour instance we are holding is correct code; detouring it would intercept every enable in the process."
+TF_GET_ROOT              = UnityEngine.Transform::get_root/0        shared-call why="2 owners. Walking up from a live Transform to its Canvas root is the debug overlay parenting step, and the receiver decides the answer."
+SCREEN_GET_WIDTH         = UnityEngine.Screen::get_width/0          shared-call why="2 owners, a static with no receiver at all. Reading the backbuffer width cannot be wrong for a caller; only a detour could be."
+SCREEN_GET_HEIGHT        = UnityEngine.Screen::get_height/0         shared-call why="2 owners, static, exactly as get_width. Used together with it for the overlay layout."
+TF_GET_PARENT            = UnityEngine.Transform::get_parent/0     shared-call why="3 owners -- the generator caught this one; it was written as a plain symbol first and rejected. Walking up from a live Transform is receiver-decided and safe to call."
+
+# ------------------------------------------------- Bot AI (mods/sain) driving
+# The five driving calls and the two sensors, resolved offline so that nothing
+# in mods/sain ever asks the runtime for a name again. Every RVA and every
+# signature below came from
+#   python tools\il2cpp_resolve.py <gameasm> <metadec> type <idx>
+# on 2026-08-26; the signatures are quoted in mods/sain/client/drivecalls.nim
+# next to the call that stages the arguments for them.
+#
+# THE ONE THAT IS NOT HERE, and why. `BotMover::GoToPoint(Vector3, bool, float,
+# bool, bool, bool, bool)` @0x1A2EE00 and `EFT.BotOwner::GoToPoint(Vector3,
+# bool, float, bool, bool, bool, bool, bool)` @0x81CB40 are the real
+# destination calls. They take 8 and 9 register slots INCLUDING `this`, and
+# `AOWL_FAST_MAX_SLOTS` is 5 -- Win64 puts everything past the fourth argument
+# on the STACK, which the shape dispatcher does not express and callrva.nim
+# refuses rather than spills. Listing them here would produce a symbol that
+# compiles and a call that can never be staged, so they are deliberately
+# absent. See the BLOCKED note in mods/sain/README.md.
+SAIN_MOVER_SPRINT       = BotMover::Sprint/2
+SAIN_MOVER_STOP         = BotMover::Stop/0
+SAIN_STEERING_LOOKTO    = BotSteering::LookToPoint/1
+SAIN_SHOOTDATA_SHOOT    = ShootData::Shoot/0
+SAIN_BOTOWNER_STOPMOVE  = EFT.BotOwner::StopMove/0
+
+# The two sensors. `Physics::Raycast` has THREE arity-3 overloads on this build
+# -- (Vector3,Vector3,float)@0x5328830, (Vector3,Vector3,RaycastHit)@0x5328C30
+# and (Ray,float,int)@0x5328DD0 -- so if the generator resolves this by arity
+# alone it will be AMBIGUOUS and rejected, which is the correct outcome and not
+# something to work around by picking one.
+SAIN_PHYSICS_RAYCAST    = UnityEngine.Physics::Raycast/3
+SAIN_NAVMESH_SAMPLE     = UnityEngine.AI.NavMesh::SamplePosition/4

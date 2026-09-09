@@ -1,0 +1,270 @@
+{
+  "_comment": "A person's `voice` TAG (what data/archetypes.json lists under `voices`, what gen.nim writes into the person) -> a concrete voice per TTS engine. Every tag gen can produce is here, and no two tags share the same (kokoro id, speed) pair or the same (chatterbox stem, exaggeration, cfg_weight) triple, so two people with different tags never sound the same by default. A tag NOT listed here is resolved by a deterministic pick from `pools` keyed on fnv1a64(personId) (falling back to the tag text when no person is known), so it is stable per person across restarts and is reported in the tts note as 'unmapped tag'. kokoro ids are the 54 names in voices-v1.0.bin (GET /health on the kokoro server lists them); chatterbox stems are `<stem>.wav` files in data/voices/ -- the three shipped ones are PLACEHOLDERS made with piper and Windows SAPI, drop real ~10 s reference wavs beside them and point the tags at their stems. piper is an .onnx stem under toolsDir/piper (only en_US-lessac-medium exists on this machine, so every tag maps to it).",
+  "pools": {
+    "kokoro": [
+      "am_adam",
+      "am_michael",
+      "am_echo",
+      "am_eric",
+      "am_liam",
+      "am_onyx",
+      "am_puck",
+      "am_fenrir",
+      "bm_george",
+      "bm_lewis",
+      "bm_daniel",
+      "bm_fable",
+      "af_bella",
+      "af_sarah",
+      "af_nicole",
+      "af_sky",
+      "af_kore",
+      "af_river",
+      "bf_emma",
+      "bf_isabella",
+      "bf_alice",
+      "bf_lily"
+    ],
+    "chatterbox": [
+      "placeholder-piper-lessac",
+      "placeholder-sapi-david",
+      "placeholder-sapi-zira"
+    ],
+    "orpheus": [
+      "austin",
+      "daniel",
+      "troy",
+      "autumn",
+      "diana",
+      "hannah"
+    ]
+  },
+  "tags": {
+    "gruff-male": {
+      "kokoro": "am_onyx",
+      "speed": 0.92,
+      "chatterbox": "placeholder-sapi-david",
+      "exaggeration": 0.35,
+      "cfg_weight": 0.6,
+      "piper": "lessac",
+      "orpheus": "troy"
+    },
+    "steady-female": {
+      "kokoro": "af_sarah",
+      "speed": 0.98,
+      "chatterbox": "placeholder-sapi-zira",
+      "exaggeration": 0.3,
+      "cfg_weight": 0.55,
+      "piper": "lessac",
+      "orpheus": "autumn"
+    },
+    "flat-male": {
+      "kokoro": "am_eric",
+      "speed": 0.95,
+      "chatterbox": "placeholder-piper-lessac",
+      "exaggeration": 0.2,
+      "cfg_weight": 0.65,
+      "piper": "lessac",
+      "orpheus": "austin"
+    },
+    "harsh-male": {
+      "kokoro": "am_fenrir",
+      "speed": 1.05,
+      "chatterbox": "placeholder-sapi-david",
+      "exaggeration": 0.75,
+      "cfg_weight": 0.45,
+      "piper": "lessac",
+      "orpheus": "daniel"
+    },
+    "manic-male": {
+      "kokoro": "am_puck",
+      "speed": 1.18,
+      "chatterbox": "placeholder-piper-lessac",
+      "exaggeration": 0.95,
+      "cfg_weight": 0.3,
+      "piper": "lessac",
+      "orpheus": "austin"
+    },
+    "cold-female": {
+      "kokoro": "bf_alice",
+      "speed": 0.94,
+      "chatterbox": "placeholder-sapi-zira",
+      "exaggeration": 0.2,
+      "cfg_weight": 0.7,
+      "piper": "lessac",
+      "orpheus": "diana"
+    },
+    "old-male": {
+      "kokoro": "bm_george",
+      "speed": 0.85,
+      "chatterbox": "placeholder-sapi-david",
+      "exaggeration": 0.4,
+      "cfg_weight": 0.5,
+      "piper": "lessac",
+      "orpheus": "troy"
+    },
+    "quiet-female": {
+      "kokoro": "af_river",
+      "speed": 0.9,
+      "chatterbox": "placeholder-sapi-zira",
+      "exaggeration": 0.25,
+      "cfg_weight": 0.6,
+      "piper": "lessac",
+      "orpheus": "hannah"
+    },
+    "rasping-male": {
+      "kokoro": "bm_lewis",
+      "speed": 0.93,
+      "chatterbox": "placeholder-piper-lessac",
+      "exaggeration": 0.55,
+      "cfg_weight": 0.5,
+      "piper": "lessac",
+      "orpheus": "daniel"
+    },
+    "smooth-male": {
+      "kokoro": "am_michael",
+      "speed": 0.97,
+      "chatterbox": "placeholder-sapi-david",
+      "exaggeration": 0.45,
+      "cfg_weight": 0.4,
+      "piper": "lessac",
+      "orpheus": "troy"
+    },
+    "clipped-female": {
+      "kokoro": "bf_emma",
+      "speed": 1.08,
+      "chatterbox": "placeholder-sapi-zira",
+      "exaggeration": 0.35,
+      "cfg_weight": 0.65,
+      "piper": "lessac",
+      "orpheus": "autumn"
+    },
+    "heavy-male": {
+      "kokoro": "am_adam",
+      "speed": 0.88,
+      "chatterbox": "placeholder-piper-lessac",
+      "exaggeration": 0.5,
+      "cfg_weight": 0.55,
+      "piper": "lessac",
+      "orpheus": "austin"
+    },
+    "soft-male": {
+      "kokoro": "am_liam",
+      "speed": 0.94,
+      "chatterbox": "placeholder-sapi-david",
+      "exaggeration": 0.3,
+      "cfg_weight": 0.35,
+      "piper": "lessac",
+      "orpheus": "daniel"
+    },
+    "whispering-female": {
+      "kokoro": "af_nicole",
+      "speed": 0.88,
+      "chatterbox": "placeholder-sapi-zira",
+      "exaggeration": 0.15,
+      "cfg_weight": 0.4,
+      "piper": "lessac",
+      "orpheus": "diana"
+    },
+    "choral-male": {
+      "kokoro": "bm_fable",
+      "speed": 0.96,
+      "chatterbox": "placeholder-piper-lessac",
+      "exaggeration": 0.6,
+      "cfg_weight": 0.4,
+      "piper": "lessac",
+      "orpheus": "troy"
+    },
+    "tired-male": {
+      "kokoro": "am_echo",
+      "speed": 0.9,
+      "chatterbox": "placeholder-sapi-david",
+      "exaggeration": 0.25,
+      "cfg_weight": 0.45,
+      "piper": "lessac",
+      "orpheus": "austin"
+    },
+    "brisk-female": {
+      "kokoro": "af_bella",
+      "speed": 1.1,
+      "chatterbox": "placeholder-sapi-zira",
+      "exaggeration": 0.5,
+      "cfg_weight": 0.5,
+      "piper": "lessac",
+      "orpheus": "hannah"
+    },
+    "gravel-male": {
+      "kokoro": "bm_daniel",
+      "speed": 0.9,
+      "chatterbox": "placeholder-piper-lessac",
+      "exaggeration": 0.65,
+      "cfg_weight": 0.55,
+      "piper": "lessac",
+      "orpheus": "daniel"
+    },
+    "urgent-female": {
+      "kokoro": "af_kore",
+      "speed": 1.12,
+      "chatterbox": "placeholder-sapi-zira",
+      "exaggeration": 0.8,
+      "cfg_weight": 0.35,
+      "piper": "lessac",
+      "orpheus": "autumn"
+    },
+    "young-male": {
+      "kokoro": "am_puck",
+      "speed": 1.02,
+      "chatterbox": "placeholder-sapi-david",
+      "exaggeration": 0.55,
+      "cfg_weight": 0.3,
+      "piper": "lessac",
+      "orpheus": "troy"
+    },
+    "hoarse-female": {
+      "kokoro": "bf_isabella",
+      "speed": 0.92,
+      "chatterbox": "placeholder-sapi-zira",
+      "exaggeration": 0.45,
+      "cfg_weight": 0.6,
+      "piper": "lessac",
+      "orpheus": "diana"
+    },
+    "warm-male": {
+      "kokoro": "am_michael",
+      "speed": 1.03,
+      "chatterbox": "placeholder-piper-lessac",
+      "exaggeration": 0.4,
+      "cfg_weight": 0.3,
+      "piper": "lessac",
+      "orpheus": "austin"
+    },
+    "bright-female": {
+      "kokoro": "af_sky",
+      "speed": 1.05,
+      "chatterbox": "placeholder-sapi-zira",
+      "exaggeration": 0.6,
+      "cfg_weight": 0.45,
+      "piper": "lessac",
+      "orpheus": "hannah"
+    },
+    "dry-male": {
+      "kokoro": "am_eric",
+      "speed": 1.0,
+      "chatterbox": "placeholder-sapi-david",
+      "exaggeration": 0.2,
+      "cfg_weight": 0.75,
+      "piper": "lessac",
+      "orpheus": "daniel"
+    },
+    "default": {
+      "kokoro": "am_michael",
+      "speed": 1.0,
+      "chatterbox": "placeholder-piper-lessac",
+      "exaggeration": 0.5,
+      "cfg_weight": 0.5,
+      "piper": "lessac",
+      "orpheus": "daniel"
+    }
+  },
+  "_orpheusNote": "Orpheus voices are the SIX Groq serves for canopylabs/orpheus-v1-english (MEASURED 2026-09-07: `voice must be one of [autumn diana hannah austin daniel troy]`; the model's own tara/leo/zoe/... are refused there). Male tags spread over austin/daniel/troy, female over autumn/diana/hannah."
+}

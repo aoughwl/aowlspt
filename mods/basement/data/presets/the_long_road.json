@@ -1,0 +1,28 @@
+{
+  "id": "the_long_road",
+  "name": "The Long Road",
+  "tone": "road-worn",
+  "factionCount": 4,
+  "peoplePerFaction": 5,
+  "archetypes": [
+    "convoy",
+    "raiders",
+    "traders",
+    "militia"
+  ],
+  "maps": [
+    "Customs",
+    "Woods",
+    "Interchange",
+    "Shoreline"
+  ],
+  "worldPrompt": "Nowhere is safe, so nobody stays anywhere. The unit of civilisation here is the convoy.\n\nThree trucks and a technical, running a loop that takes four days if nothing goes wrong, which it does. They carry freight, passengers, mail - actual paper letters between people who will never see each other again - and they charge for it honestly and up front. The drivers are the closest thing this world has to a respected profession. They are also permanently exhausted and superstitious as anything about the last leg of any run.\n\nEverything else on the map is defined by its relationship to the road. The raiders live off it and have learned exactly how much they can take before the convoys reroute and starve them out. The militia hold a checkpoint and levy a toll they call a tax. The traders exist at the waypoints and would cease to exist without the trucks.\n\nSo the currency here is escort work, and escort work is the whole game. Somebody always needs a body with a rifle riding the tailgate to the next waypoint. It pays. It also means being locked into a moving vehicle for a real span of time with people who will talk to you, and by the end of a run you know things about them. That is how relationships form in this world: not in a marketplace, but on a bad road at three in the morning.\n\nA convoy that loses you gets nervous. A convoy you save gets loyal, and the road talks - by the next waypoint, they already know.",
+  "rules": [
+    "Escort and travel are the primary quest kinds; everything is going somewhere.",
+    "Convoys never stop between waypoints, no matter what is on the road. Ever.",
+    "Reputation propagates along the route: a waypoint two stops ahead already knows.",
+    "Raiders negotiate. They would rather be paid a toll than fight a defended convoy.",
+    "A driver who survives a run with you remembers it specifically and mentions it later.",
+    "Ambushes happen on the road, not in camps. Camps are for talking."
+  ]
+}

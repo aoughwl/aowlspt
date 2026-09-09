@@ -1,0 +1,5 @@
+{
+  "enabled": true,
+  "stashRows": 28,
+  "whitelist": ["nikita", "prapor", "therapist"]
+}

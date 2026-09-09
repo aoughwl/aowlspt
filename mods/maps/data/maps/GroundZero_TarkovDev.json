@@ -1,0 +1,160 @@
+{
+ "id": "GroundZero_TarkovDev",
+ "displayName": "Ground Zero (TarkovDev)",
+ "author": "Tarkov.dev",
+ "authorLink": "https://tarkov.dev",
+ "internalNames": [
+  "Sandbox",
+  "Sandbox_high"
+ ],
+ "coordinateRotation": 180,
+ "bounds": {
+  "Min": {
+   "x": -99,
+   "y": -124
+  },
+  "Max": {
+   "x": 249,
+   "y": 364
+  }
+ },
+ "defaultLevel": 0,
+ "layers": {
+  "Garage": {
+   "level": -1,
+   "image": "GroundZero_TarkovDev/Layers/GroundZero-Underground_Level.svg",
+   "imageBounds": {
+    "Min": {
+     "x": -99,
+     "y": -124
+    },
+    "Max": {
+     "x": 249,
+     "y": 364
+    }
+   },
+   "gameBounds": [
+    {
+     "Min": {
+      "x": 43,
+      "y": -100,
+      "z": -100
+     },
+     "Max": {
+      "x": 117,
+      "y": 190,
+      "z": 21
+     }
+    },
+    {
+     "Min": {
+      "x": 117,
+      "y": 49,
+      "z": -100
+     },
+     "Max": {
+      "x": 143,
+      "y": 80,
+      "z": 21
+     }
+    }
+   ]
+  },
+  "Ground Floor": {
+   "level": 0,
+   "image": "GroundZero_TarkovDev/Layers/GroundZero-Ground_Level.svg",
+   "imageBounds": {
+    "Min": {
+     "x": -99,
+     "y": -124
+    },
+    "Max": {
+     "x": 249,
+     "y": 364
+    }
+   },
+   "gameBounds": [
+    {
+     "Min": {
+      "x": -99,
+      "y": -124,
+      "z": -100
+     },
+     "Max": {
+      "x": 249,
+      "y": 364,
+      "z": 100
+     }
+    }
+   ]
+  },
+  "2nd Floor": {
+   "level": 1,
+   "image": "GroundZero_TarkovDev/Layers/GroundZero-Second_Floor.svg",
+   "imageBounds": {
+    "Min": {
+     "x": -99,
+     "y": -124
+    },
+    "Max": {
+     "x": 249,
+     "y": 364
+    }
+   },
+   "gameBounds": [
+    {
+     "Min": {
+      "x": -99,
+      "y": -124,
+      "z": 28
+     },
+     "Max": {
+      "x": 249,
+      "y": 364,
+      "z": 32.3
+     }
+    },
+    {
+     "Min": {
+      "x": 91,
+      "y": 216,
+      "z": 26
+     },
+     "Max": {
+      "x": 98,
+      "y": 228,
+      "z": 31
+     }
+    }
+   ]
+  },
+  "3rd Floor": {
+   "level": 2,
+   "image": "GroundZero_TarkovDev/Layers/GroundZero-Third_Floor.svg",
+   "imageBounds": {
+    "Min": {
+     "x": -99,
+     "y": -124
+    },
+    "Max": {
+     "x": 249,
+     "y": 364
+    }
+   },
+   "gameBounds": [
+    {
+     "Min": {
+      "x": -99,
+      "y": -124,
+      "z": 32.3
+     },
+     "Max": {
+      "x": 249,
+      "y": 364,
+      "z": 100
+     }
+    }
+   ]
+  }
+ }
+}

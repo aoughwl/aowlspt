@@ -1,0 +1,37 @@
+{
+  "_comment": "Admin / cheat menu. These are the INITIAL toggle states, read at load and seeded into the F6 menu; after you change a toggle in the menu it lives in the mod's own state, not here. EVERY cheat defaults OFF: this build goes to testers, so nothing cheats until the player opts in from the F6 menu or the settings screen. Keys mirror the F12 settings schema in admin.nim, and the three default sets (here, the schema, AOWL_ADM_DEFAULTS) must agree.",
+
+  "esp": false,
+  "godmode": false,
+  "infiniteStamina": false,
+  "noRecoil": false,
+  "noWeight": false,
+  "instantHeal": false,
+  "unlimitedAmmo": false,
+  "thermalVision": false,
+  "nightVision": false,
+  "fly": false,
+  "teleport": false,
+  "timeOfDay": false,
+
+  "_profile": "The phase profiler, DEFAULT OFF. Brackets onCamTick (the everyMain callback that the host drain profiler measured at 6579.2us/frame) with QueryPerformanceCounter at four disjoint levels, and prints one decomposition line plus one region-cache line beside each in-raid adminDiag dump. It installs no detour, resolves no name and reads no game memory of its own -- it is two QPC reads per bracket -- but it is off by default because an instrument nobody knows is running is an instrument whose cost gets attributed to what it measures.",
+  "profile": false,
+
+  "_espMaxDistance": "Do not box players farther than this many metres from you. 400 is a sane raid default; raise it for open maps.",
+  "espMaxDistance": 400.0,
+
+  "_hotkeys": "MEASURED DEFECT, fixed 2026-08-28: these six keys were declared in the F12 schema and read by loadHotkeyConfig(), but were NOT MEMBERS OF THIS FILE. configGet answered ErrNotFound for every one, so the mod ran on its compiled-in fallbacks and the settings page had nothing to show a current value from -- four rows that rendered and resolved to nothing. Listing them here is the config path.",
+
+  "_hotkeysGate": "Master gate for the action keys below. ON. Measured from aowl_admin_hotkey_poll: with the gate on and every key unbound (the shipped state) the poll makes ZERO calls into the game -- it scans twelve LONGs in our own shared-memory block and returns before it ever binds Input::GetKeyDown. The first game call happens only once you bind a key. Set this to false to stop the poll entirely.",
+  "hotkeys": true,
+
+  "_hotkeyNames": "A UnityEngine.KeyCode NAME -- F7, Insert, KeypadPlus, ... -- or \"\" for unbound. An unrecognised name is REFUSED with the name printed in the host log and under the F6 menu; it is never read as KeyCode.None, which is a real key with ordinal 0. A key is also refused for an action that reports no capability, because a key on an unbound action does nothing, which is worse than no key. Rebinding in the F6 menu (select the row, press K) writes back here, so an in-game rebind survives a restart. Only the five actions this mod can actually perform have a row; the other seven are not bindable.",
+  "hotkeyEsp": "",
+  "hotkeyGodmode": "",
+  "hotkeyStamina": "",
+  "hotkeyNoRecoil": "",
+  "hotkeyNoWeight": "",
+
+  "_adminSurface": "A signpost row (implemented = false in admin.nim -- it sets nothing; the live admin surface is the in-game F6 overlay). It is given a path here anyway so that no declared setting is missing one: tools/settingscheck.py cannot tell a deliberate signpost from a control that renders and resolves to nothing, and neither can a player. The caption is also a deploy marker in tools/deploy.json.",
+  "adminSurface": "press F6 in game"
+}

@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- HelloAowl: a third-party-style plugin proving the Aowl API. Build:
+         dotnet build -c Release -p:OutDir=<dir>\
+       and drop HelloAowl.dll next to Aowl.Api.dll in BepInEx\plugins. -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <AssemblyName>HelloAowl</AssemblyName>
+    <RootNamespace>HelloAowl</RootNamespace>
+    <Version>0.1.0</Version>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <SptInstallDir Condition="'$(SptInstallDir)' == '' and '$(SPT_INSTALL_DIR)' != ''">$(SPT_INSTALL_DIR)</SptInstallDir>
+    <SptInstallDir Condition="'$(SptInstallDir)' == ''">D:\SPT415</SptInstallDir>
+    <GameManagedDir>$(SptInstallDir)\EscapeFromTarkov_Data\Managed</GameManagedDir>
+    <OutDir Condition="'$(OutDir)' == ''">$(SptInstallDir)\BepInEx\plugins\</OutDir>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <CopyProjectReferencesToOutputDirectory>false</CopyProjectReferencesToOutputDirectory>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+  <Target Name="Build Cleanup" AfterTargets="Build">
+    <Delete Files="$(OutDir)$(AssemblyName).pdb" />
+    <Delete Files="$(OutDir)$(AssemblyName).deps.json" />
+  </Target>
+  <ItemGroup>
+    <Reference Include="UnityEngine"><HintPath>$(GameManagedDir)\UnityEngine.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.CoreModule"><HintPath>$(GameManagedDir)\UnityEngine.CoreModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.InputLegacyModule"><HintPath>$(GameManagedDir)\UnityEngine.InputLegacyModule.dll</HintPath><Private>false</Private></Reference>
+    <ProjectReference Include="..\..\Aowl.Api\Aowl.Api.csproj"><Private>false</Private></ProjectReference>
+    <PackageReference Include="BepInEx.Core" Version="5.*" />
+    <PackageReference Include="BepInEx.PluginInfoProps" Version="1.*" />
+  </ItemGroup>
+</Project>

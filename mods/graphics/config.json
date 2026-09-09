@@ -1,0 +1,75 @@
+{
+  "_comment": "aowl.graphics — full-frame post-process. The RENDERING runs client-side in the host (abi/aowlspt_graphics.h) over the DXGI back buffer; this file is only the control surface. Keys are flat so the settings UI and the write-back path both address them directly. See README.md for what each does and the screen-space caveat (this grades the shipped LDR frame; it is not a replacement for BSG's HDR tonemapper).",
+
+  "enabled": true,
+
+  "//preset": "THE ONE KEY THAT MATTERS. A finished look in one word. While this is anything other than \"custom\", the preset OWNS every look key below and the individual sliders are IGNORED — set it to \"custom\" to drive them yourself. Sharing a look with someone is sharing this line. Options: custom | neutral | filmic | cold-clinical | warm-cinematic | night-owl.",
+  "//preset.neutral": "Cleanup only — vanilla minus the banding and the mush. If you cannot tell it from stock in a screenshot, it is doing its job.",
+  "//preset.filmic": "The default. AgX look, real contrast with the shadow toe bought back, a little grain.",
+  "//preset.cold-clinical": "Visibility first. Cool, slightly bright, shadows pulled open hard. No bloom (bloom is glare, and glare is a player you did not see) and no vignette (it darkens exactly the screen edge where peripheral movement lives).",
+  "//preset.warm-cinematic": "The screenshot look. Warm, contrasty, bloomy, grainy, a touch of lens. Costs a little visibility.",
+  "//preset.night-owl": "Dark interiors and night raids — Factory basements, Labs, Reserve bunkers. Exposure and gamma up, toe lifted hard, highlight roll-off raised so a flashlight does not blow out the wall in front of you.",
+  "preset": "filmic",
+
+  "//raidOnly": "When true (default), the grade runs ONLY inside a raid; the main menu and 2D UI screens stay stock. The raid signal comes from the backend (the tarkov mod knows raid start/end). Set false to grade everywhere — also the escape hatch if you run without the backend/manager, since without the signal the gate stays closed.",
+  "raidOnly": true,
+
+  "//sliders": "Everything below this line is ignored unless preset is \"custom\".",
+
+  "//tonemapper": "0 = none, 1 = AgX (filmic, neutral highlights — default), 2 = ACES. tonemapStrength blends the look 0..1.",
+  "tonemapper": 1,
+  "tonemapStrength": 0.90,
+
+  "//exposure": "EV bias applied before the tonemap look. 0 = neutral.",
+  "exposure": 0.0,
+
+  "contrast": 1.10,
+  "saturation": 1.02,
+
+  "//vibrance": "Saturation weighted by how unsaturated a pixel already IS, 0..1. Gains colour separation without turning foliage neon the way a flat saturation multiplier does. Costs no extra texture taps.",
+  "vibrance": 0.35,
+
+  "//shadowDetail": "Re-lifts ONLY the toe after contrast, 0..1, so raising contrast does not cost you the ability to see a player standing in a doorway. Costs no extra taps.",
+  "shadowDetail": 0.35,
+
+  "//clarity": "Wide-radius local contrast (unsharp against a 4-tap low pass), 0..1. This is what makes a flat, hazy frame read as three-dimensional. Masked to the mid-tones so it cannot crush blacks or blow highlights. Costs 4 texture taps.",
+  "clarity": 0.30,
+
+  "//temperature": "White balance. temperature -1..1 (cool..warm), tint -1..1 (green..magenta).",
+  "temperature": 0.04,
+  "tint": 0.0,
+
+  "//lgg": "Lift/Gamma/Gain — shadows offset, midtone power, highlight scale.",
+  "lift": 0.0,
+  "gamma": 1.0,
+  "gain": 1.0,
+
+  "//legacy": "shadows (additive lift) and highlights (pre-tonemap roll-off) match the original TarkovGraphics knobs.",
+  "shadows": 0.0,
+  "highlights": 1.1,
+
+  "//sharpness": "CAS-style contrast-adaptive sharpening, 0..1. Adaptive, so it does not ring on already-crisp edges the way a fixed unsharp mask does.",
+  "sharpness": 0.35,
+
+  "//bloom": "bloom enables the bright-pass blur — this is the ONLY expensive switch in the stack (3 extra fullscreen passes at half resolution). Turn it off first if you are chasing frames. bloomThreshold is the luma knee; raise it so only real light sources bloom.",
+  "bloom": true,
+  "bloomStrength": 0.30,
+  "bloomThreshold": 0.70,
+
+  "//grain": "Animated film grain, 0..1, weighted toward the shadows — where real grain lives and where banding lives. grainSize is the cell size in pixels. Costs no extra taps.",
+  "grain": 0.18,
+  "grainSize": 1.5,
+
+  "//dither": "Triangular-PDF noise at ~1 least-significant bit before the 8-bit write, 0..2. The cheapest real win in the stack: it is the only thing that kills banding in dark interiors, and Tarkov interiors are almost entirely gradient. Leave it on.",
+  "dither": 1.0,
+
+  "//chroma": "Radial chromatic aberration, 0..1. Red/blue only and exactly zero at the screen centre, so it never smears what you are aiming at. Off by default — tasteful means opt-in. Costs 2 texture taps.",
+  "chroma": 0.0,
+
+  "//vignette": "vignette strength 0..1; vignetteRadius 0.5..1.5 (larger = darkening starts further out).",
+  "vignette": 0.20,
+  "vignetteRadius": 1.0,
+
+  "//diag": "Red-tint the frame to confirm the post-process blit lands on the right back buffer, ignoring the raid gate. Turn off for normal play.",
+  "diag": false
+}

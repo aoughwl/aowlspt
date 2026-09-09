@@ -1,0 +1,4 @@
+{
+  "//patrolTuning": "Apply the shipped patrol-pacing tweaks to bots.types.bear/usec.difficulty.*. Only keys this database ALREADY carries are written -- the three pre-1.0 SPT names post-1.0 dropped (GO_TO_NEXT_POINT_DELTA, GO_TO_NEXT_POINT_DELTA_RESERV_WAY, USE_CHACHE_WAYS) are probed, skipped, and listed on /waypoints/status. Set false to leave BSG's pacing alone; the point data is served either way.",
+  "patrolTuning": true
+}

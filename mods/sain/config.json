@@ -1,0 +1,108 @@
+{
+  "enabled": true,
+  "difficulty": "default",
+  "forcePersonality": "",
+  "logDecisions": false,
+
+
+  "_driveFromHostThread": "Whether the five driving calls (GoToPoint, Sprint, LookToPoint, Shoot, and the self-actions) may be made from the host's own thread on a host whose onMainThread drain has never fired. When the drain has fired they are queued and executed on Unity's thread regardless, which is what they need. Set false to withhold them instead: bots then decide and do not move, which is the safe direction and the visibly broken one. Either way /sain/status and the log say which path the session took.",
+  "driveFromHostThread": true,
+  "_clientDrivesLocomotion": "Whether the CLIENT-side actuator may write locomotion (BotMover::Sprint @0x1A2D700). Default false, and that is the ONE-WRITER decision, not caution. Two things were writing a bot's movement on last-writer-wins: the server side (server/drive.nim -> ORBIT dispatch -> SetTargetMoveSpeed @0x1A2B4D0, plus the botnav GoToPoint thunk, host flag botNav) and this per-decide actuator. The server side wins because it is the only one that can issue a DESTINATION -- GoToPoint needs 8-9 register slots and the shape dispatcher tops out at 5, so this actuator could only ever set 'sprint' along a path somebody else chose. Setting this true restores two writers deliberately; either way the withheld count is printed in /sain/status so the loser is provably inert rather than silently off.",
+  "clientDrivesLocomotion": false,
+
+  "_allowIl2cppReflection": "Whether this mod may resolve IL2CPP types and methods BY NAME (il2cpp_class_from_name / il2cpp_class_get_method_from_name). Default false, and that is a measured fact rather than caution: on this build those calls return NON-NIL handles into UNMAPPED memory, so the nil check passes and the first dereference kills the client. The mod was measured dying inside exactly that call while binding UnityEngine.Physics::Raycast. With it false the cover sensor, the navmesh filter, the aim postfix and the damage postfix all decline and say why in the log; suppression falls back to the health delta and bots fight without taking cover. Turn it on only to re-measure the fact on a future Tarkov build.",
+  "allowIl2cppReflection": false,
+  "_sainRvaTable": "Bind 36 of SAIN's members from the table in client/rvatable.nim: 27 as direct calls at a static RVA, and 9 as GUARDED FIELD READS (pPhysical, phStamina, mcSprint, boMemory, memGoalEnemy, medFirstAid, medStims, medSurgery, wmReady) whose members are not properties on this build at all. A field row has no function and therefore no prologue to compare; it rests instead on an offset taken verbatim from Il2CppMetadataRegistration.fieldOffsets, a VirtualQuery for the exact width at every hop, an m_CachedPtr liveness check wherever the receiver is a UnityEngine.Object (readability is NOT liveness on this build), and a STATED RECEIVER TYPE -- a field read off the wrong object ANSWERS rather than faults, which is why wGrenades stays refused on receiver grounds even though its offset is known. EVERY FIELD ROW IS A READ: the field mechanism has no invoke path at all, so no drive call can be expressed through it. The 27 call rows' addresses were derived offline with tools/il2cpp_resolve.py against GameAssembly.dll 1.1.0.1.46777, each byte-verified 16/16 against its recorded prologue and checked to sit in committed EXECUTABLE memory inside the il2cpp PE section before it is ever called. A direct RVA call bypasses the token-gated export ABI entirely, so the failure mode that kills the client (a random non-zero handle passing a nil check) is not on the path at all. The other 21 members SAIN asks for are REFUSED by name in the log with the measurement that decided it -- absent from the image, declared at an arity this mod never calls, declared on a class this mod never holds, an RVA with 147 or 341 owners, a List<T> instantiation whose layout is unreachable offline, or (hcBodyPart) an interface receiver whose likeliest implementation dispatches to a SHARED GENERIC body that needs a MethodInfo the RVA path cannot supply -- and are never retried reflectively. HOW MUCH OF THIS ACTUALLY BINDS IS sainRvaTableDriveLevel, NOT THIS FLAG: this flag alone, at the default level 0, binds nothing. HONEST SCOPE: among the members this table covers, zero remain by-name; that is not the same as SAIN working. GoToPoint, Sprint, Stop, Shoot and the alive-players list are all refused, so the only calls that can make a bot act are LookToPoint and TryReload, at level 3. Default false.",
+  "sainRvaTable": false,
+
+  "_sainRvaTableDriveLevel": "How much of the RVA table above may bind. Ignored unless sainRvaTable is true. 0 OBSERVER: nothing binds -- every keyed member is refused at bind time with a LEVEL line naming what it would have needed, so a raid at 0 is a dry run of the refusals with no call into the game at all. 1 READS: every bound call row is an arity-0 getter and every field row is a guarded read; the field mechanism has no invoke path, so nothing at this level can change the game state. 2 AIM: adds the two-hop walk EFT.BotOwner::get_AimingManager @0x80E9B0 -> AimingManager::get_CurrentAiming @0x23D5B60 (both UNIQUE, both prologue-verified) and a POSTFIX installed by verified static RVA on Aiming::get_IsReady @0x1AD48C0 (UNIQUE; the host checks module base, code page, il2cpp PE section and the 16 prologue bytes against its STARTUP SNAPSHOT). The postfix WATCHES -- it returns frameContinue and never rewrites readiness -- and the gate it feeds can only WITHHOLD a shot the ladder already ordered, so a missing reading behaves exactly like no sensor at all. Every AimingToXxx node inherits that one UNIQUE body; UnderbarrelLauncherBotAiming does not, and when it is current the postfix simply never fires and nothing is gated. 3 DRIVE: adds the only two calls in the table that make a bot act, BotSteering::LookToPoint @0x1A3B690 and BotReload::TryReload @0xBB44A0. Every other drive member SAIN asks for -- GoToPoint, Sprint, Stop, Shoot and all three medical applies -- is a stated refusal, so level 3 is TWO calls and not a combat brain. The three medical applies are refused PERMANENTLY: all three were disassembled at their own RVAs and all three STORE the caller's managed Action into a heap closure with no null test and invoke it later, outside the body we call, so a null delegate would crash minutes afterwards on a stack containing none of our frames. AND IT IS ALSO THE CAPABILITY GATE, as of 2026-09-04: client/bridge.nim's arming step 7 grants capFull -- which is what lets the decision loop run at all -- only when sainRvaTable is true AND this is >= 1. At 0 the mod arms to capReadOnly with the same refusal text it has always printed, so 0 is a complete way back to the previously shipped behaviour without a rebuild. Raise this one notch per raid, and read the 'sain CENSUS' block in the host log after each: it carries the LEVEL census, the LEVEL 1 / COVER / FIRED-AT-US verdicts, the decision kinds and one line per drive-call kind. Default 0.",
+  "sainRvaTableDriveLevel": 0,
+
+  "_selfTestRuntime": "A GameAssembly.dll for the `--side sim` self-test to bind against, so it reports real bindings offline. Empty -- which is what ships -- means the process, and under aowlspt-sim there is no runtime at all. It must be an ABSOLUTE path: a relative one resolves against whatever directory the host was started in, which in an install is the game's own directory, and it is refused with that reason. `aowl test` and `aowl run` set AOWLSPT_SELFTEST_RUNTIME to the stand-in runtime tests/mockil2cpp builds, which is why this key is empty here and nothing ships a fixture path into an install.",
+  "selfTestRuntime": "",
+
+  "global": {
+    "engageDistance": 70.0,
+    "timeBeforeSearch": 40.0,
+    "holdGroundBaseTime": 1.0,
+    "fightBackHealthThreshold": 0.55,
+    "runAwayHealthThreshold": 0.28,
+    "coverMinEnemyDistance": 8.0,
+    "maxCoverPathLength": 60.0,
+    "decisionHz": 10.0,
+    "maxBotsPerTick": 8,
+    "farFromPlayerDistance": 150.0
+  },
+
+  "roles": {
+    "pmc": {
+      "difficulty": "inherit",
+      "engageDistance": 90.0,
+      "timeBeforeSearch": 25.0,
+      "willSearchForEnemy": true,
+      "runAwayHealthThreshold": 0.28,
+      "canShiftCoverPosition": true
+    },
+    "scav": {
+      "difficulty": "inherit",
+      "engageDistance": 50.0,
+      "timeBeforeSearch": 60.0,
+      "willSearchForEnemy": false,
+      "runAwayHealthThreshold": 0.28,
+      "canShiftCoverPosition": true
+    },
+    "boss": {
+      "difficulty": "inherit",
+      "engageDistance": 110.0,
+      "timeBeforeSearch": 5.0,
+      "willSearchForEnemy": true,
+      "runAwayHealthThreshold": 0.1,
+      "canShiftCoverPosition": true
+    },
+    "zombie": {
+      "difficulty": "inherit",
+      "engageDistance": 200.0,
+      "timeBeforeSearch": 1.0,
+      "willSearchForEnemy": true,
+      "runAwayHealthThreshold": 0.0,
+      "canShiftCoverPosition": false
+    }
+  },
+
+  "_objectives": "Bot AI > Objectives. Where a bot goes when it is NOT fighting. The backend ships a catalog of positions (patrol points from mods/waypoints, plus spawn-density anchors); the client partitions live bots by their real BSG group -- the BotOwner.BotsGroup pointer, which is the ONLY squad identity readable on this build -- and gives every member of one group a destination derived from ONE shared objective. TURNING THIS ON MOVES THE DESTINATION WRITER. With it off, server/dispatch.nim issues GoToPoint per bot census, as it always has. With it on, that path issues NO destination at all and the client decide ladder is the single writer -- there is no configuration in which both write, and /aowlspt/sain/status FAILS rather than passes if one is ever measured. REAL LOOTING IS NOT IN THIS: `seekLoot` means walk to a place worth searching and loiter there. Opening a container needs LootableContainer.Interact and an inventory-move RVA, neither of which is measured in docs/SAIN_RVA.md, and resolving them by name kills the client on this build. Off by default.",
+  "objectives": {
+    "objectivesEnabled": false,
+    "squadShareObjectives": true,
+    "seekQuestPoi": true,
+    "seekLoot": true,
+    "holdPositions": false,
+    "huntLastKnown": true,
+    "objectiveSplinterM": 25.0,
+    "objectiveLeashM": 45.0,
+    "objectiveReachM": 8.0,
+    "objectiveTimeoutS": 120.0,
+    "lootSeekAggressiveness": 0.5,
+    "questPoiBias": 1.25
+  },
+
+  "server": {
+    "patchBrains": true,
+    "neutraliseLocationModifiers": true
+  },
+
+  "_botLoot": "Bot AI > Loadout. How much loose loot generated bots carry, and how their weapons are built. `richnessMultiplier` is live on this build: the server's own bot generator reads it, so changing it changes what a killed scav drops. The `tier` and min/max keys below are the config SCHEMA for a fuller loadout system and are NOT yet read by the generator -- they are declared so the keys exist and a later pass can wire them without a config migration; each is greyed on the settings page until it does.",
+  "botLoot": {
+    "richnessMultiplier": 1.0,
+    "realisticLoot": true,
+    "weaponTier": "role",
+    "ammoTier": "role",
+    "armorTier": "role",
+    "pocketLootMin": 0,
+    "pocketLootMax": 4,
+    "rigLootMin": 0,
+    "rigLootMax": 6,
+    "backpackLootMin": 0,
+    "backpackLootMax": 6,
+    "factionOverrides": {}
+  }
+}

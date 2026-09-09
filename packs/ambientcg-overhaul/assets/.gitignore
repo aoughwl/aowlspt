@@ -1,0 +1,5 @@
+# The ~2.2 GB of ambientCG images is assembled on demand by assemble.ps1 /
+# assemble_pack.py -- it is NOT committed. Keep this directory in the tree but
+# ignore everything assembled into it.
+*
+!.gitignore

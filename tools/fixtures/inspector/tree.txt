@@ -1,0 +1,42 @@
+# MEASURED live-inspector output -- `tree`. Same rules as the other files in
+# this directory: every OUTPUT block is VERBATIM host text. DO NOT EDIT ONE BY
+# HAND; re-harvest and say where it came from in SOURCE.
+
+=== ENTRY tree-toggle-strip-depth2
+--- SOURCE live client, 2026-09-02, Settings open, mods tab built; captured by tools/ichannel.py run_batch (the `echo <sentinel>` line it appends is stripped by run_batch itself, which is why no `> echo` echo appears), batch 58
+--- SHAPE depth-2 tree of the top-row tab strip: 13 spawners, each printing `(1 child)` followed immediately by that child -- which is the node the UnityEngine.UI.Toggle component actually lives on. The `(N child)` count is what makes the parent->child pairing checkable instead of assumed
+--- COMMAND tree 0x000002024b079ee0 2
+--- OUTPUT
+aowlspt live inspector -- batch 58, 2 command(s), on Unity thread 16676
+> tree 0x000002024b079ee0 2
+  tree from 0x000002024b079ee0 name="Toggles" (max depth 2, max 3000 nodes)
+    "Toggles"  0x000002024b079ee0  (13 child)
+      + "GameToggleSpawner"  0x000002024b079e80  (1 child)
+        + "GameToggle"  0x00000203094986c0  (2 child)
+      + "GraphicsToggleSpawner"  0x000002024b079e00  (1 child)
+        + "GraphicsToggle"  0x0000020309498400  (2 child)
+      + "PostFxToggleSpawner"  0x000002024b079da0  (1 child)
+        + "PostFxToggle"  0x00000203094980e0  (2 child)
+      + "SoundToggleSpawner"  0x000002024b079d20  (1 child)
+        + "SoundToggle"  0x00000203094a7e40  (2 child)
+      + "ControlsToggleSpawner"  0x000002024b079cc0  (1 child)
+        + "ControlsToggle"  0x00000203094a7b80  (2 child)
+      + "GameToggleSpawner(Clone)"  0x000002030962f640  (1 child)
+        + "GameToggle(Clone)"  0x000002030962f1c0  (2 child)
+      + "GameToggleSpawner(Clone)"  0x00000203097aeae0  (1 child)
+        + "GameToggle(Clone)"  0x00000203097ae7e0  (2 child)
+      + "GameToggleSpawner(Clone)"  0x00000203090dcb80  (1 child)
+        + "GameToggle(Clone)"  0x00000203090dc8a0  (2 child)
+      + "GameToggleSpawner(Clone)"  0x00000203091dfaa0  (1 child)
+        + "GameToggle(Clone)"  0x00000203091df740  (2 child)
+      + "GameToggleSpawner(Clone)"  0x00000203092f49a0  (1 child)
+        + "GameToggle(Clone)"  0x00000203092f46a0  (2 child)
+      + "GameToggleSpawner(Clone)"  0x00000203093df1e0  (1 child)
+        + "GameToggle(Clone)"  0x00000203093e7ea0  (2 child)
+      + "GameToggleSpawner(Clone)"  0x0000020308cd9c00  (1 child)
+        + "GameToggle(Clone)"  0x0000020308cd9920  (2 child)
+      + "GameToggleSpawner(Clone)"  0x0000020308da9440  (1 child)
+        + "GameToggle(Clone)"  0x0000020308da9160  (2 child)
+  27 node(s) printed  -- complete.
+aowlspt live inspector -- batch 58 complete, 33 line(s)
+--- END

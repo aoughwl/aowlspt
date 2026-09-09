@@ -1,0 +1,75 @@
+# MEASURED live-inspector output. Every OUTPUT block below is VERBATIM host
+# text captured from a real run on this machine on 2026-09-01/02 -- pointers,
+# counts, frame numbers and all. Nothing here is hand-written prose.
+#
+# WHY THIS EXISTS: three tools parse this prose (acceptance.py,
+# nativetabs_check.py, uihooks_check.py) and each had grown its own private
+# replay. Two of them passed VACUOUSLY on their own command echo or on a
+# fragment of the batch header before being fixed. One corpus, loaded by
+# tools/inspectfixtures.py, is how that stays fixed: every parser test runs
+# against text the host really emitted, including its refusals.
+#
+# DO NOT EDIT AN OUTPUT BLOCK BY HAND. If the host's wording changes, re-harvest
+# from a real capture and say where it came from in SOURCE. A fixture someone
+# tidied is no longer evidence.
+#
+# Entry format:  === ENTRY <id> / --- SOURCE / --- SHAPE / --- COMMAND /
+#                --- OUTPUT <verbatim ...> / --- END
+
+=== ENTRY children-ok
+--- SOURCE scratchpad boot.out, batch 7
+--- SHAPE childCount plus one [i] transform/go/name row and the TRANSFORMS-not-components trailer
+--- COMMAND children 0x0000017bb7247d60
+--- OUTPUT
+aowlspt live inspector -- batch 7, 2 command(s), on Unity thread 17180
+> children 0x0000017bb7247d60
+  childCount = 1
+  via Transform::GetChild / get_childCount, Object::get_name (calls)
+    [0] transform=0x0000017bb72366c0 ($c0)  go=0x0000017bb72366a0 ($g0)  name="UI"
+  transforms bound to $c0..$c0, GameObjects to $g0..$g0. NOTE: these are TRANSFORMS, not components -- `click` needs the Button, so go through `component $g0 Button` first.
+> echo aowl-batch-21642
+  aowl-batch-21642
+aowlspt live inspector -- batch 7 complete, 8 line(s)
+--- END
+
+=== ENTRY children-refuse-unreadable
+--- SOURCE scratchpad boot.out, batch 1
+--- SHAPE `! that pointer is not readable; refusing to walk it.` alongside parent's `(not readable; chain ends)`
+--- COMMAND parent 0x00000202515a71c0 1
+--- OUTPUT
+aowlspt live inspector -- batch 1, 3 command(s), on Unity thread 17180
+> parent 0x00000202515a71c0 1
+  via Transform::get_parent, Component::get_transform, Object::get_name, Component::get_gameObject, GameObject::get_activeSelf (calls, not field reads)
+    [0] 0x00000202515a71c0  (not readable; chain ends)
+> children 0x00000202515a71c0
+  ! that pointer is not readable; refusing to walk it.
+> echo aowl-batch-1788294138785-20
+  aowl-batch-1788294138785-20
+aowlspt live inspector -- batch 1 complete, 8 line(s)
+--- END
+
+=== ENTRY children-toggle-strip
+--- SOURCE live client, 2026-09-02, Settings open on the GAME tab, mods tab built (8 published pages); captured by tools/ichannel.py run_batch, which strips the `echo <sentinel>` line it appends, batch 63
+--- SHAPE childCount = 13 and 13 child lines: the 5 stock tab spawners followed by the 8 mod-tab `GameToggleSpawner(Clone)`s, in strip order
+--- COMMAND children 0x000002024b079ee0
+--- OUTPUT
+aowlspt live inspector -- batch 63, 2 command(s), on Unity thread 16676
+> children 0x000002024b079ee0
+  childCount = 13
+  via Transform::GetChild / get_childCount, Object::get_name (calls)
+    [0] transform=0x000002024b079e80 ($c0)  go=0x000002024b079e20 ($g0)  name="GameToggleSpawner"
+    [1] transform=0x000002024b079e00 ($c1)  go=0x000002024b079dc0 ($g1)  name="GraphicsToggleSpawner"
+    [2] transform=0x000002024b079da0 ($c2)  go=0x000002024b079d60 ($g2)  name="PostFxToggleSpawner"
+    [3] transform=0x000002024b079d20 ($c3)  go=0x000002024b079ce0 ($g3)  name="SoundToggleSpawner"
+    [4] transform=0x000002024b079cc0 ($c4)  go=0x000002024b079c80 ($g4)  name="ControlsToggleSpawner"
+    [5] transform=0x000002030962f640 ($c5)  go=0x000002030962f620 ($g5)  name="GameToggleSpawner(Clone)"
+    [6] transform=0x00000203097aeae0 ($c6)  go=0x00000203097aeaa0 ($g6)  name="GameToggleSpawner(Clone)"
+    [7] transform=0x00000203090dcb80 ($c7)  go=0x00000203090dcb60 ($g7)  name="GameToggleSpawner(Clone)"
+    [8] transform=0x00000203091dfaa0 ($c8)  go=0x00000203091dfa80 ($g8)  name="GameToggleSpawner(Clone)"
+    [9] transform=0x00000203092f49a0 ($c9)  go=0x00000203092f4980 ($g9)  name="GameToggleSpawner(Clone)"
+    [10] transform=0x00000203093df1e0 ($c10)  go=0x00000203093df1c0 ($g10)  name="GameToggleSpawner(Clone)"
+    [11] transform=0x0000020308cd9c00 ($c11)  go=0x0000020308cd9be0 ($g11)  name="GameToggleSpawner(Clone)"
+    [12] transform=0x0000020308da9440 ($c12)  go=0x0000020308da9420 ($g12)  name="GameToggleSpawner(Clone)"
+  transforms bound to $c0..$c12, GameObjects to $g0..$g12. NOTE: these are TRANSFORMS, not components -- `click` needs the Button, so go through `component $g0 Button` first.
+aowlspt live inspector -- batch 63 complete, 20 line(s)
+--- END
