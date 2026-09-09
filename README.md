@@ -79,11 +79,19 @@ pointed somewhere else while it did.
 
 ## Where to start
 
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — the whole shape in one
-document: the hosts, where C stops and aowlmony starts, and how a request and a
-hook travel end to end.
+**[aoughwl.com/docs/aowlspt](https://aoughwl.github.io/docs/aowlspt)** — the
+full documentation, and much more of it than is in this repo: getting started,
+the mods, bot AI, the emulator, the IL2CPP host, pitfalls, troubleshooting, and
+the generated ABI reference.
+
+**[Discord](https://discord.gg/nxa3W7w4rJ)** — the people who used this, and
+where Jester is being built.
+
+In the repo: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) is the whole shape
+in one document — the hosts, where C stops and aowlmony starts, and how a
+request and a hook travel end to end. Then
 [`docs/INSTALL.md`](docs/INSTALL.md) · [`docs/ABI.md`](docs/ABI.md) ·
-[`docs/EMULATOR.md`](docs/EMULATOR.md) · [`docs/IL2CPP.md`](docs/IL2CPP.md)
+[`docs/EMULATOR.md`](docs/EMULATOR.md) · [`docs/IL2CPP.md`](docs/IL2CPP.md).
 
 Everything binds loopback only and there is no flag to change it. `aowlspt-install`
 is the single program that writes outside this repo, and only when told what and
